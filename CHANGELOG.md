@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.9.10] - 2026-09-28
+
 ### Fixed
 
+- Topology card detail panel popups no longer get truncated at the bottom in narrow bottom-sheet mode or fixed-height Lovelace Sections layouts. `uit-detail-panel` now uses a flex-column host with a shrinkable `.panel` scroll container (`flex: 1 1 auto; min-height: 0`) so narrow panels stay within `max-height: 60%` and scroll internally, while `.body` and `.content` use a shrinkable flex basis (`flex: 1 1 280px` / `240px` below `600px` with `min-height: 0`) so definite-height cards do not overflow and clip the overlay. [#186](https://github.com/ruaan-deysel/ha-unifi-insights/issues/186)
 - Protect WebSocket connections now share the client's request-rate limiter with polling. Rate-limit responses defer further requests without restarting an established events stream, and recovered rate-limit notices are logged at debug level instead of warning. [#185](https://github.com/ruaan-deysel/ha-unifi-insights/issues/185)
 
 ## [2026.9.9] - 2026-09-26
