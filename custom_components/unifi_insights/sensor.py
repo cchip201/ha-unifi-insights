@@ -66,8 +66,14 @@ from .innerspace_entity import (
 )
 from .site_internet_activity_sensor import (
     SITE_INTERNET_ACTIVITY_SENSOR_TYPES as SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
+)
+from .site_internet_activity_sensor import (
     UnifiSiteInternetActivitySensor as UnifiSiteInternetActivitySensor,
+)
+from .site_internet_activity_sensor import (
     UnifiSiteInternetActivitySensorEntityDescription as UnifiSiteInternetActivitySensorEntityDescription,
+)
+from .site_internet_activity_sensor import (
     _discover_site_internet_activity_sensors,
 )
 
@@ -113,20 +119,15 @@ def format_uptime(seconds: int | None) -> str | None:
     if seconds is None:
         return None
 
-    days = seconds // (24 * 3600)
-    seconds %= 24 * 3600
-    hours = seconds // 3600
-    seconds %= 3600
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
     minutes = seconds // 60
 
-    parts = []
     if days > 0:
-        parts.append(f"{days}d")
-    if hours > 0 or days > 0:  # Show hours if days present
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-
-    return " ".join(parts)
+        return f"{days}d {hours}h {minutes}m"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def get_stats_field(stats: dict, *keys: str, default: Any = None) -> Any:
