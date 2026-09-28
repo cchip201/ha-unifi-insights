@@ -539,6 +539,46 @@ async def test_remove_config_entry_device_only_for_deselected_sites(
     )
 
 
+def _client_device(mac: str, name: str | None, name_by_user: str | None = None) -> MagicMock:
+    """Build a client device registry entry stub (cmcore fork, backlog 529)."""
+    device = _device_entry(f"client_{mac}")
+    device.name = name
+    device.name_by_user = name_by_user
+    return device
+
+
+@pytest.mark.parametrize(
+    ("mac", "name", "name_by_user", "expected"),
+    [
+        # randomized (locally administered) and unnamed: removable
+        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c0", None, True),
+        ("1e:fc:1f:19:57:7e", "", None, True),
+        ("be:cf:ed:fa:7a:1e", None, None, True),
+        # randomized but named, in UniFi or in Home Assistant: refused
+        ("a6:32:49:91:9b:c0", "Colin's Pixel", None, False),
+        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c0", "Kitchen tablet", False),
+        # a global (burned-in) MAC is never ephemeral, named or not
+        ("98:e2:55:40:0c:ad", "98:e2:55:40:0c:ad", None, False),
+    ],
+)
+async def test_remove_config_entry_device_for_ephemeral_client(
+    hass: HomeAssistant,
+    mac: str,
+    name: str | None,
+    name_by_user: str | None,
+    expected: bool,  # noqa: FBT001
+) -> None:
+    """The fork lets a randomized, unnamed client's device be deleted, nothing else."""
+    entry = _entry_with_sites({"default": "Default"}, ["default"])
+
+    assert (
+        await async_remove_config_entry_device(
+            hass, entry, _client_device(mac, name, name_by_user)
+        )
+        is expected
+    )
+
+
 async def test_remove_config_entry_device_refused_when_not_loaded(
     hass: HomeAssistant,
 ) -> None:
