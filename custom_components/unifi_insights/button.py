@@ -32,6 +32,7 @@ from .entity import (
     UnifiProtectEntity,
     async_call_coordinator_action,
     camera_supports_ptz,
+    is_ephemeral_client,
 )
 
 if TYPE_CHECKING:
@@ -151,6 +152,8 @@ async def async_setup_entry(
                     for client_id, client_data in clients.items():
                         if not isinstance(client_data, dict):
                             continue
+                        if is_ephemeral_client(client_data):
+                            continue  # cmcore fork (backlog 529): randomized MAC, no name
                         client_key = (site_id, client_id, "reconnect")
                         if client_key in known_button_keys:
                             continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +42,36 @@ def get_field(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
         if key in data and data[key] is not None:
             return data[key]
     return default
+
+
+_MAC_TEXT = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$")
+
+
+def is_ephemeral_client(client_data: dict[str, Any]) -> bool:
+    """
+    Return True for a client with a randomized MAC and no name (cmcore fork, backlog 529).
+
+    A randomized MAC is locally administered (bit 0x02 of the first octet): a phone's
+    per-network private address or a container's random MAC. Without a name or hostname
+    nothing identifies it, and a new one appears at every rotation or recreate - each would
+    mint a permanent Home Assistant device (19 in 24 h on one network). No per-client
+    entity is created for such a client; site and SSID client counts still include it.
+    A named client keeps its entities whatever its MAC.
+    """
+    mac = str(get_field(client_data, "macAddress", "mac_address", "mac", default="") or "")
+    mac = mac.strip().lower()
+    try:
+        first_octet = int(re.split(r"[:-]", mac)[0][:2], 16)
+    except (ValueError, IndexError):
+        return False
+    if not first_octet & 0x02:
+        return False
+    name = str(get_field(client_data, "name", "hostname", default="") or "").strip().lower()
+    if not name:
+        return True
+    if _MAC_TEXT.match(name):
+        return re.sub(r"[^0-9a-f]", "", name) == re.sub(r"[^0-9a-f]", "", mac)
+    return False
 
 
 def first_not_none(*values: Any, default: Any = None) -> Any:

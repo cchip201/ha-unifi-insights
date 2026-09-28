@@ -32,6 +32,7 @@ from .entity import (
     async_call_coordinator_action,
     get_field,
     is_device_online,
+    is_ephemeral_client,
     is_gateway_device,
 )
 
@@ -367,6 +368,8 @@ async def async_setup_entry(
                     for client_id, client_data in clients.items():
                         if not isinstance(client_data, dict):
                             continue
+                        if is_ephemeral_client(client_data):
+                            continue  # cmcore fork (backlog 529): randomized MAC, no name
                         key = (site_id, client_id, "block_switch")
                         if key in known_switch_keys:
                             continue
