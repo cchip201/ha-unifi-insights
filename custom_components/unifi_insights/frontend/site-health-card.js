@@ -1,0 +1,1 @@
+import{_ as e,g as t,h as n,m as r,t as i}from"./chunks/register-dashboard-card-B28iQ1xT.js";i({tag:r,editorTag:n,card:t,editor:e,name:`UniFi Site Health`,description:`Compact site health summary with WAN, gateway, device, and client status.`});

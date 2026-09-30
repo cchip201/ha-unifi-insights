@@ -1,0 +1,1 @@
+import{c as e,f as t,l as n,p as r,t as i}from"./chunks/register-dashboard-card-B28iQ1xT.js";i({tag:e,editorTag:n,card:t,editor:r,name:`UniFi Protect Status`,description:`Live UniFi Protect camera, doorbell, chime, and NVR status summary.`});

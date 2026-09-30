@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Ruaan Deysel
+
 """Tests for serving the topology card bundle."""
 
 from __future__ import annotations
@@ -13,12 +15,25 @@ from homeassistant.components.lovelace.const import LOVELACE_DATA
 
 from custom_components.unifi_insights import async_setup, frontend
 from custom_components.unifi_insights.frontend import (
+    CARD_FILES,
     CARD_PATH,
     CARD_URL,
+    FRONTEND_PATH,
+    FRONTEND_URL_BASE,
     async_register_frontend,
 )
 
 MANIFEST = Path(frontend.__file__).parent / "manifest.json"
+
+
+def _expected_urls() -> dict[str, str]:
+    version = json.loads(MANIFEST.read_text(encoding="utf-8"))["version"]
+    urls: dict[str, str] = {}
+    for filename in CARD_FILES:
+        digest = hashlib.sha256((FRONTEND_PATH / filename).read_bytes()).hexdigest()[:8]
+        base = f"{FRONTEND_URL_BASE}/{filename}"
+        urls[base] = f"{base}?v={version}-{digest}"
+    return urls
 
 
 class FakeResources:
@@ -35,7 +50,11 @@ class FakeResources:
         return self.items
 
     def _create(self, data: dict) -> dict:
-        item = {"id": "topology", "url": data["url"], "type": data["res_type"]}
+        item = {
+            "id": f"res-{len(self.items)}",
+            "url": data["url"],
+            "type": data["res_type"],
+        }
         self.items.append(item)
         return item
 
@@ -57,9 +76,8 @@ def http(hass):
 
 
 async def test_registers_bundle_once(hass, http, enable_custom_integrations) -> None:
-    """The static path and the Lovelace module resource register once."""
-    version = json.loads(MANIFEST.read_text(encoding="utf-8"))["version"]
-    digest = hashlib.sha256(CARD_PATH.read_bytes()).hexdigest()[:8]
+    """The static path and the Lovelace module resources register once."""
+    expected = _expected_urls()
     with (
         patch.object(frontend, "ResourceStorageCollection", FakeResources),
         patch.object(frontend, "add_extra_js_url") as add_js,
@@ -70,13 +88,11 @@ async def test_registers_bundle_once(hass, http, enable_custom_integrations) -> 
     http.async_register_static_paths.assert_awaited_once()
     (configs,) = http.async_register_static_paths.await_args.args
     assert [(c.url_path, c.path, c.cache_headers) for c in configs] == [
-        (CARD_URL, str(CARD_PATH), True)
+        (FRONTEND_URL_BASE, str(FRONTEND_PATH), True)
     ]
     resources = hass.data[LOVELACE_DATA].resources
-    assert resources.items == [
-        {"id": "topology", "url": f"{CARD_URL}?v={version}-{digest}", "type": "module"}
-    ]
-    resources.async_create_item.assert_awaited_once()
+    assert [item["url"] for item in resources.items] == list(expected.values())
+    assert resources.async_create_item.await_count == len(CARD_FILES)
     add_js.assert_not_called()
 
 
@@ -91,8 +107,8 @@ async def test_updates_resource_when_bundle_changes(
     with patch.object(frontend, "ResourceStorageCollection", FakeResources):
         await async_register_frontend(hass)
 
-    resources.async_create_item.assert_not_awaited()
     resources.async_update_item.assert_awaited_once()
+    assert resources.async_create_item.await_count == len(CARD_FILES) - 1
     assert resources.items[0]["url"] != f"{CARD_URL}?v=old"
 
 
@@ -100,14 +116,12 @@ async def test_keeps_current_resource_unchanged(
     hass, http, enable_custom_integrations
 ) -> None:
     """A current Lovelace resource needs neither creation nor an update."""
-    version = json.loads(MANIFEST.read_text(encoding="utf-8"))["version"]
-    digest = hashlib.sha256(CARD_PATH.read_bytes()).hexdigest()[:8]
-    item = {
-        "id": "topology",
-        "url": f"{CARD_URL}?v={version}-{digest}",
-        "type": "module",
-    }
-    resources = FakeResources([item])
+    expected = _expected_urls()
+    items = [
+        {"id": f"res-{idx}", "url": url, "type": "module"}
+        for idx, url in enumerate(expected.values())
+    ]
+    resources = FakeResources(list(items))
     hass.data[LOVELACE_DATA].resources = resources
 
     with patch.object(frontend, "ResourceStorageCollection", FakeResources):
@@ -115,7 +129,7 @@ async def test_keeps_current_resource_unchanged(
 
     resources.async_create_item.assert_not_awaited()
     resources.async_update_item.assert_not_awaited()
-    assert resources.items == [item]
+    assert resources.items == items
     http.async_register_static_paths.assert_awaited_once()
 
 
@@ -131,10 +145,10 @@ async def test_resource_failure_does_not_fail_setup_and_can_retry(
         resources.async_create_item.side_effect = resources._create
         await async_register_frontend(hass)
 
-    assert "Unable to register optional topology card frontend" in caplog.text
+    assert "Unable to register optional dashboard card frontend" in caplog.text
     assert hass.data[frontend._REGISTERED]
     http.async_register_static_paths.assert_awaited_once()
-    assert len(resources.items) == 1
+    assert len(resources.items) == len(CARD_FILES)
 
 
 async def test_yaml_resources_use_frontend_fallback(
@@ -145,7 +159,7 @@ async def test_yaml_resources_use_frontend_fallback(
     with patch.object(frontend, "add_extra_js_url") as add_js:
         await async_register_frontend(hass)
 
-    add_js.assert_called_once()
+    assert add_js.call_count == len(CARD_FILES)
 
 
 @pytest.mark.parametrize("missing", ["http", "frontend"])

@@ -1,0 +1,1 @@
+import{b as e,t,v as n,x as r,y as i}from"./chunks/register-dashboard-card-B28iQ1xT.js";t({tag:n,editorTag:i,card:e,editor:r,name:`UniFi Event Timeline`,description:`Recent UniFi Protect security and device activity timeline.`});

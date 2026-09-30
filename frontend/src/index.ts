@@ -1,7 +1,12 @@
 // Entry point of the topology card bundle, served by the integration (frontend.py).
 import { CARD_TAG, EDITOR_TAG } from "./config";
 import { defineOnce } from "./define";
+import "./internet-activity-card";
 import { makeLocalize } from "./localize";
+import "./performance-card";
+import "./protect-status-card";
+import "./site-health-card";
+import "./timeline-card";
 import { UnifiInsightsTopologyCard } from "./topology-card";
 import { UnifiInsightsTopologyCardEditor } from "./topology-card-editor";
 

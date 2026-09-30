@@ -1,0 +1,1 @@
+import{d as e,o as t,s as n,t as r,u as i}from"./chunks/register-dashboard-card-B28iQ1xT.js";r({tag:t,editorTag:n,card:i,editor:e,name:`UniFi Device Performance`,description:`Infrastructure CPU, memory, PoE, client load, and throughput summary.`});

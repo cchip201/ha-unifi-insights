@@ -3,7 +3,7 @@
  * it. (The integration's translations/ folder is backend-only.)
  */
 const en = {
-    "card.name": "UniFi Insights Topology",
+    "card.name": "UniFi Topology",
     "card.description":
         "Interactive network topology of a UniFi site, from UniFi Insights.",
     "state.loading": "Loading network topology…",

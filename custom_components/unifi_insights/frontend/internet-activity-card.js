@@ -1,0 +1,1 @@
+import{a as e,i as t,n,r,t as i}from"./chunks/register-dashboard-card-B28iQ1xT.js";i({tag:n,editorTag:r,card:t,editor:e,name:`UniFi Internet Activity`,description:`Historical WAN download/upload activity and live gateway throughput.`});
