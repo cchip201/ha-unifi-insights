@@ -77,14 +77,20 @@ it("closes on request and renders nothing without a selection", async () => {
     expect(empty.shadowRoot!.querySelector("section")).toBeNull();
 });
 
-it("constrains .panel as a shrinkable flex child so narrow max-height scrolls instead of truncating", () => {
+it("constrains .panel as a shrinkable flex child with a sticky header so narrow panels fit or scroll cleanly", () => {
     // jsdom does not compute layout, so verify the CSS contract directly.
     const cssText = UitDetailPanel.styles.map((s) => s.cssText).join("\n");
     expect(cssText).toMatch(
         /:host\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s,
     );
     expect(cssText).toMatch(
+        /:host\(\[narrow\]\)\s*\{[^}]*max-height:\s*calc\(100%\s*-\s*8px\);/s,
+    );
+    expect(cssText).toMatch(
         /\.panel\s*\{[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow:\s*auto;/s,
+    );
+    expect(cssText).toMatch(
+        /header\s*\{[^}]*position:\s*sticky;[^}]*top:\s*0;/s,
     );
     expect(cssText).not.toMatch(/\.panel\s*\{[^}]*height:\s*100%;/s);
 });

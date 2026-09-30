@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `unifi_insights/timeline/get`
   - `unifi_insights/timeline/subscribe`
 
+### Fixed
+
+- Topology card narrow bottom-sheet detail panel now expands up to the full available canvas height (`max-height: calc(100% - 8px)` instead of `60%`) with a sticky header/close button, allowing full 8-row switch and access point details (including **Open device**) to display without unnecessary scrolling in 1-column Lovelace Sections cards. [#186](https://github.com/ruaan-deysel/ha-unifi-insights/issues/186)
+
 ## [2026.9.10] - 2026-09-28
 
 ### Fixed

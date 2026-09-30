@@ -149,7 +149,7 @@ import{$ as e,A as t,B as n,C as r,D as i,E as a,F as o,G as s,H as c,I as l,J a
                 right: 0;
                 bottom: 0;
                 width: auto;
-                max-height: 60%;
+                max-height: calc(100% - 8px);
             }
             .panel {
                 pointer-events: auto;
@@ -157,16 +157,21 @@ import{$ as e,A as t,B as n,C as r,D as i,E as a,F as o,G as s,H as c,I as l,J a
                 flex: 1 1 auto;
                 min-height: 0;
                 overflow: auto;
-                padding: 4px 16px 16px;
+                padding: 0 16px 16px;
                 background: var(--card-background-color);
                 border: 1px solid var(--uit-line);
                 border-radius: var(--ha-card-border-radius, 12px);
                 box-shadow: var(--ha-card-box-shadow, none);
             }
             header {
+                position: sticky;
+                top: 0;
+                z-index: 1;
                 display: flex;
                 align-items: center;
                 gap: 8px;
+                padding-top: 4px;
+                background: var(--card-background-color);
             }
             h3 {
                 flex: 1;
