@@ -1424,3 +1424,104 @@ class TestEntityPlatformRestoration:
         state = hass.states.get(entity_id)
         assert state is not None
         assert state.state == STATE_HOME
+
+
+class TestOfflineTrackerKeepsItsUplink:
+    """
+    cmcore 2026-10-01 (backlog 643.1 A): an offline client's tracker keeps its uplink.
+
+    A tracker whose client is offline at setup stays on the AP or switch device its
+    registry entry already points at, instead of a standalone client_<mac> device -
+    39 of those, all without an area, followed one day of planned outages.
+    """
+
+    MAC: str = "aa:bb:cc:dd:ee:01"
+
+    @pytest.fixture
+    def mock_coordinator(self) -> MagicMock:
+        """Return a site that answered, with this client not connected."""
+        coordinator = MagicMock()
+        coordinator.data = {"clients": {"site1": {}}}
+        return coordinator
+
+    @staticmethod
+    def _entry(hass: HomeAssistant, coordinator: MagicMock) -> MockConfigEntry:
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={"connection_type": "remote", "console_id": "c", "api_key": "k"},
+            options={"track_wifi_clients": True, "track_wired_clients": True},
+            entry_id="uplink_keep_entry",
+        )
+        entry.add_to_hass(hass)
+        entry.runtime_data = MagicMock()
+        entry.runtime_data.coordinator = coordinator
+        return entry
+
+    async def _tracker(
+        self, hass: HomeAssistant, entry: MockConfigEntry
+    ) -> UnifiClientTracker:
+        added: list[Any] = []
+        await async_setup_entry(hass, entry, added.extend)
+        return next(e for e in added if isinstance(e, UnifiClientTracker))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("identifier", "expect"),
+        [
+            pytest.param("site1_ap1", "uplink", id="last_under_an_access_point"),
+            pytest.param(
+                "client_aa:bb:cc:dd:ee:01", "placeholder", id="already_on_a_placeholder"
+            ),
+        ],
+    )
+    async def test_offline_tracker_stays_under_its_last_device(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        device_registry: dr.DeviceRegistry,
+        mock_coordinator: MagicMock,
+        identifier: str,
+        expect: str,
+    ) -> None:
+        """The tracker keeps the AP device; a placeholder stays a placeholder."""
+        entry = self._entry(hass, mock_coordinator)
+        device = device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, identifier)},
+            name="U7ProXGHallway",
+        )
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{self.MAC}",
+            config_entry=entry,
+            device_id=device.id,
+            suggested_object_id="client_aa_bb",
+        )
+        tracker = await self._tracker(hass, entry)
+        if expect == "uplink":
+            assert tracker.device_info["identifiers"] == {(DOMAIN, identifier)}
+            assert "name" not in tracker.device_info  # the AP's device, not renamed
+        else:
+            placeholder = {(DOMAIN, f"client_{self.MAC}")}
+            assert tracker.device_info["identifiers"] == placeholder
+
+    @pytest.mark.asyncio
+    async def test_no_device_on_record_falls_back_to_the_placeholder(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """A registry entry with no device keeps upstream's standalone device."""
+        entry = self._entry(hass, mock_coordinator)
+        entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{self.MAC}",
+            config_entry=entry,
+            suggested_object_id="client_aa_bb",
+        )
+        tracker = await self._tracker(hass, entry)
+        placeholder = {(DOMAIN, f"client_{self.MAC}")}
+        assert tracker.device_info["identifiers"] == placeholder
