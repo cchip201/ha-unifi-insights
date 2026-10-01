@@ -11,6 +11,7 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL, Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import (
@@ -669,7 +670,7 @@ async def async_unload_entry(
 
 
 async def async_remove_config_entry_device(
-    hass: HomeAssistant,  # noqa: ARG001
+    hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
     device_entry: DeviceEntry,
 ) -> bool:
@@ -684,8 +685,17 @@ async def async_remove_config_entry_device(
     cmcore fork (backlog 529): the device of a randomized, unnamed client can
     be deleted too. This fork creates no entity for such a client, so nothing
     re-creates its device; before the fork each one minted a permanent device.
+
+    cmcore fork (backlog 643): so can a client device that holds no entity. A
+    client's tracker sits on the AP or switch the client is under; the client's
+    own device is a placeholder for a client that was offline when the
+    integration set up, and it is left empty once the client is back. Nothing
+    re-uses an empty one, so deleting it loses nothing - a tracker that needs a
+    client device again creates a new one.
     """
     if _is_ephemeral_client_device(device_entry):
+        return True
+    if _is_empty_client_device(hass, device_entry):
         return True
 
     runtime_data = getattr(entry, "runtime_data", None)
@@ -725,6 +735,22 @@ def _is_ephemeral_client_device(device_entry: DeviceEntry) -> bool:
             {"mac": identifier.removeprefix("client_"), "name": name}
         )
     return False
+
+
+def _is_empty_client_device(hass: HomeAssistant, device_entry: DeviceEntry) -> bool:
+    """
+    Return True for a client device that holds no entity (cmcore fork, backlog 643).
+
+    A disabled entity counts: a device whose only entity is disabled still holds it.
+    """
+    if not any(
+        domain == DOMAIN and identifier.startswith("client_")
+        for domain, identifier in device_entry.identifiers
+    ):
+        return False
+    return not er.async_entries_for_device(
+        er.async_get(hass), device_entry.id, include_disabled_entities=True
+    )
 
 
 def _is_site_scoped_identifier(identifier: str, site_id: str) -> bool:

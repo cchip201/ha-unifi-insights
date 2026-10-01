@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 if TYPE_CHECKING:
@@ -500,6 +502,27 @@ def _device_entry(*identifiers: str) -> MagicMock:
     return device
 
 
+def _hold_an_entity(
+    hass: HomeAssistant, device: MagicMock, *, disabled: bool = False
+) -> MagicMock:
+    """Register the stub's device with one entity, as a live client device holds its tracker."""
+    config_entry = MockConfigEntry(domain=DOMAIN)
+    config_entry.add_to_hass(hass)
+    real = dr.async_get(hass).async_get_or_create(
+        config_entry_id=config_entry.entry_id, identifiers=set(device.identifiers)
+    )
+    device.id = real.id
+    er.async_get(hass).async_get_or_create(
+        "device_tracker",
+        DOMAIN,
+        f"tracker-{real.id}",
+        config_entry=config_entry,
+        device_id=real.id,
+        disabled_by=er.RegistryEntryDisabler.USER if disabled else None,
+    )
+    return device
+
+
 def _entry_with_sites(available: dict[str, str], polled: list[str]) -> MagicMock:
     """Build a config entry whose config coordinator polls only some sites."""
     entry = MagicMock()
@@ -532,14 +555,14 @@ async def test_remove_config_entry_device_only_for_deselected_sites(
 ) -> None:
     """Devices of a site dropped from the filter can be removed; nothing else (#128)."""
     entry = _entry_with_sites({"default": "Default", "site2": "Branch"}, ["default"])
+    device = _hold_an_entity(hass, _device_entry(*identifiers))
 
-    assert (
-        await async_remove_config_entry_device(hass, entry, _device_entry(*identifiers))
-        is expected
-    )
+    assert await async_remove_config_entry_device(hass, entry, device) is expected
 
 
-def _client_device(mac: str, name: str | None, name_by_user: str | None = None) -> MagicMock:
+def _client_device(
+    mac: str, name: str | None, name_by_user: str | None = None
+) -> MagicMock:
     """Build a client device registry entry stub (cmcore fork, backlog 529)."""
     device = _device_entry(f"client_{mac}")
     device.name = name
@@ -570,13 +593,38 @@ async def test_remove_config_entry_device_for_ephemeral_client(
 ) -> None:
     """The fork lets a randomized, unnamed client's device be deleted, nothing else."""
     entry = _entry_with_sites({"default": "Default"}, ["default"])
+    device = _hold_an_entity(hass, _client_device(mac, name, name_by_user))
 
+    assert await async_remove_config_entry_device(hass, entry, device) is expected
+
+
+async def test_remove_config_entry_device_for_empty_client_device(
+    hass: HomeAssistant,
+) -> None:
+    """A client device that holds no entity can be deleted (cmcore fork, backlog 643)."""
+    entry = _entry_with_sites({"default": "Default"}, ["default"])
+    named = _client_device("98:e2:55:40:0c:ad", "Kitchen tablet")
+    named.id = "device-empty"
+
+    # the placeholder left behind once the client's tracker moved back to its uplink
+    assert await async_remove_config_entry_device(hass, entry, named) is True
+
+    # the same device while it holds the client's tracker, enabled or not
     assert (
         await async_remove_config_entry_device(
-            hass, entry, _client_device(mac, name, name_by_user)
+            hass, entry, _hold_an_entity(hass, named)
         )
-        is expected
+        is False
     )
+    disabled = _hold_an_entity(
+        hass, _client_device("98:e2:55:40:0c:ae", "Hall tablet"), disabled=True
+    )
+    assert await async_remove_config_entry_device(hass, entry, disabled) is False
+
+    # an empty device that is not a client device is not covered by this rule
+    network = _device_entry("default_device-1")
+    network.id = "device-empty-network"
+    assert await async_remove_config_entry_device(hass, entry, network) is False
 
 
 async def test_remove_config_entry_device_refused_when_not_loaded(
