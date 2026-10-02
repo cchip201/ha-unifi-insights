@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Topology card: when a card is too short for a node's details, they now open in a dialog over the dashboard, sized to fit them, instead of in a panel cut off by the card. The dialog only scrolls if the screen itself is too short. Cards with room still show the details beside the graph. [#186](https://github.com/ruaan-deysel/ha-unifi-insights/issues/186)
+
 ## [2026.10.0] - 2026-10-01
 
 ### Added

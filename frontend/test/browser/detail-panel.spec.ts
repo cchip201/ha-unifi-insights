@@ -128,16 +128,51 @@ async function expectActionInView(page: Page): Promise<void> {
     await expect(action).toBeFocused();
 }
 
+const dialog = `${panelHost} dialog`;
+
+// A card too short for the details shows them in a modal dialog instead.
+async function expectDialogShowsEverything(page: Page): Promise<void> {
+    const modal = page.locator(dialog);
+    await expect(modal).toBeVisible();
+    expect(await modal.evaluate((element) => element.matches(":modal"))).toBe(
+        true,
+    );
+    const viewport = page.viewportSize()!;
+    const box = await geometry(modal);
+    expectWithin(box, {
+        left: 0,
+        top: 0,
+        right: viewport.width,
+        bottom: viewport.height,
+    });
+    const scrolling = await geometry(page.locator(panel));
+    // The panel fills the dialog exactly: no browser-default frame around it.
+    for (const side of ["left", "top", "right", "bottom"] as const)
+        expect(Math.abs(scrolling[side] - box[side])).toBeLessThanOrEqual(1);
+    expect(box.right - box.left).toBeLessThanOrEqual(400);
+    expect(scrolling.scrollHeight).toBeLessThanOrEqual(scrolling.clientHeight);
+    await expectActionInView(page);
+}
+
+const node = `${card} [data-id="dev:uuid-core"]`;
+
+async function expectInCard(page: Page): Promise<void> {
+    await expect(page.locator(dialog)).toHaveCount(0);
+    await expectContained(page, { overflows: false });
+    expect((await geometry(page.locator(panel))).scrollTop).toBe(0);
+    await expectActionInView(page);
+}
+
 test.describe("topology detail panel overflow", () => {
-    test("desktop card contains and scrolls the full switch detail", async ({
+    test("desktop card with room keeps the details beside the graph", async ({
         page,
     }) => {
         // Reduced motion makes zoom instant, so each transform can be compared.
         await page.emulateMedia({ reducedMotion: "reduce" });
         await page.setViewportSize({ width: 1280, height: 800 });
-        await openFixture(page, { width: 800, height: 360 });
-        await expectContained(page);
-        await scrollToAction(page);
+        await openFixture(page, { width: 800, height: 620 });
+        await expect(page.locator(panelHost)).not.toHaveAttribute("narrow");
+        await expectInCard(page);
 
         const viewport = page.locator(`${card} uit-graph-view g.viewport`);
         const fitted = await viewport.getAttribute("transform");
@@ -152,31 +187,16 @@ test.describe("topology detail panel overflow", () => {
         await page.mouse.move(canvasBox!.x + 180, canvasBox!.y + 130);
         await page.mouse.up();
         await expect(viewport).not.toHaveAttribute("transform", zoomed!);
-        await expectContained(page);
+        await expectContained(page, { overflows: false });
 
         // Shrink across the 600px breakpoint into the narrow bottom sheet.
         await page.locator("#frame").evaluate((frame) => {
             frame.style.width = "560px";
-            frame.style.height = "300px";
         });
         await expect(page.locator(panelHost)).toHaveAttribute("narrow", "");
-        await expectContained(page);
-
-        await scrollToAction(page);
+        await expectContained(page, { overflows: false });
 
         await page.getByRole("button", { name: "Close", exact: true }).click();
-        await expect(page.locator(panel)).toBeHidden();
-    });
-
-    test("narrow card keeps the bottom sheet and actions reachable", async ({
-        page,
-    }) => {
-        await page.setViewportSize({ width: 390, height: 844 });
-        await openFixture(page, { width: 360, height: 320 });
-        await expectContained(page);
-        await scrollToAction(page);
-
-        await page.keyboard.press("Escape");
         await expect(page.locator(panel)).toBeHidden();
     });
 
@@ -189,22 +209,152 @@ test.describe("topology detail panel overflow", () => {
         await openFixture(page, { width: 560, height: 620, unresolved: 93 });
         await expect(page.locator(panelHost)).toHaveAttribute("narrow", "");
         await expect(page.locator(`${card} .notices`)).toBeVisible();
-        await expectContained(page, { overflows: false });
-        await expectActionInView(page);
+        await expectInCard(page);
     });
 
-    test("Sections fixed-height card contains the scrolling panel", async ({
+    test("eight-row narrow Sections card shows full details unscrolled", async ({
         page,
     }) => {
         await page.setViewportSize({ width: 1280, height: 800 });
-        // Five rows is the shortest size that still leaves the panel room for
-        // its final action below the toolbar; the long details still overflow.
+        await openFixture(page, {
+            width: 500,
+            height: sectionsHeight(8),
+            layout: "grid",
+        });
+        await expect(page.locator(panelHost)).toHaveAttribute("narrow", "");
+        await expectInCard(page);
+    });
+
+    test("short desktop card opens the full details in a dialog", async ({
+        page,
+    }) => {
+        // #186 on 2026.10.0: a short card cut the details off, and reaching
+        // Open device needed a scroll inside the card.
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await openFixture(page, { width: 800, height: 360 });
+        await expectDialogShowsEverything(page);
+
+        await page.keyboard.press("Escape");
+        await expect(page.locator(panel)).toBeHidden();
+        await expect(page.locator(dialog)).toHaveCount(0);
+        await expect(page.locator(node)).toBeFocused();
+    });
+
+    test("short narrow card opens the full details in a dialog", async ({
+        page,
+    }) => {
+        await page.setViewportSize({ width: 390, height: 844 });
+        await openFixture(page, { width: 360, height: 320 });
+        await expectDialogShowsEverything(page);
+
+        await page.getByRole("button", { name: "Close", exact: true }).click();
+        await expect(page.locator(dialog)).toHaveCount(0);
+        await expect(page.locator(node)).toBeFocused();
+    });
+
+    test("five-row Sections card dialog closes from the backdrop", async ({
+        page,
+    }) => {
+        await page.setViewportSize({ width: 1280, height: 800 });
         await openFixture(page, {
             width: 800,
             height: sectionsHeight(5),
             layout: "grid",
         });
+        await expectDialogShowsEverything(page);
+
+        await page.mouse.click(4, 4);
+        await expect(page.locator(dialog)).toHaveCount(0);
+        await expect(page.locator(panel)).toBeHidden();
+    });
+
+    test("Open device leaves no dialog behind", async ({ page }) => {
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await openFixture(page, { width: 800, height: 360 });
+        await expectDialogShowsEverything(page);
+
+        await page.getByRole("button", { name: "Open device" }).click();
+        await expect(page).toHaveURL(/\/config\/devices\/device\//);
+        await expect(page.locator(dialog)).toHaveCount(0);
+    });
+
+    test("dragging a text selection onto the backdrop keeps the dialog", async ({
+        page,
+    }) => {
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await openFixture(page, { width: 800, height: 360 });
+        await expectDialogShowsEverything(page);
+
+        const value = await page.locator(`${panel} dd`).first().boundingBox();
+        expect(value).not.toBeNull();
+        await page.mouse.move(value!.x + 2, value!.y + value!.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(4, 4, { steps: 5 });
+        await page.mouse.up();
+        await expect(page.locator(dialog)).toBeVisible();
+    });
+
+    test("detaching the card closes the dialog instead of leaving it in the card", async ({
+        page,
+    }) => {
+        // HA detaches hidden and cached panels and later re-attaches them.
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await openFixture(page, { width: 800, height: 360 });
+        await expectDialogShowsEverything(page);
+
+        await page.evaluate(async () => {
+            const element = window.fixtureCard;
+            const parent = element.parentElement!;
+            element.remove();
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            parent.append(element);
+        });
+        await expect(page.locator(dialog)).toHaveCount(0);
+        await expect(page.locator(panel)).toBeHidden();
+
+        await page.locator(node).click();
+        await expectDialogShowsEverything(page);
+    });
+
+    test("card shrunk after opening keeps the panel in the card and scrollable", async ({
+        page,
+    }) => {
+        // Only opening a panel (or crossing the narrow breakpoint) can turn
+        // it into a dialog; a resize alone leaves the scrolling panel.
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await openFixture(page, { width: 800, height: 620 });
+        await expectInCard(page);
+
+        await page.locator("#frame").evaluate((frame) => {
+            frame.style.height = "360px";
+        });
+        await expect(page.locator(panelHost)).not.toHaveAttribute("narrow");
         await expectContained(page);
+        await expect(page.locator(dialog)).toHaveCount(0);
+        // Nor does the next live update.
+        await page.evaluate(() => window.fixtureUpdate());
+        await page.evaluate(
+            () => new Promise((resolve) => requestAnimationFrame(resolve)),
+        );
+        await expect(page.locator(dialog)).toHaveCount(0);
+        await scrollToAction(page);
+    });
+
+    test("dialog scrolls when the screen itself is too short", async ({
+        page,
+    }) => {
+        await page.setViewportSize({ width: 1280, height: 320 });
+        await openFixture(page, { width: 800, height: 300 });
+        const modal = page.locator(dialog);
+        await expect(modal).toBeVisible();
+        expectWithin(await geometry(modal), {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 320,
+        });
+        const scrolling = await geometry(page.locator(panel));
+        expect(scrolling.scrollHeight).toBeGreaterThan(scrolling.clientHeight);
         await scrollToAction(page);
     });
 });
@@ -213,5 +363,6 @@ declare global {
     interface Window {
         fixtureCard: HTMLElement;
         fixtureReady: boolean;
+        fixtureUpdate: () => void;
     }
 }
