@@ -1,7 +1,10 @@
 """Constants for the UniFi Insights integration."""
 
 from datetime import timedelta
-from typing import Final
+from typing import TYPE_CHECKING, Any, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 DOMAIN = "unifi_insights"
 
@@ -81,6 +84,37 @@ ISP_WAN_NUMBERS: Final = (
     "upload_kbps",
     "uptime",
 )
+# cmcore (backlog 663): the device and Protect coordinators' poll, per config entry,
+# in seconds (options flow). A cloud entry is polled through UniFi's remote connector,
+# which answered HTTP 408 (connector timeout) about 35 times an hour on the offsite
+# console under the 30 s poll; cloud entries default to 120 s, local entries keep 30 s.
+# No option is stored until one is chosen.
+CONF_POLL_INTERVAL: Final = "poll_interval"
+DEFAULT_POLL_INTERVAL_LOCAL: Final = 30
+DEFAULT_POLL_INTERVAL_REMOTE: Final = 120
+MIN_POLL_INTERVAL: Final = 30
+MAX_POLL_INTERVAL: Final = 900
+
+
+def poll_interval_seconds(
+    connection_type: str | None, options: Mapping[str, Any] | None
+) -> int:
+    """Return an entry's device/Protect poll: its option, else its type's default."""
+    default = (
+        DEFAULT_POLL_INTERVAL_REMOTE
+        if connection_type == CONNECTION_TYPE_REMOTE
+        else DEFAULT_POLL_INTERVAL_LOCAL
+    )
+    raw = (options or {}).get(CONF_POLL_INTERVAL, default)
+    if isinstance(raw, bool):
+        return default
+    try:
+        seconds = int(raw)
+    except TypeError, ValueError:
+        return default
+    return max(MIN_POLL_INTERVAL, min(MAX_POLL_INTERVAL, seconds))
+
+
 # Protect coordinator - moderate updates for cameras, sensors (30 seconds)
 # Real-time updates via WebSocket when available
 SCAN_INTERVAL_PROTECT = timedelta(seconds=30)

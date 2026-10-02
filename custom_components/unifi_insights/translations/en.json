@@ -96,12 +96,14 @@
           "track_wifi_clients": "Track WiFi Clients",
           "track_wired_clients": "Track Wired Clients",
           "client_control": "Enable Client Control",
+          "poll_interval": "Poll interval (seconds)",
           "site_ids": "Sites"
         },
         "data_description": {
           "track_wifi_clients": "Create device tracker entities for connected WiFi clients. This may create many entities.",
           "track_wired_clients": "Create device tracker entities for connected wired (LAN) clients. This may create many entities.",
           "client_control": "Create allow/block switch and reconnect button entities for connected clients. Disable to prevent orphaned entities when clients leave the network.",
+          "poll_interval": "How often devices, clients and Protect are polled. Cloud entries default to 120 s because UniFi's remote connector times out under faster polling; local entries default to 30 s. Clear the field to return to the default.",
           "site_ids": "Only poll these sites. Leave empty to include every site on the console. Unselected sites are not queried, which reduces API traffic on multi-site consoles."
         }
       }

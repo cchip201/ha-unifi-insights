@@ -23,11 +23,11 @@ from custom_components.unifi_insights.api.network.models import (
     device_id_is_mac,
     parse_outlet_metrics,
 )
-from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
+from custom_components.unifi_insights.const import DOMAIN
 from custom_components.unifi_insights.data_transforms import normalize_legacy_wans
 from custom_components.unifi_insights.helpers import async_get_device_entry
 
-from .base import UnifiBaseCoordinator
+from .base import UnifiBaseCoordinator, entry_poll_interval
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -142,7 +142,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             protect_client=protect_client,
             entry=entry,
             name="device",
-            update_interval=SCAN_INTERVAL_DEVICE,
+            update_interval=entry_poll_interval(entry),
         )
         self.config_coordinator = config_coordinator
         # Map integration site IDs to classic ("legacy") site names used by the

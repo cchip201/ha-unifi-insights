@@ -123,6 +123,7 @@ After setup, open the integration's options flow (**Settings** → **Devices & S
 | Track Wired Clients   | Off     | Creates device tracker entities for connected wired clients.                                                                                                                                                                         |
 | Enable Client Control | On      | Creates allow/block switch and reconnect button entities for each connected client. Disable this if you only need read-only monitoring — it prevents orphaned unavailable entities from accumulating when clients leave the network. |
 | Sites                 | All     | Only shown when the console has more than one site. Pick the sites to poll; unselected sites are not queried at all, which cuts API traffic on multi-site consoles. Leave empty to include every site.                               |
+| Poll interval (s)     | 30/120  | How often devices, clients and Protect are polled, 30-900 s. Cloud entries default to 120 s because UniFi's remote connector times out (HTTP 408) under faster polling; local entries default to 30 s. Clear the field to return to the default. |
 
 ## Entities
 

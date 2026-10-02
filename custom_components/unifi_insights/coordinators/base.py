@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta  # noqa: TC003
+from datetime import timedelta
 from http import HTTPStatus
 import logging
 from typing import TYPE_CHECKING, Any
@@ -13,7 +13,11 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.const import (
+    CONF_CONNECTION_TYPE,
+    DOMAIN,
+    poll_interval_seconds,
+)
 
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
@@ -31,6 +35,21 @@ if TYPE_CHECKING:
     from custom_components.unifi_insights.api.protect import UniFiProtectClient
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def entry_poll_interval(entry: ConfigEntry) -> timedelta:
+    """
+    Return how often this entry's device and Protect coordinators poll.
+
+    cmcore (backlog 663): the entry's `poll_interval` option when one is set, else
+    120 s for a cloud entry (UniFi's remote connector times out under a 30 s poll)
+    and 30 s for a local one.
+    """
+    return timedelta(
+        seconds=poll_interval_seconds(
+            entry.data.get(CONF_CONNECTION_TYPE), entry.options
+        )
+    )
 
 
 class UnifiBaseCoordinator(DataUpdateCoordinator[dict[str, Any]]):
