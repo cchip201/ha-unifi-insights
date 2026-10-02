@@ -57,6 +57,7 @@ from .entity import (
     first_not_none,
     get_field,
     is_gateway_device,
+    site_unique_id_prefix,
 )
 from .entity import (
     get_client_type as _get_client_type,
@@ -2284,7 +2285,8 @@ class UnifiSiteClientSensor(CoordinatorEntity[UnifiFacadeCoordinator], SensorEnt
         self.entity_description = description
         self._site_id = site_id
 
-        self._attr_unique_id = f"{site_id}_{description.key}"
+        prefix = site_unique_id_prefix(coordinator.data, site_id)
+        self._attr_unique_id = f"{prefix}_{description.key}"
         self._attr_device_info = DeviceInfo(**self._build_device_info())  # type: ignore[typeddict-item]
 
     def _build_device_info(self) -> dict[str, Any]:

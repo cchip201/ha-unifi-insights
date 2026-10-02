@@ -16,7 +16,11 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .coordinators import UnifiFacadeCoordinator
-from .entity import build_site_device_info, find_site_gateway_device_id
+from .entity import (
+    build_site_device_info,
+    find_site_gateway_device_id,
+    site_unique_id_prefix,
+)
 
 
 @dataclass
@@ -194,7 +198,9 @@ class UnifiSiteInternetActivitySensor(
         self.entity_description = description
         self._site_id = site_id
 
-        self._attr_unique_id = f"{site_id}_{description.key}"
+        self._attr_unique_id = (
+            f"{site_unique_id_prefix(coordinator.data, site_id)}_{description.key}"
+        )
         self._attr_device_info = DeviceInfo(**self._build_device_info())  # type: ignore[typeddict-item]
         self._attr_extra_state_attributes = {
             "period": description.period_label,

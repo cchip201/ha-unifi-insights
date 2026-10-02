@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from custom_components.unifi_insights import (
     SETUP_PROBE_RETRIES,
     UnifiInsightsData,
+    _migrate_site_unique_ids,
     _raise_for_setup_probes,
     async_remove_config_entry_device,
 )
@@ -33,6 +34,7 @@ from custom_components.unifi_insights.api.innerspace import (
     InnerSpaceProjectIdentity,
 )
 from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.entity import site_unique_id_prefix
 from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
 
 
@@ -1083,3 +1085,88 @@ async def test_setup_entry_innerspace_only_console(
 
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
     mock_innerspace_client.close.assert_awaited()
+
+
+# ---- cmcore (backlog 648, 2026-10-01): site-level ids are per console ----------
+SITE = "88f7af54-98f8-306a-a1c7-c9349722b1f6"  # every console's default site id
+CMCORE_GW = "e0:63:da:88:c0:bb"
+OFFSITE_GW = "aa:bb:cc:dd:ee:ff"
+
+
+def _console(hass: HomeAssistant, gateway: str) -> tuple[MockConfigEntry, str]:
+    """Register a config entry and its gateway device, as each console does."""
+    entry = MockConfigEntry(domain=DOMAIN, title=f"console {gateway}")
+    entry.add_to_hass(hass)
+    dev = dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, f"{SITE}_{gateway}")}
+    )
+    return entry, dev.id
+
+
+def _data(gateway: str) -> dict:
+    return {"devices": {SITE: {gateway: {"model": "UDMPRO", "name": gateway}}}}
+
+
+async def test_site_rows_move_to_their_own_console_and_no_other(
+    hass: HomeAssistant,
+) -> None:
+    """
+    Move each site row to the console whose gateway device holds it.
+
+    CMCore's WAN usage sensors sat on the offsite console's device: the shared
+    site id made `<site>_<key>` one row for every console.
+    """
+    cmcore, cmcore_dev = _console(hass, CMCORE_GW)
+    offsite, offsite_dev = _console(hass, OFFSITE_GW)
+    reg = er.async_get(hass)
+    # last claimed by the OFFSITE entry, but on CMCore's gateway: the 10-01 shape
+    row = reg.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{SITE}_internet_download_1h",
+        config_entry=offsite,
+        device_id=cmcore_dev,
+        suggested_object_id="network_cmcoreudmp_internet_download_last_hour",
+    )
+    stray = reg.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{SITE}_site_total_clients",
+        config_entry=offsite,
+        device_id=offsite_dev,
+    )
+
+    # the offsite entry moves only the row on its own gateway
+    assert _migrate_site_unique_ids(hass, offsite, _data(OFFSITE_GW)) == 1
+    stray_now = reg.async_get(stray.entity_id)
+    assert stray_now.unique_id == f"{SITE}_{OFFSITE_GW}_site_total_clients"
+    row_now = reg.async_get(row.entity_id)
+    assert row_now.unique_id == f"{SITE}_internet_download_1h"
+
+    # CMCore's entry takes its row: same entity_id, so the history stays
+    assert _migrate_site_unique_ids(hass, cmcore, _data(CMCORE_GW)) == 1
+    moved = reg.async_get(row.entity_id)
+    assert moved.unique_id == f"{SITE}_{CMCORE_GW}_internet_download_1h"
+    assert moved.config_entry_id == cmcore.entry_id
+    assert moved.entity_id == row.entity_id
+
+    # a second run is a no-op; a site with no gateway keeps the upstream id
+    assert _migrate_site_unique_ids(hass, cmcore, _data(CMCORE_GW)) == 0
+    no_gateway = {"devices": {SITE: {"sw1": {"model": "USW24"}}}}
+    assert _migrate_site_unique_ids(hass, cmcore, no_gateway) == 0
+
+
+def test_site_sensor_ids_carry_the_gateway_only_when_there_is_one() -> None:
+    assert site_unique_id_prefix(_data(CMCORE_GW), SITE) == f"{SITE}_{CMCORE_GW}"
+    no_gateway = {"devices": {SITE: {"sw1": {"model": "USW24"}}}}
+    assert site_unique_id_prefix(no_gateway, SITE) == SITE
+    assert site_unique_id_prefix(None, SITE) == SITE
+
+
+async def test_site_migration_and_ids_tolerate_malformed_device_data(
+    hass: HomeAssistant,
+) -> None:
+    entry, _ = _console(hass, CMCORE_GW)
+    for bad in ({"devices": "garbage"}, {"devices": None}, {}):
+        assert _migrate_site_unique_ids(hass, entry, bad) == 0
+        assert site_unique_id_prefix(bad, SITE) == SITE

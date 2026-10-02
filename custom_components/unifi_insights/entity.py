@@ -149,6 +149,27 @@ def find_site_gateway_device_id(
     return None
 
 
+def site_unique_id_prefix(
+    coordinator_data: dict[str, Any] | None, site_id: str
+) -> str:
+    """
+    Return the unique-id prefix of a site-level entity: `<site>_<gateway>`.
+
+    cmcore (backlog 648, 2026-10-01): every console's default site has the same
+    id, so a site-level sensor keyed `<site>_<key>` was claimed by whichever
+    config entry registered it last - CMCore's WAN usage sensors sat on the
+    offsite console's device, moved back at a restart and away again minutes
+    later. The gateway (the console itself on a UDM) makes the id per console;
+    a site with no gateway keeps the upstream `<site>` prefix.
+    """
+    if not isinstance(coordinator_data, dict) or not isinstance(
+        coordinator_data.get("devices"), dict
+    ):
+        return site_id
+    gateway_id = find_site_gateway_device_id(coordinator_data, site_id)
+    return f"{site_id}_{gateway_id}" if gateway_id else site_id
+
+
 def build_site_device_info(
     coordinator_data: dict[str, Any], site_id: str
 ) -> dict[str, Any]:

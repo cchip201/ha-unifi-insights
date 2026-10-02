@@ -3109,7 +3109,9 @@ class TestUnifiSiteClientSensor:
             description=desc,
             site_id="site1",
         )
-        assert sensor.unique_id == "site1_site_total_clients"
+        # cmcore (backlog 648): a site with a gateway keys its site-level ids
+        # by it, because every console's default site shares one id
+        assert sensor.unique_id == "site1_device2_site_total_clients"
 
     async def test_available(self, hass: HomeAssistant, mock_coordinator_with_clients):
         """Test availability follows coordinator update success."""

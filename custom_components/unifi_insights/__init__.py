@@ -285,6 +285,65 @@ def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
     return first_non_default_site_id(sites)
 
 
+def _migrate_site_unique_ids(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator_data: dict[str, Any]
+) -> int:
+    """
+    Move site-level sensor rows from `<site>_<key>` to `<site>_<gateway>_<key>`.
+
+    cmcore (backlog 648, 2026-10-01): see entity.site_unique_id_prefix. A row moves
+    only when its device is THIS console's gateway device (identifier
+    `<site>_<gateway>`), so a row another console last claimed is left for that
+    console's entry; it is re-homed to this entry. Returns how many moved.
+    """
+    # Imports stay lazy here: HA loads the platform modules itself.
+    from homeassistant.helpers import device_registry as dr  # noqa: PLC0415
+
+    from .entity import find_site_gateway_device_id  # noqa: PLC0415
+    from .sensor import SITE_CLIENT_SENSOR_TYPES  # noqa: PLC0415
+    from .site_internet_activity_sensor import (  # noqa: PLC0415
+        SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
+    )
+
+    keys = {d.key for d in SITE_CLIENT_SENSOR_TYPES} | {
+        d.key for d in SITE_INTERNET_ACTIVITY_SENSOR_TYPES
+    }
+    ent_reg = er.async_get(hass)
+    dev_reg = dr.async_get(hass)
+    moved = 0
+    devices = coordinator_data.get("devices")
+    if not isinstance(devices, dict):
+        return 0
+    for site_id in devices:
+        gateway_id = find_site_gateway_device_id(coordinator_data, site_id)
+        if not gateway_id:
+            continue
+        gateway_identifier = (DOMAIN, f"{site_id}_{gateway_id}")
+        for key in keys:
+            old_uid = f"{site_id}_{key}"
+            new_uid = f"{site_id}_{gateway_id}_{key}"
+            entity_id = ent_reg.async_get_entity_id(Platform.SENSOR, DOMAIN, old_uid)
+            if entity_id is None or ent_reg.async_get_entity_id(
+                Platform.SENSOR, DOMAIN, new_uid
+            ):
+                continue
+            row = ent_reg.async_get(entity_id)
+            device = dev_reg.async_get(row.device_id) if row and row.device_id else None
+            if device is None or gateway_identifier not in device.identifiers:
+                continue
+            ent_reg.async_update_entity(
+                entity_id, new_unique_id=new_uid, config_entry_id=entry.entry_id
+            )
+            moved += 1
+    if moved:
+        _LOGGER.info(
+            "Moved %d site-level sensor(s) to per-console unique ids (%s)",
+            moved,
+            entry.title,
+        )
+    return moved
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: UnifiInsightsConfigEntry
 ) -> bool:
@@ -599,6 +658,13 @@ async def async_setup_entry(
             site_manager_fingerprint=site_manager_fingerprint,
             _facade_coordinator=facade_coordinator,
         )
+
+        # cmcore (backlog 648): site-level ids gain the console's gateway; move the
+        # existing rows first so they keep their entity_id and history.
+        device_data = (
+            device_coordinator.data if isinstance(device_coordinator.data, dict) else {}
+        )
+        _migrate_site_unique_ids(hass, entry, {"devices": device_data.get("devices")})
 
         _LOGGER.debug("Setting up platforms: %s", PLATFORMS)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
