@@ -4,19 +4,26 @@ import { defineConfig } from "vitest/config";
 // HACS ships it. CI rebuilds and fails if the committed file differs.
 export default defineConfig({
     build: {
-        lib: {
-            entry: "src/index.ts",
-            formats: ["es"],
-            fileName: () => "topology-card.js",
-        },
+        modulePreload: false,
         outDir: "../custom_components/unifi_insights/frontend",
-        emptyOutDir: false,
+        emptyOutDir: true,
         target: "es2022",
         minify: true,
         sourcemap: false,
         reportCompressedSize: false,
         rollupOptions: {
+            input: {
+                "topology-card": "src/index.ts",
+                "site-health-card": "src/site-health-card.ts",
+                "internet-activity-card": "src/internet-activity-card.ts",
+                "performance-card": "src/performance-card.ts",
+                "protect-status-card": "src/protect-status-card.ts",
+                "timeline-card": "src/timeline-card.ts",
+            },
             output: {
+                format: "es",
+                entryFileNames: "[name].js",
+                chunkFileNames: "chunks/[name]-[hash].js",
                 minify: {
                     compress: true,
                     mangle: { toplevel: true },

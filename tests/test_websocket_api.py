@@ -1,8 +1,11 @@
+# Copyright (c) 2026 Ruaan Deysel
+
 """Tests for the topology WebSocket API."""
 
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock, patch
 
@@ -639,3 +642,311 @@ async def test_subscribe_builder_error_does_not_break_listeners(
     assert calls == ["entity"]
     assert f"Failed to rebuild the topology snapshot for {SITE}" in caplog.text
     assert "Unexpected error updating listener" not in caplog.text
+
+
+async def test_timeline_subscribe_pushes_on_in_place_protect_event_update(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Timeline stream updates when Protect events mutate in place."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    data["protect"] = {"events": {"motion": {}}}
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 501,
+            "type": "unifi_insights/timeline/subscribe",
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+            "max_items": 10,
+            "hours": 24,
+            "categories": ["security"],
+        }
+    )
+    assert (await client.receive_json())["success"]
+    initial = await client.receive_json()
+    assert initial["type"] == "event"
+    assert initial["event"]["included"] == 0
+
+    data["protect"]["events"]["motion"]["evt-1"] = {
+        "id": "evt-1",
+        "device_id": "uuid-ap",
+        "name": "AP",
+        "timestamp": 4_102_444_800_000,
+    }
+    facade.async_update_listeners()
+
+    update = await client.receive_json()
+    assert update["type"] == "event"
+    assert update["event"]["included"] == 1
+
+
+async def test_site_health_get_returns_snapshot(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Site health get returns a snapshot for a selected site."""
+    _seed(init_integration)
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 90,
+            "type": "unifi_insights/site_health/get",
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+        }
+    )
+    msg = await client.receive_json()
+
+    assert msg["success"]
+    assert msg["result"]["site_id"] == SITE
+    assert msg["result"]["status"] in {"ok", "partial"}
+    assert "health" in msg["result"]
+
+
+async def test_internet_activity_get_returns_snapshot(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Internet activity get returns configured window totals."""
+    _seed(init_integration)
+    data = init_integration.runtime_data.coordinator.data
+    data["internet_activity"] = {
+        SITE: {
+            "1h": {"rx_bytes": 1000, "tx_bytes": 500},
+            "1d": {"rx_bytes": 2000, "tx_bytes": 1000},
+        }
+    }
+    data["internet_activity_unavailable"] = set()
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 91,
+            "type": "unifi_insights/internet_activity/get",
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+        }
+    )
+    msg = await client.receive_json()
+
+    assert msg["success"]
+    assert msg["result"]["windows"]["1h"]["download_bytes"] == 1000
+    assert msg["result"]["windows"]["1h"]["upload_bytes"] == 500
+
+
+async def test_performance_get_returns_snapshot(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Performance get returns device performance rows."""
+    _seed(init_integration)
+    stats = init_integration.runtime_data.coordinator.data.setdefault("stats", {})
+    stats[SITE] = {
+        "uuid-gw": {
+            "cpuUtilizationPct": 10,
+            "memoryUtilizationPct": 20,
+            "tx_rate": 100,
+            "rx_rate": 50,
+        }
+    }
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 92,
+            "type": "unifi_insights/performance/get",
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+        }
+    )
+    msg = await client.receive_json()
+
+    assert msg["success"]
+    assert isinstance(msg["result"].get("devices"), list)
+    assert any(device["id"] == f"{SITE}:uuid-gw" for device in msg["result"]["devices"])
+
+
+async def test_timeline_get_returns_snapshot(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Timeline get returns recent events in security category."""
+    _seed(init_integration)
+    data = init_integration.runtime_data.coordinator.data
+    data.setdefault("protect", {}).setdefault("events", {}).setdefault("motion", {})[
+        "evt-1"
+    ] = {
+        "id": "evt-1",
+        "device_id": "uuid-ap",
+        "name": "AP",
+        "timestamp": int(datetime.now(tz=UTC).timestamp() * 1000),
+    }
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 93,
+            "type": "unifi_insights/timeline/get",
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+            "hours": 24,
+            "max_items": 10,
+            "categories": ["security"],
+        }
+    )
+    msg = await client.receive_json()
+
+    assert msg["success"]
+    assert msg["result"]["status"] == "ok"
+    assert isinstance(msg["result"].get("items"), list)
+    assert any(item["id"] == "evt:evt-1" for item in msg["result"]["items"])
+
+
+async def test_protect_sources_and_get_and_subscribe(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Protect sources, get, and subscribe return snapshots and stream updates."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    data["protect"] = {
+        "cameras": {},
+        "chimes": {},
+        "nvrs": {"nvr-1": {"storage": {"healthy": True, "used": 40.0}}},
+    }
+    client = await hass_ws_client(hass)
+
+    await client.send_json({"id": 94, "type": "unifi_insights/protect/sources"})
+    sources_msg = await client.receive_json()
+    assert sources_msg["success"]
+    assert any(
+        source["entry_id"] == init_integration.entry_id
+        for source in sources_msg["result"]
+    )
+
+    await client.send_json(
+        {
+            "id": 95,
+            "type": "unifi_insights/protect/get",
+            "entry_id": init_integration.entry_id,
+        }
+    )
+    get_msg = await client.receive_json()
+    assert get_msg["success"]
+    assert get_msg["result"]["status"] == "ok"
+
+    await client.send_json(
+        {
+            "id": 96,
+            "type": "unifi_insights/protect/subscribe",
+            "entry_id": init_integration.entry_id,
+        }
+    )
+    assert (await client.receive_json())["success"]
+    initial = await client.receive_json()
+    assert initial["type"] == "event"
+    assert initial["event"]["status"] == "ok"
+
+    data["protect"]["nvrs"]["nvr-1"]["storage"]["healthy"] = False
+    facade.async_update_listeners()
+    updated = await client.receive_json()
+    assert updated["type"] == "event"
+    assert updated["event"]["status"] == "degraded"
+
+    await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()
+    unloaded_evt = await client.receive_json()
+    assert unloaded_evt["type"] == "event"
+    assert unloaded_evt["event"]["status"] == "unavailable"
+
+
+async def test_dashboard_site_subscriptions_and_errors(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client, caplog
+) -> None:
+    """Cover get/subscribe error codes, updates, and unload for site dashboard streams."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    data["internet_activity"] = {
+        SITE: {"1h": {"rx_bytes": 1000, "tx_bytes": 500}},
+    }
+    data["internet_activity_unavailable"] = set()
+    data["stats"] = {SITE: {"uuid-gw": {"cpuUtilizationPct": 12}}}
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+
+    for idx, cmd in enumerate(
+        (
+            "unifi_insights/site_health/get",
+            "unifi_insights/internet_activity/get",
+            "unifi_insights/performance/get",
+            "unifi_insights/timeline/get",
+        ),
+        start=200,
+    ):
+        await client.send_json(
+            {"id": idx, "type": cmd, "entry_id": "missing", "site_id": SITE}
+        )
+        err = await client.receive_json()
+        assert err["error"]["code"] == "entry_not_found"
+
+    await client.send_json(
+        {"id": 210, "type": "unifi_insights/protect/get", "entry_id": "missing"}
+    )
+    assert (await client.receive_json())["error"]["code"] == "entry_not_found"
+
+    await client.send_json(
+        {
+            "id": 211,
+            "type": "unifi_insights/protect/subscribe",
+            "entry_id": "missing",
+        }
+    )
+    assert (await client.receive_json())["error"]["code"] == "entry_not_found"
+
+    await client.send_json(
+        {
+            "id": 212,
+            "type": "unifi_insights/site_health/subscribe",
+            "entry_id": "missing",
+            "site_id": SITE,
+        }
+    )
+    assert (await client.receive_json())["error"]["code"] == "entry_not_found"
+
+    for idx, cmd in enumerate(
+        (
+            "unifi_insights/site_health/subscribe",
+            "unifi_insights/internet_activity/subscribe",
+            "unifi_insights/performance/subscribe",
+        ),
+        start=220,
+    ):
+        await client.send_json(
+            {
+                "id": idx,
+                "type": cmd,
+                "entry_id": init_integration.entry_id,
+                "site_id": SITE,
+            }
+        )
+        assert (await client.receive_json())["success"]
+        initial = await client.receive_json()
+        assert initial["type"] == "event"
+
+    # Trigger rebuild error logging isolation
+    _rename_ap(data, "AP-Renamed")
+    with (
+        caplog.at_level(logging.ERROR),
+        patch(
+            "custom_components.unifi_insights.websocket_api.build_site_health_snapshot",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        facade.async_update_listeners()
+    assert "Failed to rebuild site_health snapshot" in caplog.text
+
+    # Drain performance update from _rename_ap
+    perf_evt = await client.receive_json()
+    assert perf_evt["type"] == "event"
+
+    await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()

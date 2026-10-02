@@ -52,7 +52,7 @@ describe("registration", () => {
         );
         expect(entries).toEqual([
             expect.objectContaining({
-                name: "UniFi Insights Topology",
+                name: "UniFi Topology",
                 preview: true,
             }),
         ]);
