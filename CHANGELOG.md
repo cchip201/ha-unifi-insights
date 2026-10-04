@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.10.1] - 2026-10-04
+
 ### Fixed
 
 - WiFi devices (`WiFi: <SSID>`) can now be deleted from the device page once no polled site provides that network any more, for example after deselecting its site in the options or deleting the network on the controller. Previously Home Assistant rejected the removal with "Failed to remove device entry, rejected by integration". WiFi networks still served by a polled site, and any network whose site failed to refresh, still can't be removed. [#213](https://github.com/ruaan-deysel/ha-unifi-insights/issues/213)
