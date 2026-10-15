@@ -173,7 +173,7 @@ After setup, open the integration's options flow (**Settings** → **Devices & S
 | Entity              | Description                                      |
 | ------------------- | ------------------------------------------------ |
 | WiFi Network        | Enable or disable a WiFi broadcast               |
-| Firewall Rule       | Enable or disable a user-defined firewall policy |
+| Firewall Rule       | Enable or disable a user-defined firewall policy. A policy the console generates from another one (a "(Return)" policy) has no switch: it follows its parent, and its id changes whenever a policy is deleted |
 | Client Allow        | Block or allow a connected network client        |
 | Traffic Route       | Enable or disable a policy-based traffic route   |
 | VPN Client          | Enable or disable a VPN client interface         |
