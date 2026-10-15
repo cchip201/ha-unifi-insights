@@ -7,6 +7,7 @@
   "config_flow": true,
   "dependencies": [
     "ffmpeg",
+    "media_source",
     "stream",
     "wake_on_lan",
     "webhook",
