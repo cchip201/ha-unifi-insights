@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Mobility router entity child linking detects `via_device_id` using `DeviceInfo.__annotations__` instead of `DeviceInfo.__optional_keys__` for Home Assistant 2026.11 dataclass compatibility. [#324](https://github.com/tinkerologie/ha-unifi-insights/issues/324), [home-assistant/core#185211](https://github.com/home-assistant/core/issues/185211)
+
 - Local validation now uses the project environment for the complete mypy check, including Home Assistant's actual schema types. Generated frontend bundles are excluded from source spelling/formatting hooks; source formatting, YAML, copyright notices and keyword-only helper calls were aligned with the repository's existing checks. Runtime schema imports remain compatible with the supported older HA versions. [#283](https://github.com/tinkerologie/ha-unifi-insights/issues/283)
 
 - PR labeler (now the shared tinkerologie workflow) applies at most one type label: the title's Conventional Commit type decides (`feat` → `enhancement`, `fix` → `bug`, other types → neither), then the branch prefix, then a single ticked Type of Change box, then the linked issues. A contradicting type label added by automation is removed; one added by a person is kept. The label is re-evaluated when the title or description is edited, and a CHANGELOG.md-only change no longer adds `documentation`.
@@ -25,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated repository and documentation URLs to `tinkerologie` organization
 - Configured Codecov GitHub Actions workflow for tokenless coverage uploads
 - Diagnostics now also redact the address, domain and MAC filters of firewall policies and the domains, address ranges and next hop of policy-based routes.
+- Changed `script/test` to provision Home Assistant 2026.10.1 with `pytest-homeassistant-custom-component` 0.13.372 (previously 2026.6.2 and 0.13.338) as the default local test target. The minimum supported Home Assistant version stays 2026.6.0.
 
 ### Added
 
@@ -89,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Corrected ten known vendored API contract mismatches against Network v10.6.106 and Protect v7.3.70: network creation no longer injects legacy DHCP fields; traffic lists send `items`; firewall policies and Wi-Fi broadcasts use nested configuration; WAN listing omits the unsupported filter; DPI category and application IDs accept integers; Protect uploads send multipart binary content with a fresh body per retry; and sensor motion sensitivity uses `motionSettings.sensitivity`. [#320](https://github.com/tinkerologie/ha-unifi-insights/issues/320)
 - Vendored Network creation methods now raise `ValueError` before sending unsupported or ambiguous legacy DHCP, traffic-list, firewall and Wi-Fi inputs. Supply management-specific network fields and traffic-list `items` when legacy arguments have no supported translation. Traffic-list `description` is unsupported; WAN `filter_str` remains accepted but is ignored.
+- Disabling Carrier Fabric subscriber tracking now preserves devices and entities owned by another config entry on older Home Assistant registries. [#323](https://github.com/tinkerologie/ha-unifi-insights/issues/323)
 - A temporary Access outage during startup now recovers through polling and entity discovery without reloading the entry. Failed webhook cleanup during a host or port change preserves the old receiver and connection settings instead of orphaning the registration. An identity conflict or save error after cleanup schedules an entry reload to rebuild its webhook. Access shutdown cancels notification-triggered and periodic snapshot reads before closing the client. [#283](https://github.com/tinkerologie/ha-unifi-insights/issues/283)
 - Access notification close handshakes now have a firm deadline when a console keeps sending frames without a CLOSE reply, preventing cleanup before reconnect from waiting indefinitely. [#283](https://github.com/tinkerologie/ha-unifi-insights/issues/283)
 - The topology card's zoom in, zoom out and fit buttons now use the same rounded shape as the other toolbar buttons, with their icons centred, instead of circles with off-centre icons.
