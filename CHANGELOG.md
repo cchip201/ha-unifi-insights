@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.10.2] - 2026-10-16
+
 ### Changed
 
 - Group clients by uplink device once per site to reduce repeated scans while preserving client ordering and skipping non-string uplink identifiers. [#328](https://github.com/tinkerologie/ha-unifi-insights/issues/328)
@@ -29,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configured Codecov GitHub Actions workflow for tokenless coverage uploads
 - Diagnostics now also redact the address, domain and MAC filters of firewall policies and the domains, address ranges and next hop of policy-based routes.
 - Changed `script/test` to provision Home Assistant 2026.10.1 with `pytest-homeassistant-custom-component` 0.13.372 (previously 2026.6.2 and 0.13.338) as the default local test target. The minimum supported Home Assistant version stays 2026.6.0.
+- **Breaking change:** The chime **Ringtone** select and `unifi_insights.set_chime_ringtone` now use opaque Protect ringtone IDs instead of the fixed names `default`, `mechanical`, `digital`, `christmas`, `traditional`, `custom1` and `custom2`. The select shows only IDs already used by this console's chimes; the action also accepts IDs not currently in use, which the console validates. Update ringtone automations to use the ID shown by the select or its `chime_ringtone_id` attribute. Entity and action names are unchanged. [#268](https://github.com/tinkerologie/ha-unifi-insights/issues/268)
+- **Breaking change:** The camera **Microphone** switch is replaced with a read-only **Microphone** binary sensor reporting `isMicEnabled`, unless the camera reports it has no microphone. The Protect API `PATCH /v1/cameras/{id}` schema does not accept `isMicEnabled` and rejects requests with unknown fields, making the microphone state unwritable. Existing `switch.*_microphone` entity registry entries are automatically removed on upgrade, and the microphone state is now available under `binary_sensor.<camera name>_microphone`. Any automations attempting to toggle the switch must be removed or updated. ([#269](https://github.com/tinkerologie/ha-unifi-insights/issues/269))
+- Aligned the vendored UniFi Network API client with OpenAPI spec v10.6.106: updated device adoption path and limit flag, removed non-spec device locate and site lookup methods, updated DPI categories/applications and country lookups to unscoped endpoints with pagination, corrected firewall policy ordering endpoints and query parameters, enabled firewall policy patching, aligned site-to-site VPN tunnel paths, converted network updates to full-object PUT requests, and added voucher deletion by filter.
+- The README is reorganized around the supported UniFi products: Network, Protect, InnerSpace, Mobility, Site Manager and Carrier Fabric (ISP). It now has an overview, a product summary, setup steps per connection type, all registered actions and all six dashboard cards. The "How this differs from the official integrations" section is removed. Inaccurate claims are corrected: firmware update entities don't install firmware, there is no PoE port power-cycle action, there is no Recording binary sensor or Recording Mode select, and the topology card is listed as "UniFi Topology". [#230](https://github.com/tinkerologie/ha-unifi-insights/issues/230)
+- Vendored Protect client aligned with Protect API v7.3.70: removed undocumented endpoints that nothing called; added users, ULP users and POS transaction ingest.
 
 ### Added
 
@@ -75,14 +82,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Older Protect versions that lack these endpoints are checked once an hour instead of on every poll, and logged once.
   - Diagnostics redact the tamper user name and the Thread network name and IDs.
 - UniFi Protect sirens appear as siren entities. Turning one on sounds it for 5, 10, 20 or 30 seconds (Protect's default is 5) and can set its volume first. Turning it off stops it right away. Protect versions without sirens are checked once an hour and logged once. [#219](https://github.com/tinkerologie/ha-unifi-insights/issues/219)
-
-### Changed
-
-- **Breaking change:** The chime **Ringtone** select and `unifi_insights.set_chime_ringtone` now use opaque Protect ringtone IDs instead of the fixed names `default`, `mechanical`, `digital`, `christmas`, `traditional`, `custom1` and `custom2`. The select shows only IDs already used by this console's chimes; the action also accepts IDs not currently in use, which the console validates. Update ringtone automations to use the ID shown by the select or its `chime_ringtone_id` attribute. Entity and action names are unchanged. [#268](https://github.com/tinkerologie/ha-unifi-insights/issues/268)
-- **Breaking change:** The camera **Microphone** switch is replaced with a read-only **Microphone** binary sensor reporting `isMicEnabled`, unless the camera reports it has no microphone. The Protect API `PATCH /v1/cameras/{id}` schema does not accept `isMicEnabled` and rejects requests with unknown fields, making the microphone state unwritable. Existing `switch.*_microphone` entity registry entries are automatically removed on upgrade, and the microphone state is now available under `binary_sensor.<camera name>_microphone`. Any automations attempting to toggle the switch must be removed or updated. ([#269](https://github.com/tinkerologie/ha-unifi-insights/issues/269))
-- Aligned the vendored UniFi Network API client with OpenAPI spec v10.6.106: updated device adoption path and limit flag, removed non-spec device locate and site lookup methods, updated DPI categories/applications and country lookups to unscoped endpoints with pagination, corrected firewall policy ordering endpoints and query parameters, enabled firewall policy patching, aligned site-to-site VPN tunnel paths, converted network updates to full-object PUT requests, and added voucher deletion by filter.
-- The README is reorganized around the supported UniFi products: Network, Protect, InnerSpace, Mobility, Site Manager and Carrier Fabric (ISP). It now has an overview, a product summary, setup steps per connection type, all registered actions and all six dashboard cards. The "How this differs from the official integrations" section is removed. Inaccurate claims are corrected: firmware update entities don't install firmware, there is no PoE port power-cycle action, there is no Recording binary sensor or Recording Mode select, and the topology card is listed as "UniFi Topology". [#230](https://github.com/tinkerologie/ha-unifi-insights/issues/230)
-- Vendored Protect client aligned with Protect API v7.3.70: removed undocumented endpoints that nothing called; added users, ULP users and POS transaction ingest.
 
 ### Removed
 
