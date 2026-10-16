@@ -3548,6 +3548,208 @@ class TestUnifiDeviceCoordinator:
             "uplink_remote_port": 6,
         }
 
+    @pytest.mark.asyncio
+    async def test_process_device_filters_clients_without_index(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Direct device callers retain filtering, order, and client identity."""
+        coordinator.network_client.devices.get_statistics = AsyncMock(
+            return_value=_create_mock_model({"uptimeSec": 60})
+        )
+        camel = {"id": "camel", "uplinkDeviceId": "device1"}
+        snake = {"id": "snake", "uplink_device_id": "device1"}
+        other = {"id": "other", "uplinkDeviceId": "device2"}
+        fallback = {
+            "id": "fallback",
+            "uplinkDeviceId": "",
+            "uplink_device_id": "device1",
+        }
+        camel_priority = {
+            "id": "priority",
+            "uplinkDeviceId": "device2",
+            "uplink_device_id": "device1",
+        }
+        clients = [snake, other, camel, fallback, camel_priority, {"id": "unlinked"}]
+
+        _, _, stats = await coordinator._process_device(
+            "default", {"id": "device1"}, clients
+        )
+
+        assert stats["clients"] == [snake, camel, fallback]
+        assert stats["clients"][0] is snake
+        assert stats["clients"][1] is camel
+        assert stats["clients"][2] is fallback
+
+    @pytest.mark.asyncio
+    async def test_process_site_groups_clients_by_uplink(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Site processing groups clients by uplink device in a single pass."""
+        dev_a = {"id": "a", "name": "Device A"}
+        dev_b = {"id": "b", "name": "Device B"}
+        dev_empty = {"id": "empty", "name": "Device Empty"}
+
+        coordinator.network_client.devices.get_all = AsyncMock(
+            return_value=[
+                _create_mock_model(dev_a),
+                _create_mock_model(dev_b),
+                _create_mock_model(dev_empty),
+            ]
+        )
+        coordinator.network_client.devices.get_statistics = AsyncMock(
+            side_effect=lambda site_id, device_id: _create_mock_model(
+                {
+                    "cpuUtilizationPct": 15.2,
+                    "memoryUtilizationPct": 42.8,
+                    "uptimeSec": 864000,
+                }
+            )
+        )
+
+        client_a1 = {"id": "a1", "name": "Client A1", "uplinkDeviceId": "a"}
+        client_b1 = {"id": "b1", "name": "Client B1", "uplink_device_id": "b"}
+        client_a2 = {"id": "a2", "name": "Client A2", "uplink_device_id": "a"}
+        client_both = {
+            "id": "both",
+            "name": "Client Both",
+            "uplinkDeviceId": "b",
+            "uplink_device_id": "a",
+        }
+        client_fallback = {
+            "id": "fallback",
+            "name": "Client Fallback",
+            "uplinkDeviceId": "",
+            "uplink_device_id": "a",
+        }
+        client_missing = {
+            "id": "missing",
+            "name": "Client Missing",
+            "uplinkDeviceId": None,
+            "uplink_device_id": "",
+        }
+        client_unlinked = {"id": "unlinked", "name": "Client Unlinked"}
+        client_unknown = {
+            "id": "unknown",
+            "name": "Client Unknown",
+            "uplinkDeviceId": "unknown-uplink",
+        }
+        client_bad_list = {
+            "id": "bad_list",
+            "name": "Client Bad List",
+            "uplinkDeviceId": ["bad", "list"],
+        }
+        client_bad_dict = {
+            "id": "bad_dict",
+            "name": "Client Bad Dict",
+            "uplinkDeviceId": {"nested": "dict"},
+        }
+        client_bad_int = {
+            "id": "bad_int",
+            "name": "Client Bad Int",
+            "uplinkDeviceId": 123,
+        }
+        client_bad_bool = {
+            "id": "bad_bool",
+            "name": "Client Bad Bool",
+            "uplinkDeviceId": True,
+        }
+        client_bad_float = {
+            "id": "bad_float",
+            "name": "Client Bad Float",
+            "uplinkDeviceId": 45.67,
+        }
+        client_camel_priority = {
+            "id": "camel_priority",
+            "name": "Client Camel Priority",
+            "uplinkDeviceId": ["bad"],
+            "uplink_device_id": "a",
+        }
+
+        coordinator.network_client.clients.get_all = AsyncMock(
+            return_value=[
+                _create_mock_model(client_a1),
+                _create_mock_model(client_b1),
+                _create_mock_model(client_a2),
+                _create_mock_model(client_both),
+                _create_mock_model(client_fallback),
+                _create_mock_model(client_missing),
+                _create_mock_model(client_unlinked),
+                _create_mock_model(client_unknown),
+                _create_mock_model(client_bad_list),
+                _create_mock_model(client_bad_dict),
+                _create_mock_model(client_bad_int),
+                _create_mock_model(client_bad_bool),
+                _create_mock_model(client_bad_float),
+                _create_mock_model(client_camel_priority),
+            ]
+        )
+
+        devices_dict, stats_dict, clients_dict = await coordinator._process_site(
+            "default"
+        )
+
+        # Device dictionary retains all devices
+        assert set(devices_dict.keys()) == {"a", "b", "empty"}
+
+        # Client id ordering in device stats
+        assert [c["id"] for c in stats_dict["a"]["clients"]] == [
+            "a1",
+            "a2",
+            "fallback",
+        ]
+        assert [c["id"] for c in stats_dict["b"]["clients"]] == ["b1", "both"]
+        assert stats_dict["empty"]["clients"] == []
+
+        # Concrete independent expected values
+        assert stats_dict["a"]["clients"] == [
+            client_a1,
+            client_a2,
+            client_fallback,
+        ]
+        assert stats_dict["b"]["clients"] == [client_b1, client_both]
+
+        # Empty device retains its statistics
+        assert stats_dict["empty"]["id"] == "empty"
+        assert "cpuUtilizationPct" in stats_dict["empty"]
+
+        # Object identity is shared between group list and sitewide clients dictionary
+        assert stats_dict["a"]["clients"][0] is clients_dict["a1"]
+        assert stats_dict["a"]["clients"][1] is clients_dict["a2"]
+        assert stats_dict["a"]["clients"][2] is clients_dict["fallback"]
+        assert stats_dict["b"]["clients"][0] is clients_dict["b1"]
+        assert stats_dict["b"]["clients"][1] is clients_dict["both"]
+
+        # Sitewide dictionary retains all clients including unlinked and malformed
+        assert set(clients_dict.keys()) == {
+            "a1",
+            "b1",
+            "a2",
+            "both",
+            "fallback",
+            "missing",
+            "unlinked",
+            "unknown",
+            "bad_list",
+            "bad_dict",
+            "bad_int",
+            "bad_bool",
+            "bad_float",
+            "camel_priority",
+        }
+        assert clients_dict["missing"] == client_missing
+        assert clients_dict["unlinked"] == client_unlinked
+        assert clients_dict["unknown"] == client_unknown
+        assert clients_dict["bad_list"] == client_bad_list
+        assert clients_dict["bad_dict"] == client_bad_dict
+        assert clients_dict["bad_int"] == client_bad_int
+        assert clients_dict["bad_bool"] == client_bad_bool
+        assert clients_dict["bad_float"] == client_bad_float
+        assert clients_dict["camel_priority"] == client_camel_priority
+
+        # Object identity is preserved for sitewide unassigned clients
+        assert clients_dict["bad_list"] is client_bad_list
+        assert clients_dict["camel_priority"] is client_camel_priority
+
 
 # ============================================================================
 # UnifiProtectCoordinator Tests
