@@ -24,11 +24,40 @@ it("follows the tree with arrows (vertical)", () => {
     "dev:uuid-flex",
   );
   expect(nextGraphFocus(model, "dev:uuid-gw", "ArrowUp", "vertical")).toBe(
-    "dev:uuid-gw",
+    "wan:uuid-gw:wan",
   );
   expect(
     nextGraphFocus(model, "group:dev:uuid-ap", "ArrowDown", "vertical"),
   ).toBe("group:dev:uuid-ap");
+});
+
+it("moves between a gateway and its WANs", () => {
+  expect(
+    nextGraphFocus(model, "wan:uuid-gw:wan", "ArrowDown", "vertical"),
+  ).toBe("dev:uuid-gw");
+  expect(
+    nextGraphFocus(model, "wan:uuid-gw:wan", "ArrowRight", "vertical"),
+  ).toBe("wan:uuid-gw:wan2");
+  expect(
+    nextGraphFocus(model, "wan:uuid-gw:wan2", "ArrowRight", "vertical"),
+  ).toBe("wan:uuid-gw:wan2");
+  expect(nextGraphFocus(model, "wan:uuid-gw:wan", "ArrowUp", "vertical")).toBe(
+    "wan:uuid-gw:wan",
+  );
+});
+
+it("stays on a root without WANs when moving up", () => {
+  const noWans = buildModel(fixtureSnapshot(), {
+    kinds: new Set(NODE_KINDS.filter((k) => k !== "wan")),
+    clients: "collapsed",
+    toggledGroups: new Set(),
+  });
+  expect(nextGraphFocus(noWans, "dev:uuid-gw", "ArrowUp", "vertical")).toBe(
+    "dev:uuid-gw",
+  );
+  expect(nextGraphFocus(noWans, "dev:uuid-gw", "ArrowDown", "vertical")).toBe(
+    "dev:uuid-core",
+  );
 });
 
 it("rotates the arrow keys when horizontal", () => {
