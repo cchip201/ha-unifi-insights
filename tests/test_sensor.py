@@ -46,6 +46,7 @@ from custom_components.unifi_insights.const import (
     CONNECTION_TYPE_LOCAL,
     DOMAIN,
 )
+from custom_components.unifi_insights.data_transforms import get_site_gateway_id
 from custom_components.unifi_insights.protect_security_entity import (
     UnifiProtectSecuritySensor,
 )
@@ -396,10 +397,8 @@ class TestUnifiInsightsSensor:
             device_id="device1",
         )
 
-        # Native value should use value_fn
-        stats = mock_coordinator.data["stats"]["site1"]["device1"]
-        value = description.value_fn(stats)
-        assert value == 15.5
+        # Reads the read-model facts built from the stats
+        assert description.value_fn is None
         assert sensor.native_value == 15.5
 
     async def test_sensor_memory_usage(self, hass: HomeAssistant, mock_coordinator):
@@ -440,8 +439,9 @@ class TestUnifiInsightsSensor:
             device_id="device1",
         )
 
-        # 1000000 bytes/sec = 8000000 bits/sec (native unit)
-        assert sensor.native_value == 8000000
+        # The public txRateBps is already bits/s (#337): 1000000 stays 1000000,
+        # it is no longer multiplied by 8.
+        assert sensor.native_value == 1000000
 
     async def test_sensor_firmware_version(self, hass: HomeAssistant, mock_coordinator):
         """Test firmware version sensor."""
@@ -1431,6 +1431,96 @@ class TestUnifiPortSensorEdgeCases:
         )
 
         assert sensor.available is True
+
+    @pytest.mark.parametrize(
+        ("key", "record_stats", "expected"),
+        [
+            ("port_tx_bytes", {"txBytes": 42, "rxBytes": 7}, 42),
+            ("port_rx_bytes", {"rx_bytes": 7}, 7),
+            ("port_tx_bytes", {"txBytes": True}, None),
+            ("port_tx_bytes", {}, None),
+            ("port_tx_bytes", None, None),
+        ],
+    )
+    async def test_port_byte_counter_falls_back_to_port_record(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator,
+        key: str,
+        record_stats: Any,
+        expected: int | None,
+    ):
+        """Without stats counters, bytes come from the port record, never 0."""
+        mock_coordinator.data.pop("network_facts", None)
+        port: dict[str, Any] = {"idx": 1}
+        if record_stats is not None:
+            port["stats"] = record_stats
+        mock_coordinator.data["devices"] = {
+            "site1": {"device1": {"id": "device1", "ports": [port]}}
+        }
+        mock_coordinator.data["stats"] = {"site1": {"device1": {}}}
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=next(s for s in PORT_SENSOR_TYPES if s.key == key),
+            site_id="site1",
+            device_id="device1",
+            port_idx=1,
+        )
+
+        assert sensor.native_value == expected
+
+    @pytest.mark.parametrize(
+        ("watts", "expected"), [("4.5", 4.5), ("0", 0.0), ("n/a", None)]
+    )
+    async def test_port_poe_power_reads_string_watts_from_stats(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator,
+        watts: str,
+        expected: float | None,
+    ):
+        """String PoE watts parse as numbers; an unparsable string is unknown."""
+        mock_coordinator.data.pop("network_facts", None)
+        mock_coordinator.data["devices"] = {"site1": {"device1": {"id": "device1"}}}
+        mock_coordinator.data["stats"] = {
+            "site1": {"device1": {"poe_ports": {"1": watts}}}
+        }
+        sensor = UnifiPortSensor(
+            coordinator=mock_coordinator,
+            description=next(s for s in PORT_SENSOR_TYPES if s.key == "port_poe_power"),
+            site_id="site1",
+            device_id="device1",
+            port_idx=1,
+        )
+
+        assert sensor.native_value == expected
+
+    async def test_port_stats_reject_boolean_counters_and_watts(
+        self, hass: HomeAssistant, mock_coordinator
+    ):
+        """A boolean stats value is not a byte count or a PoE reading."""
+        mock_coordinator.data.pop("network_facts", None)
+        mock_coordinator.data["devices"] = {"site1": {"device1": {"id": "device1"}}}
+        mock_coordinator.data["stats"] = {
+            "site1": {
+                "device1": {
+                    "port_bytes": {1: {"tx_bytes": True}},
+                    "poe_ports": {1: True},
+                }
+            }
+        }
+
+        def _sensor(key: str) -> UnifiPortSensor:
+            return UnifiPortSensor(
+                coordinator=mock_coordinator,
+                description=next(s for s in PORT_SENSOR_TYPES if s.key == key),
+                site_id="site1",
+                device_id="device1",
+                port_idx=1,
+            )
+
+        assert _sensor("port_tx_bytes").native_value is None
+        assert _sensor("port_poe_power").native_value is None
 
     @pytest.mark.parametrize("key", ["port_tx_bytes", "port_tx_rate", "port_speed"])
     async def test_port_sensor_unavailable_when_device_refresh_fails(
@@ -4153,9 +4243,9 @@ class TestUnifiSiteInternetActivitySensor:
         # Non-dict site_devices, non-gateway device, non-dict data/site_windows,
         # and bool value
         coordinator.data["devices"]["site1"] = "not_a_dict"
-        assert sensor._find_gateway_device_id() is None
+        assert get_site_gateway_id(coordinator.data, "site1") is None
         coordinator.data["devices"]["site1"] = {"sw1": {"features": ["switching"]}}
-        assert sensor._find_gateway_device_id() is None
+        assert get_site_gateway_id(coordinator.data, "site1") is None
         coordinator.data["internet_activity"]["site1"] = {"1h": {"rx_bytes": True}}
         assert sensor.native_value is None
         coordinator.data["internet_activity"]["site1"] = "not_a_dict"

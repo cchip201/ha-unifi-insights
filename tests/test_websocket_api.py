@@ -32,9 +32,21 @@ from custom_components.unifi_insights.const import (
     CONNECTION_TYPE_CARRIER_FABRIC,
     DOMAIN,
 )
+from custom_components.unifi_insights.data_transforms import (
+    NETWORK_FACTS_KEY,
+    build_site_network_facts,
+)
 from custom_components.unifi_insights.device_tracker import UnifiClientTracker
 from custom_components.unifi_insights.helpers import async_get_device_entry
 from custom_components.unifi_insights.internet_activity_snapshot import WINDOWS
+from custom_components.unifi_insights.performance import (
+    build_performance_snapshot,
+    build_unavailable_performance,
+)
+from custom_components.unifi_insights.site_health import (
+    build_site_health_snapshot,
+    build_unavailable_site_health,
+)
 from custom_components.unifi_insights.topology import build_site_topology
 from custom_components.unifi_insights.websocket_api import (
     _UNLOAD_WATCHERS,
@@ -966,8 +978,7 @@ async def test_performance_get_returns_snapshot(
         "uuid-gw": {
             "cpuUtilizationPct": 10,
             "memoryUtilizationPct": 20,
-            "tx_rate": 100,
-            "rx_rate": 50,
+            "uplink": {"txRateBps": 100, "rxRateBps": 50},
         }
     }
     client = await hass_ws_client(hass)
@@ -985,6 +996,125 @@ async def test_performance_get_returns_snapshot(
     assert msg["success"]
     assert isinstance(msg["result"].get("devices"), list)
     assert any(device["id"] == f"{SITE}:uuid-gw" for device in msg["result"]["devices"])
+
+
+# ADR-005 contract locks for the performance and site-health payloads (#337).
+_PERFORMANCE_KEYS = {
+    "version",
+    "entry_id",
+    "site_id",
+    "site_name",
+    "status",
+    "issues",
+    "devices",
+    "revision",
+}
+_PERFORMANCE_DEVICE_KEYS = {
+    "id",
+    "ha_device_id",
+    "name",
+    "kind",
+    "state",
+    "cpu_pct",
+    "memory_pct",
+    "uptime_s",
+    "tx_bps",
+    "rx_bps",
+    "poe_power_w",
+    "clients",
+}
+_SITE_HEALTH_KEYS = {
+    "version",
+    "entry_id",
+    "site_id",
+    "site_name",
+    "status",
+    "issues",
+    "health",
+    "gateway",
+    "devices",
+    "attention_devices",
+    "attention_omitted",
+    "clients",
+    "freshness",
+    "revision",
+}
+_SITE_HEALTH_GATEWAY_KEYS = {
+    "present",
+    "name",
+    "state",
+    "uptime_s",
+    "ha_device_id",
+    "internet",
+    "wan_links",
+}
+_COUNT_KEYS = {"online", "offline", "unknown"}
+_KIND_KEYS = {"gateway", "switch", "access_point", "other"}
+
+
+async def test_performance_and_site_health_contract_locks(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Version 1 payloads keep their exact key sets and report bit/s as sent."""
+    data = _seed(init_integration)
+    data.setdefault("stats", {})[SITE] = {
+        "uuid-gw": {
+            "cpuUtilizationPct": 12.5,
+            "memoryUtilizationPct": 63.2,
+            "uptimeSec": 3600,
+            "uplink": {"txRateBps": 100, "rxRateBps": 50},
+        }
+    }
+    # Publish the seeded site like the device coordinator does.
+    data[NETWORK_FACTS_KEY] = {
+        **(data.get(NETWORK_FACTS_KEY) or {}),
+        SITE: build_site_network_facts(data["devices"][SITE], data["stats"][SITE]),
+    }
+    client = await hass_ws_client(hass)
+
+    results = {}
+    for msg_id, payload_type in ((95, "performance"), (96, "site_health")):
+        await client.send_json(
+            {
+                "id": msg_id,
+                "type": f"unifi_insights/{payload_type}/get",
+                "entry_id": init_integration.entry_id,
+                "site_id": SITE,
+            }
+        )
+        msg = await client.receive_json()
+        assert msg["success"]
+        results[payload_type] = msg["result"]
+
+    performance = results["performance"]
+    assert performance["version"] == 1
+    assert set(performance) == _PERFORMANCE_KEYS
+    for device in performance["devices"]:
+        assert set(device) == _PERFORMANCE_DEVICE_KEYS
+    gateway = next(d for d in performance["devices"] if d["id"] == f"{SITE}:uuid-gw")
+    assert (gateway["tx_bps"], gateway["rx_bps"]) == (100, 50)
+    assert (gateway["cpu_pct"], gateway["memory_pct"]) == (12.5, 63.2)
+    assert gateway["kind"] == "gateway"
+
+    health = results["site_health"]
+    assert health["version"] == 1
+    assert set(health) == _SITE_HEALTH_KEYS
+    assert set(health["gateway"]) == _SITE_HEALTH_GATEWAY_KEYS
+    assert health["gateway"]["present"] is True
+    assert health["gateway"]["uptime_s"] == 3600
+    assert set(health["devices"]) == _KIND_KEYS
+    assert all(set(counts) == _COUNT_KEYS for counts in health["devices"].values())
+    assert set(health["clients"]) == {"total", "wired", "wireless"}
+    assert set(health["health"]) == {"level", "reasons"}
+
+    unavailable_performance = build_unavailable_performance("e", SITE, "x")
+    assert unavailable_performance["version"] == 1
+    assert set(unavailable_performance) == _PERFORMANCE_KEYS
+    unavailable_health = build_unavailable_site_health("e", SITE, "x")
+    assert unavailable_health["version"] == 1
+    assert set(unavailable_health) == _SITE_HEALTH_KEYS
+    assert set(unavailable_health["gateway"]) == _SITE_HEALTH_GATEWAY_KEYS
+    assert set(unavailable_health["devices"]) == _KIND_KEYS
 
 
 async def test_timeline_get_returns_snapshot(
@@ -2439,3 +2569,72 @@ async def test_node_details_wan_with_repeated_key_matches_the_snapshot(
     assert wan["name"] == "Fiber"
     assert msg["success"], msg
     assert msg["result"] == {"kind": "wan", "ip_address": WAN_IP}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (
+            "unifi_insights/topology/subscribe",
+            "build_site_topology",
+            build_site_topology,
+        ),
+        (
+            "unifi_insights/site_health/subscribe",
+            "build_site_health_snapshot",
+            build_site_health_snapshot,
+        ),
+        (
+            "unifi_insights/performance/subscribe",
+            "build_performance_snapshot",
+            build_performance_snapshot,
+        ),
+    ],
+    ids=["topology", "site_health", "performance"],
+)
+async def test_subscriptions_rebuild_when_only_network_facts_change(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    case: tuple[str, str, Any],
+) -> None:
+    """A replaced facts map alone rebuilds; equal content still pushes nothing."""
+    command, builder_name, builder = case
+    data = _seed(init_integration)
+    data[NETWORK_FACTS_KEY] = {
+        **(data.get(NETWORK_FACTS_KEY) or {}),
+        SITE: build_site_network_facts(data["devices"][SITE], {}),
+    }
+    facade = init_integration.runtime_data.coordinator
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 1,
+            "type": command,
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+        }
+    )
+    assert (await client.receive_json())["success"]
+    assert (await client.receive_json())["type"] == "event"
+
+    with patch(
+        f"custom_components.unifi_insights.websocket_api.{builder_name}",
+        wraps=builder,
+    ) as spy:
+        facade.async_update_listeners()
+        await _assert_no_event(client, 2)
+        assert spy.call_count == 0
+
+        # Only the facts map is republished; devices and stats are the same
+        # objects. The inputs changed, so the snapshot is rebuilt, and its
+        # content did not, so nothing is pushed.
+        data[NETWORK_FACTS_KEY] = {
+            **data[NETWORK_FACTS_KEY],
+            SITE: build_site_network_facts(data["devices"][SITE], {}),
+        }
+        facade.async_update_listeners()
+        await _assert_no_event(client, 3)
+        assert spy.call_count == 1

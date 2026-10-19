@@ -1,6 +1,8 @@
 # Copyright 2026 UniFi Insights contributors
 """Sample library response data for testing."""
 
+from unifi_official_api.network.models.device import Device
+
 # Network API responses
 SAMPLE_SITE = {
     "id": "default",
@@ -80,6 +82,65 @@ SAMPLE_PDU_LEGACY_DEVICE = {
         },
     ],
 }
+
+# --- Network device read model (#337) ---
+#
+# Constructed (not a capture): a switch in the compatibility snake_case shape
+# (``mac``, ``status``, ``firmware_version``, ``site_id``) that older code
+# paths and hand-written test data use.
+SAMPLE_NETWORK_DEVICE = {
+    "id": "network_device_1",
+    "mac": "00:11:22:33:44:66",
+    "model": "USW Pro 24 PoE",
+    "name": "Core Switch",
+    "status": "online",
+    "adopted": True,
+    "features": ["switching"],
+    "firmware_version": "7.1.26",
+    "site": "default",
+    "site_id": "default",
+}
+
+# Captured (redacted) from the maintainer's UDM Pro through the official
+# Network API (GET /v1/sites/{site}/devices, 2026-10-19). It reports no v1
+# ``type``, only ``features: ["switching"]`` and a list-shaped ``interfaces``.
+# Only the id, MAC, IP and name are replaced with placeholders. This is the raw
+# v1 overview item; SAMPLE_UDM_PRO_OVERVIEW is what the coordinator stores
+# from it (``model_dump(by_alias=True)``, which adds ``type: None`` and an
+# empty ``ports``).
+SAMPLE_UDM_PRO_OVERVIEW_API = {
+    "id": "00000000-0000-4000-8000-0000000000d1",
+    "macAddress": "aa:bb:cc:00:00:d1",
+    "ipAddress": "192.168.1.1",
+    "name": "UDM-Pro",
+    "model": "UDM Pro",
+    "state": "ONLINE",
+    "supported": True,
+    "firmwareVersion": "5.1.33",
+    "firmwareUpdatable": False,
+    "features": ["switching"],
+    "interfaces": ["ports"],
+}
+SAMPLE_UDM_PRO_OVERVIEW = Device.model_validate(SAMPLE_UDM_PRO_OVERVIEW_API).model_dump(
+    by_alias=True
+)
+
+# Captured (redacted) from the same UDM Pro (GET
+# /v1/sites/{site}/devices/{id}/statistics/latest, 2026-10-19). The record has
+# no identifiers, so it is verbatim. ``uplink`` rates are bits/s (#337).
+SAMPLE_UDM_PRO_STATS = {
+    "uptimeSec": 3333412,
+    "lastHeartbeatAt": "2026-10-19T06:10:15Z",
+    "nextHeartbeatAt": "2026-10-19T06:10:39Z",
+    "loadAverage1Min": 1.18,
+    "loadAverage5Min": 1.3,
+    "loadAverage15Min": 1.4,
+    "cpuUtilizationPct": 14.6,
+    "memoryUtilizationPct": 62.5,
+    "uplink": {"txRateBps": 35072, "rxRateBps": 74016},
+    "interfaces": {},
+}
+
 
 # Protect API responses
 SAMPLE_USL_ENTRY_SENSOR = {

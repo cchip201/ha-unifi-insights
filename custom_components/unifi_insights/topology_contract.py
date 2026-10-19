@@ -7,17 +7,29 @@ The TypedDicts here are the payload the topology WebSocket commands send, and
 the helpers are the per-field normalisers the graph builder runs every device,
 client and port through: MAC parsing, opaque node ids, device kind and state,
 display and site names, link medium, client connection and port details.
-Like ``topology``, this module is pure (no I/O, no Home Assistant or
-integration imports), so ``coordinators/config.py`` can use
-``normalize_mac`` without an import cycle.
+Like ``topology``, this module is pure (no I/O, no Home Assistant imports).
+Its only integration import is the equally pure ``data_transforms``, which
+owns the shared field and MAC primitives and the network device read model,
+so ``coordinators/config.py`` can use ``normalize_mac`` without an import
+cycle. The kind, state, client and port helpers here are adapters over the
+read-model rules for callers that hold a raw record; the builders read the
+published facts.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import re
 from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict
+
+from .data_transforms import (
+    client_connection_type,
+    device_online_state,
+    device_ports,
+    get_field,
+    normalize_mac,
+)
+from .data_transforms import device_kind as network_device_kind
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -111,30 +123,9 @@ class SiteTopology(TypedDict):
     truncation: TopologyTruncation | None
 
 
-_GATEWAY_LEGACY_TYPES: Final = frozenset({"udm", "uxg", "ugw", "udr", "ucg"})
-_ONLINE_STATES: Final = frozenset({"ONLINE", "CONNECTED", "UP"})
-_OFFLINE_STATES: Final = frozenset({"OFFLINE", "DISCONNECTED", "DOWN"})
-_MAC_RE: Final = re.compile(r"[0-9a-f]{2}(?:[:-]?[0-9a-f]{2}){5}")
-
-
 def first_present(data: Mapping[str, Any], *keys: str) -> Any:
     """Return the first non-None value among ``keys`` (get_field semantics)."""
-    for key in keys:
-        value = data.get(key)
-        if value is not None:
-            return value
-    return None
-
-
-def normalize_mac(value: Any) -> str | None:
-    """Return ``value`` as a lower-case colon MAC, or None if it is not one."""
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip().lower()
-    if not _MAC_RE.fullmatch(candidate):
-        return None
-    digits = candidate.replace(":", "").replace("-", "")
-    return ":".join(digits[index : index + 2] for index in range(0, 12, 2))
+    return get_field(data, *keys)
 
 
 def opaque_node_id(prefix: str, key: bytes, raw_id: str) -> str:
@@ -175,47 +166,18 @@ def wan_state(wan: Mapping[str, Any]) -> NodeState:
 
 
 def device_kind(device: Mapping[str, Any]) -> NodeKind:
-    """Classify a device: legacy type, then v1 type, then features."""
-    topology = device.get("topology")
-    legacy_type = topology.get("legacy_type") if isinstance(topology, dict) else None
-    if isinstance(legacy_type, str):
-        lowered = legacy_type.lower()
-        if lowered in _GATEWAY_LEGACY_TYPES:
-            return "gateway"
-        if lowered == "usw":
-            return "switch"
-        if lowered == "uap":
-            return "access_point"
+    """
+    Classify a raw device record with the read model's kind rule.
 
-    v1_type = device.get("type")
-    if isinstance(v1_type, str):
-        lowered = v1_type.lower()
-        if "gateway" in lowered:
-            return "gateway"
-        if "switch" in lowered:
-            return "switch"
-        if "access" in lowered or lowered in {"ap", "uap"}:
-            return "access_point"
-
-    features = device.get("features")
-    if isinstance(features, list):
-        if "accessPoint" in features:
-            return "access_point"
-        if "switching" in features:
-            return "switch"
-    return "other"
+    The builders read the published facts; this adapter is for callers that
+    hold only a raw record.
+    """
+    return network_device_kind(device)
 
 
 def device_state(device: Mapping[str, Any]) -> NodeState:
-    """Map a device state string onto online/offline/unknown."""
-    raw = first_present(device, "state", "status")
-    if isinstance(raw, str):
-        upper = raw.upper()
-        if upper in _ONLINE_STATES:
-            return "online"
-        if upper in _OFFLINE_STATES:
-            return "offline"
-    return "unknown"
+    """Map a raw device record's state with the read model's spec rule."""
+    return device_online_state(device)
 
 
 def site_display_name(data: Mapping[str, Any], site_id: str) -> str:
@@ -241,35 +203,20 @@ def as_int(value: Any) -> int | None:
     return value
 
 
-def _ports(device: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return a device's port dicts from ``ports`` or ``interfaces.ports``."""
-    ports = device.get("ports")
-    if not isinstance(ports, list):
-        interfaces = device.get("interfaces")
-        ports = interfaces.get("ports") if isinstance(interfaces, dict) else None
-    if not isinstance(ports, list):
-        return []
-    return [port for port in ports if isinstance(port, dict)]
-
-
-def _port_index(port: Mapping[str, Any]) -> int | None:
-    """Return a port's index across the v1, interface and legacy shapes."""
-    return as_int(first_present(port, "idx", "port_idx", "portIdx"))
-
-
 def uplink_port_index(device: Mapping[str, Any]) -> int | None:
     """Return the index of the port flagged as the device's uplink."""
-    for port in _ports(device):
-        if first_present(port, "is_uplink", "isUplink") is True:
-            return _port_index(port)
+    for port in device_ports(device):
+        if port.is_uplink:
+            return as_int(port.raw_index)
     return None
 
 
 def port_poe_watts(device: Mapping[str, Any], port_idx: int) -> float | None:
     """Return the PoE draw on one port, or None when PoE is off or unknown."""
-    for port in _ports(device):
-        if _port_index(port) != port_idx:
+    for port_facts in device_ports(device):
+        if as_int(port_facts.raw_index) != port_idx:
             continue
+        port = port_facts.record
         poe = port.get("poe")
         if isinstance(poe, dict):
             if poe.get("enabled") is not True:
@@ -298,15 +245,8 @@ def link_medium(value: Any) -> LinkMedium:
 
 
 def client_connection(client: Mapping[str, Any]) -> ClientConnection | None:
-    """Return a client's wired/wireless connection, if known."""
-    raw = client.get("type")
-    if isinstance(raw, str):
-        upper = raw.upper()
-        if upper == "WIRED":
-            return "wired"
-        if upper == "WIRELESS":
-            return "wireless"
-    return None
+    """Return a client's wired/wireless connection with the shared client rule."""
+    return client_connection_type(client)
 
 
 def display_name(value: Any, fallback: str) -> str:
