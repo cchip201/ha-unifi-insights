@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_API_KEY
-from homeassistant.exceptions import ServiceValidationError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.unifi_insights import CarrierFabricData
@@ -18,12 +17,6 @@ from custom_components.unifi_insights.const import (
 )
 from custom_components.unifi_insights.diagnostics import (
     async_get_config_entry_diagnostics,
-)
-from custom_components.unifi_insights.services import (
-    _coord_data,
-    _get_coordinator_for_network_resource,
-    _get_coordinator_for_protect_resource,
-    _get_coordinators,
 )
 from custom_components.unifi_insights.websocket_api import (
     ERR_ENTRY_NOT_LOADED,
@@ -71,30 +64,6 @@ def carrier_entry_with_runtime_data(hass):
         coordinator=mock_coordinator,
     )
     return entry
-
-
-def test_services_guards_ignore_carrier_fabric_entry(
-    hass, carrier_entry_with_runtime_data
-):
-    """Test service helper functions ignore Carrier Fabric entries without crashing."""
-    # 1. _coord_data returns None
-    assert _coord_data(carrier_entry_with_runtime_data) is None
-
-    # 2. _get_coordinator_for_network_resource ignores CarrierFabricData
-    with pytest.raises(
-        ServiceValidationError, match="No UniFi Insights coordinator found"
-    ):
-        _get_coordinator_for_network_resource(hass)
-
-    # 3. _get_coordinator_for_protect_resource ignores CarrierFabricData
-    with pytest.raises(
-        ServiceValidationError, match="No UniFi Protect coordinator found"
-    ):
-        _get_coordinator_for_protect_resource(hass)
-
-    # 4. _get_coordinators excludes carrier entry
-    coordinators = _get_coordinators(hass)
-    assert len(coordinators) == 0
 
 
 async def test_websocket_guards_ignore_carrier_fabric_entry(

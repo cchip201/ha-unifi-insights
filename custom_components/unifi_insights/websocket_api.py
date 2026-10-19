@@ -57,7 +57,7 @@ from .topology_keys import async_get_node_key
 
 # Schemas are typed against probatio, the library HA 2026.10 annotates its schema
 # arguments with. Runtime still imports voluptuous: HA 2026.10 aliases it to probatio,
-# and the 2026.6 minimum ships real voluptuous, so only the type checker sees probatio.
+# and the 2026.9 minimum ships real voluptuous, so only the type checker sees probatio.
 if TYPE_CHECKING:
     import probatio as vol
 else:
@@ -109,7 +109,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_topology_get)
     websocket_api.async_register_command(hass, ws_topology_subscribe)
     # Extend HA's native schema so required fields work with both Voluptuous
-    # (HA 2026.6/9) and Probatio (HA 2026.10+).
+    # (HA 2026.9) and Probatio (HA 2026.10+).
     websocket_api.async_register_command(
         hass,
         "unifi_insights/topology/node_details",
@@ -164,7 +164,7 @@ def _device_in_entry(device: dr.DeviceEntry, entry_id: str) -> bool:
     """
     Return whether a registry device belongs to the config entry.
 
-    Home Assistant 2026.9+ gives a device a single owner (``config_entry_id``);
+    Home Assistant 2026.8+ gives a device a single owner (``config_entry_id``);
     earlier versions list every owner in ``config_entries``, which 2026.9+
     reports as deprecated, so it is only read when the single owner is absent.
     """

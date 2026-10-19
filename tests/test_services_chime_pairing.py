@@ -40,9 +40,8 @@ from custom_components.unifi_insights.const import (
     SERVICE_SET_CHIME_PAIRED_DOORBELLS,
 )
 from custom_components.unifi_insights.helpers import is_doorbell_camera_model
+from custom_components.unifi_insights.service_targets import _doorbell_camera_id
 from custom_components.unifi_insights.services import (
-    _doorbell_camera_id,
-    _entry_id_for_coordinator,
     async_setup_services,
     async_unload_services,
 )
@@ -171,21 +170,6 @@ def test_doorbell_camera_id_reads_only_this_integrations_ring_sensors() -> None:
     )
     # Nothing between the prefix and the suffix means no camera id.
     assert _doorbell_camera_id(entry(f"{DOMAIN}_camera_{RING_SUFFIX}")) is None
-
-
-def test_entry_id_for_coordinator_finds_the_owner_or_none() -> None:
-    """The console is found by identity, and a stranger matches nothing."""
-    owned = MagicMock()
-    other = MagicMock()
-    hass = MagicMock()
-    hass.config_entries.async_entries.return_value = [
-        MagicMock(entry_id="no_runtime_data", runtime_data=None),
-        MagicMock(entry_id="entry_b", runtime_data=MagicMock(coordinator=other)),
-        MagicMock(entry_id="entry_a", runtime_data=MagicMock(coordinator=owned)),
-    ]
-
-    assert _entry_id_for_coordinator(hass, owned) == "entry_a"
-    assert _entry_id_for_coordinator(hass, MagicMock()) is None
 
 
 async def test_pairs_the_selected_doorbell_with_exact_arguments(
@@ -440,10 +424,11 @@ async def test_missing_chime_raises(
     """A chime no console has is refused before any doorbell is looked at."""
     await _setup(hass, mock_config_entry, protect_client)
 
-    with pytest.raises(ServiceValidationError, match="not found on any configured"):
+    with pytest.raises(ServiceValidationError) as raised:
         await _call(
             hass, chime_id="no_such_chime", doorbells={"entity_id": _ring(hass)}
         )
+    assert raised.value.translation_key == "protect_resource_not_found"
 
     protect_client.chimes.update.assert_not_awaited()
 
@@ -454,8 +439,9 @@ async def test_chime_target_is_required(
     """Without a chime id or a target there is nothing to pair."""
     await _setup(hass, mock_config_entry, protect_client)
 
-    with pytest.raises(ServiceValidationError, match="Chime ID or target is required"):
+    with pytest.raises(ServiceValidationError) as raised:
         await _call(hass, doorbells={"entity_id": _ring(hass)})
+    assert raised.value.translation_key == "protect_target_required"
 
     protect_client.chimes.update.assert_not_awaited()
 

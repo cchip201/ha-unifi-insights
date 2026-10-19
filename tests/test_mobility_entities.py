@@ -38,7 +38,7 @@ from custom_components.unifi_insights.mobility_entity import (
     UnifiMobilityWorkspaceSensor,
     async_setup_mobility_binary_sensors,
 )
-from custom_components.unifi_insights.services import (
+from custom_components.unifi_insights.service_targets import (
     _resolve_network_client_id,
     _resolve_network_device_id,
 )
@@ -490,11 +490,13 @@ async def test_network_actions_reject_mobility_targets(
     assert tracker is not None
 
     for target in (sensor, router.id):
-        with pytest.raises(ServiceValidationError, match="UniFi Mobility"):
+        with pytest.raises(ServiceValidationError) as err:
             _resolve_network_device_id(hass, target, None, [entry])
+        assert err.value.translation_key == "target_mobility_unsupported"
     for target in (tracker, router.id):
-        with pytest.raises(ServiceValidationError, match="UniFi Mobility"):
+        with pytest.raises(ServiceValidationError) as err:
             _resolve_network_client_id(hass, target, [entry])
+        assert err.value.translation_key == "target_mobility_unsupported"
 
 
 class _UnsetType:
