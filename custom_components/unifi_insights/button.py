@@ -46,12 +46,16 @@ from .const import (
     MANUFACTURER,
 )
 from .coordinators import UnifiFacadeCoordinator
+from .coordinators.device import (
+    get_device_port,
+    port_can_be_power_cycled,
+    power_cyclable_ports,
+)
 from .coordinators.voucher_state import voucher_request_kwargs, voucher_site_ids
-from .data_transforms import current_chime_ringtone_id, device_facts
+from .data_transforms import current_chime_ringtone_id
 from .entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
-    async_call_coordinator_action,
     build_site_device_info,
     camera_supports_ptz,
     get_client_type,
@@ -78,31 +82,6 @@ PARALLEL_UPDATES = 1
 @dataclass
 class UnifiInsightsButtonEntityDescription(ButtonEntityDescription):  # type: ignore[misc]
     """Class describing UniFi Insights button entities."""
-
-
-def get_device_port(
-    coordinator_data: Any,
-    site_id: str | None,
-    device_id: str | None,
-    port_idx: int,
-) -> Mapping[str, Any] | None:
-    """
-    Return a device's port record, or None if it is not found.
-
-    Reads the shared port tuple of the published read model and matches the
-    raw index exactly: ``3`` finds ``3``, never ``"03"`` (PoE button and
-    action discovery only accept integer indexes).
-    """
-    if not site_id or not device_id or not isinstance(coordinator_data, dict):
-        return None
-    facts = device_facts(coordinator_data, site_id, device_id)
-    port = facts.port_by_raw_index(port_idx) if facts is not None else None
-    return port.record if port is not None else None
-
-
-def port_can_be_power_cycled(port: Mapping[str, Any]) -> bool:
-    """Return True if port can be power-cycled (PoE is enabled)."""
-    return isinstance(port.get("poe"), dict) and port["poe"].get("enabled") is True
 
 
 def _get_port_label(port: Mapping[str, Any], port_idx: int) -> str:
@@ -183,10 +162,9 @@ class UnifiAccessUnlockButton(UnifiAccessDoorEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Send the remote unlock; the relay state comes from the read-back."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_unlock_door",
+        await self._async_command(
             "Could not unlock the Access door",
+            self.coordinator.async_unlock_door,
             self._door_id,
         )
 
@@ -393,14 +371,11 @@ async def async_setup_entry(
                         )
 
                     # Discover PoE power-cycle buttons for PoE-enabled ports
-                    facts = device_facts(coordinator.data, site_id, device_id)
-                    for port_facts in facts.ports if facts is not None else ():
+                    for port_facts in power_cyclable_ports(
+                        coordinator.data, site_id, device_id
+                    ):
                         port = port_facts.record
                         port_idx = port_facts.raw_index
-                        if not isinstance(port_idx, int):
-                            continue
-                        if not port_can_be_power_cycled(port):
-                            continue
 
                         poe_btn_key = (
                             site_id,
@@ -547,20 +522,9 @@ class UnifiInsightsButton(UnifiInsightsEntity, ButtonEntity):
             self._site_id,
         )
 
-        success = await async_call_coordinator_action(
-            self.coordinator,
-            "async_restart_device",
-            f"Unable to restart device {self._device_id}",
-            self._site_id,
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.network_client.devices.restart(
-                self._site_id,
-                self._device_id,
-            ),
+        await self.coordinator.device_coordinator.async_restart_device(
+            self._site_id, self._device_id
         )
-        if not success:
-            msg = "Unable to restart device"
-            raise HomeAssistantError(msg)
 
         _LOGGER.info(
             "Successfully initiated restart for device %s in site %s",
@@ -622,24 +586,8 @@ class UnifiInsightsPoePowerCycleButton(UnifiInsightsEntity, ButtonEntity):
             self._port_idx,
             self._device_id,
         )
-        err_msg = (
-            f"Unable to power cycle PoE port {self._port_idx} on device"
-            f" {self._device_id}"
-        )
-        devices_api = self.coordinator.network_client.devices
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_power_cycle_port",
-            err_msg,
-            self._site_id,
-            self._device_id,
-            self._port_idx,
-            fallback_factory=lambda: devices_api.execute_port_action(
-                self._site_id,
-                self._device_id,
-                self._port_idx,
-                "POWER_CYCLE",
-            ),
+        await self.coordinator.device_coordinator.async_power_cycle_port(
+            self._site_id, self._device_id, self._port_idx
         )
 
 
@@ -677,20 +625,8 @@ class UnifiProtectChimePlayButton(UnifiProtectEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Report that the official API cannot play a chime."""
-
-        async def unsupported() -> None:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="chime_playback_unsupported",
-            )
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_play_chime",
-            f"Unable to play ringtone on chime {self._device_id}",
-            self._device_id,
-            fallback_factory=unsupported,
-        )
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_play_chime(self._device_id)
 
 
 class UnifiClientReconnectButton(
@@ -765,12 +701,8 @@ class UnifiClientReconnectButton(
             "Reconnecting client %s in site %s", self._client_id, self._site_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_reconnect_client",
-            f"Unable to reconnect client {self._client_id}",
-            self._site_id,
-            self._client_id,
+        await self.coordinator.device_coordinator.async_reconnect_client(
+            self._site_id, self._client_id
         )
         _LOGGER.info(
             "Successfully reconnected client %s in site %s",
@@ -840,12 +772,8 @@ class UnifiClientWakeButton(CoordinatorEntity[UnifiFacadeCoordinator], ButtonEnt
     async def async_press(self) -> None:
         """Send the Wake-on-LAN magic packet."""
         _LOGGER.debug("Sending Wake-on-LAN packet from a Wake button")
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_wake_client",
-            f"Unable to wake client {self._client_name}",
-            self._mac,
-            client_name=self._client_name,
+        await self.coordinator.device_coordinator.async_wake_client(
+            self._mac, client_name=self._client_name
         )
 
 
@@ -867,17 +795,8 @@ class UnifiProtectPTZPatrolStartButton(UnifiProtectEntity, ButtonEntity):
         """Start PTZ patrol."""
         _LOGGER.debug("Starting PTZ patrol for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_start_ptz_patrol",
-            f"Unable to start PTZ patrol for camera {self._device_id}",
-            self._device_id,
-            0,
-            fallback_factory=lambda: self.coordinator.protect_client.ptz_start_patrol(  # type: ignore[union-attr]
-                camera_id=self._device_id,
-                slot=0,
-            ),
-        )
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_start_ptz_patrol(self._device_id, 0)
         _LOGGER.info("Successfully started PTZ patrol for camera %s", self._device_id)
 
 
@@ -899,15 +818,8 @@ class UnifiProtectPTZPatrolStopButton(UnifiProtectEntity, ButtonEntity):
         """Stop PTZ patrol."""
         _LOGGER.debug("Stopping PTZ patrol for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_stop_ptz_patrol",
-            f"Unable to stop PTZ patrol for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.ptz_stop_patrol(  # type: ignore[union-attr]
-                camera_id=self._device_id,
-            ),
-        )
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_stop_ptz_patrol(self._device_id)
         _LOGGER.info("Successfully stopped PTZ patrol for camera %s", self._device_id)
 
 
@@ -943,15 +855,12 @@ class UnifiGenerateVoucherButton(
         """Generate a guest voucher with current HA settings."""
         settings = self.coordinator.get_voucher_settings(self._site_id)
         kwargs: dict[str, Any] = voucher_request_kwargs(settings)
-        created = await async_call_coordinator_action(
-            self.coordinator,
-            "async_generate_voucher",
-            f"Unable to generate a guest voucher in site {self._site_id}",
-            self._site_id,
-            name=DEFAULT_VOUCHER_NAME,
-            count=1,
-            **kwargs,
+        created = await self.coordinator.async_generate_voucher(
+            self._site_id, name=DEFAULT_VOUCHER_NAME, count=1, **kwargs
         )
         if not created:
-            err_msg = f"UniFi returned no voucher for site {self._site_id}"
-            raise HomeAssistantError(err_msg)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="voucher_not_created",
+                translation_placeholders={"site_id": self._site_id},
+            )

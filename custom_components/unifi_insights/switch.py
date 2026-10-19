@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.core import callback
@@ -42,7 +42,6 @@ from .coordinators.config_sections import (
 from .data_transforms import get_site_gateway_id
 from .entity import (
     UnifiProtectEntity,
-    async_call_coordinator_action,
     get_field,
     is_device_online,
 )
@@ -56,7 +55,7 @@ if TYPE_CHECKING:
 
     from . import UnifiInsightsConfigEntry
     from .coordinators import UnifiFacadeCoordinator
-    from .coordinators.access import UnifiInsightsAccessCoordinator
+    from .coordinators.access import EmergencyMode, UnifiInsightsAccessCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -289,7 +288,8 @@ class UnifiAccessEmergencySwitch(UnifiAccessEntity, SwitchEntity):
     def __init__(self, coordinator: UnifiInsightsAccessCoordinator, mode: str) -> None:
         """Create the switch for one emergency mode on the console device."""
         super().__init__(coordinator)
-        self._mode = mode
+        # One of EMERGENCY_MODES, which the discovery passes in as its keys.
+        self._mode = cast("EmergencyMode", mode)
         self._attr_translation_key = f"access_emergency_{mode}"
         self._attr_unique_id = access_unique_id(self._namespace, "emergency", mode)
         self._attr_device_info = console_device_info(self._namespace)
@@ -309,20 +309,18 @@ class UnifiAccessEmergencySwitch(UnifiAccessEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs: object) -> None:  # noqa: ARG002
         """Turn this mode on; the coordinator clears the other mode."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_emergency_mode",
+        await self._async_command(
             "Could not change the Access emergency mode",
+            self.coordinator.async_set_emergency_mode,
             self._mode,
             enabled=True,
         )
 
     async def async_turn_off(self, **kwargs: object) -> None:  # noqa: ARG002
         """Turn this mode off and keep the other mode as the console reports it."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_emergency_mode",
+        await self._async_command(
             "Could not change the Access emergency mode",
+            self.coordinator.async_set_emergency_mode,
             self._mode,
             enabled=False,
         )
@@ -690,14 +688,6 @@ class UnifiFirewallRuleSwitch(
             model="UniFi Firewall Policies",
         )
 
-    def _update_local_state(self, *, enabled: bool) -> None:
-        """Update the aggregated coordinator cache for immediate UI feedback."""
-        firewall_rules = self.coordinator.data.setdefault("firewall_rules", {})
-        site_rules = firewall_rules.setdefault(self._site_id, {})
-        rule_data = site_rules.get(self._rule_id)
-        if isinstance(rule_data, dict):
-            rule_data["enabled"] = enabled
-
     @property
     def available(self) -> bool:
         """Return if the switch is available."""
@@ -742,24 +732,9 @@ class UnifiFirewallRuleSwitch(
             self._site_id,
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_firewall_rule_enabled",
-            f"Unable to update firewall rule {self._rule_id}",
-            self._site_id,
-            self._rule_id,
-            enabled=enabled,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.firewall.update_rule(
-                    self._site_id,
-                    self._rule_id,
-                    enabled=enabled,
-                )
-            ),
+        await self.coordinator.config_coordinator.async_set_firewall_rule_enabled(
+            self._site_id, self._rule_id, enabled=enabled
         )
-        self._update_local_state(enabled=enabled)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable the firewall rule."""
@@ -827,14 +802,6 @@ class UnifiInsightsPolicyBasedRouteSwitch(
             manufacturer=MANUFACTURER,
             model="UniFi Policy-Based Routes",
         )
-
-    def _update_local_state(self, *, enabled: bool) -> None:
-        """Update the aggregated coordinator cache for immediate UI feedback."""
-        routes = self.coordinator.data.setdefault("policy_based_routes", {})
-        site_routes = routes.setdefault(self._site_id, {})
-        route_data = site_routes.get(self._route_id)
-        if isinstance(route_data, dict):
-            route_data["enabled"] = enabled
 
     @property
     def available(self) -> bool:
@@ -933,24 +900,10 @@ class UnifiInsightsPolicyBasedRouteSwitch(
                 self._site_id,
             )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_policy_based_route_enabled",
-            f"Unable to update policy-based route {self._route_id}",
-            self._site_id,
-            self._route_id,
-            enabled=enabled,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.routes.update_route(
-                    self.coordinator.resolve_legacy_site_name(self._site_id),
-                    self._route_id,
-                    enabled=enabled,
-                )
-            ),
+        config = self.coordinator.config_coordinator
+        await config.async_set_policy_based_route_enabled(
+            self._site_id, self._route_id, enabled=enabled
         )
-        self._update_local_state(enabled=enabled)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable the policy-based route."""
@@ -1019,13 +972,6 @@ class UnifiInsightsVpnClientSwitch(
         data = vpn_clients.get(self._client_id, {})
         return data if isinstance(data, dict) else {}
 
-    def _update_local_state(self, *, enabled: bool) -> None:
-        """Optimistically update local coordinator state for immediate UI feedback."""
-        vpn_clients = self.coordinator.data.setdefault("vpn_clients", {})
-        site_vpn_clients = vpn_clients.setdefault(self._site_id, {})
-        if self._client_id in site_vpn_clients:
-            site_vpn_clients[self._client_id]["enabled"] = enabled
-
     @property
     def available(self) -> bool:
         """Return if the switch is available."""
@@ -1067,24 +1013,9 @@ class UnifiInsightsVpnClientSwitch(
             self._site_id,
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_vpn_client_enabled",
-            f"Unable to update VPN client {self._client_id}",
-            self._site_id,
-            self._client_id,
-            enabled=enabled,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.vpn_clients.update_vpn_client(
-                    self.coordinator.resolve_legacy_site_name(self._site_id),
-                    self._client_id,
-                    enabled=enabled,
-                )
-            ),
+        await self.coordinator.config_coordinator.async_set_vpn_client_enabled(
+            self._site_id, self._client_id, enabled=enabled
         )
-        self._update_local_state(enabled=enabled)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable the VPN client."""
@@ -1145,38 +1076,22 @@ class UnifiProtectStatusLightSwitch(UnifiProtectEntity, SwitchEntity):
         _ = kwargs
         _LOGGER.debug("Turning on status light for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera_settings",
-            f"Unable to turn on status light for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                ledSettings={"isEnabled": True},
-            ),
-            ledSettings={"isEnabled": True},
+        # The owner publishes the written setting; state follows from it.
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_update_camera_settings(
+            self._device_id, ledSettings={"isEnabled": True}
         )
-        self._attr_is_on = True
-        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the status light off."""
         _ = kwargs
         _LOGGER.debug("Turning off status light for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera_settings",
-            f"Unable to turn off status light for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                ledSettings={"isEnabled": False},
-            ),
-            ledSettings={"isEnabled": False},
+        # The owner publishes the written setting; state follows from it.
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_update_camera_settings(
+            self._device_id, ledSettings={"isEnabled": False}
         )
-        self._attr_is_on = False
-        self.async_write_ha_state()
 
 
 class UnifiProtectHighFPSSwitch(UnifiProtectEntity, SwitchEntity):
@@ -1221,38 +1136,22 @@ class UnifiProtectHighFPSSwitch(UnifiProtectEntity, SwitchEntity):
         _ = kwargs
         _LOGGER.debug("Enabling high FPS mode for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera_settings",
-            f"Unable to enable high FPS mode for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                videoMode=VIDEO_MODE_HIGH_FPS,
-            ),
-            videoMode=VIDEO_MODE_HIGH_FPS,
+        # The owner publishes the written setting; state follows from it.
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_update_camera_settings(
+            self._device_id, videoMode=VIDEO_MODE_HIGH_FPS
         )
-        self._attr_is_on = True
-        self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable high FPS mode (return to default)."""
         _ = kwargs
         _LOGGER.debug("Disabling high FPS mode for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera_settings",
-            f"Unable to disable high FPS mode for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                videoMode=VIDEO_MODE_DEFAULT,
-            ),
-            videoMode=VIDEO_MODE_DEFAULT,
+        # The owner publishes the written setting; state follows from it.
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_update_camera_settings(
+            self._device_id, videoMode=VIDEO_MODE_DEFAULT
         )
-        self._attr_is_on = False
-        self.async_write_ha_state()
 
 
 class UnifiClientBlockSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity):
@@ -1337,38 +1236,28 @@ class UnifiClientBlockSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
             "Allowing client %s in site %s (unblocking)", self._client_id, self._site_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_unblock_client",
-            f"Unable to allow client {self._client_id}",
-            self._site_id,
-            self._client_id,
+        await self.coordinator.device_coordinator.async_unblock_client(
+            self._site_id, self._client_id
         )
         _LOGGER.info(
             "Successfully allowed client %s in site %s",
             self._client_id,
             self._site_id,
         )
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Block the client."""
         _ = kwargs
         _LOGGER.debug("Blocking client %s in site %s", self._client_id, self._site_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_block_client",
-            f"Unable to block client {self._client_id}",
-            self._site_id,
-            self._client_id,
+        await self.coordinator.device_coordinator.async_block_client(
+            self._site_id, self._client_id
         )
         _LOGGER.info(
             "Successfully blocked client %s in site %s",
             self._client_id,
             self._site_id,
         )
-        await self.coordinator.async_request_refresh()
 
 
 class UnifiWifiSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity):
@@ -1446,25 +1335,14 @@ class UnifiWifiSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity)
             "Enabling WiFi network %s in site %s", self._wifi_id, self._site_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_wifi_network",
-            f"Unable to enable WiFi network {self._wifi_id}",
-            self._site_id,
-            self._wifi_id,
-            fallback_factory=lambda: self.coordinator.network_client.wifi.update(
-                self._site_id,
-                self._wifi_id,
-                enabled=True,
-            ),
-            enabled=True,
+        await self.coordinator.config_coordinator.async_update_wifi_network(
+            self._site_id, self._wifi_id, enabled=True
         )
         _LOGGER.info(
             "Successfully enabled WiFi network %s in site %s",
             self._wifi_id,
             self._site_id,
         )
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable the WiFi network."""
@@ -1473,25 +1351,14 @@ class UnifiWifiSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity)
             "Disabling WiFi network %s in site %s", self._wifi_id, self._site_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_wifi_network",
-            f"Unable to disable WiFi network {self._wifi_id}",
-            self._site_id,
-            self._wifi_id,
-            fallback_factory=lambda: self.coordinator.network_client.wifi.update(
-                self._site_id,
-                self._wifi_id,
-                enabled=False,
-            ),
-            enabled=False,
+        await self.coordinator.config_coordinator.async_update_wifi_network(
+            self._site_id, self._wifi_id, enabled=False
         )
         _LOGGER.info(
             "Successfully disabled WiFi network %s in site %s",
             self._wifi_id,
             self._site_id,
         )
-        await self.coordinator.async_request_refresh()
 
 
 class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity):
@@ -1556,36 +1423,6 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                     continue
         return None
 
-    def _update_local_state(
-        self,
-        *,
-        relay_state: bool | None = None,
-        cycle_enabled: bool | None = None,
-    ) -> None:
-        """Update local coordinator cache for immediate UI feedback."""
-        devices = self.coordinator.data.setdefault("devices", {})
-        site_devices = devices.setdefault(self._site_id, {})
-        device_data = site_devices.get(self._device_id)
-        if isinstance(device_data, dict):
-            outlet_table = device_data.get("outlet_table", [])
-            if isinstance(outlet_table, list):
-                for outlet in outlet_table:
-                    if not isinstance(outlet, dict):
-                        continue
-                    idx = outlet.get("index")
-                    if idx is None:
-                        idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
-                    if idx is not None:
-                        try:
-                            if int(idx) == self._outlet_index:
-                                if relay_state is not None:
-                                    outlet["relay_state"] = relay_state
-                                if cycle_enabled is not None:
-                                    outlet["cycle_enabled"] = cycle_enabled
-                                break
-                        except TypeError, ValueError:
-                            continue
-
     @property
     def available(self) -> bool:
         """Return True if switch is available."""
@@ -1623,10 +1460,6 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
                 attrs[key] = outlet[key]
         return attrs
 
-    def _get_legacy_site_name(self) -> str:
-        """Resolve the legacy site name via the facade coordinator."""
-        return self.coordinator.resolve_legacy_site_name(self._site_id)
-
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the outlet."""
         _ = kwargs
@@ -1636,32 +1469,12 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
             self._device_id,
             self._site_id,
         )
-        site_name = self._get_legacy_site_name()
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_outlet_state",
-            (
-                f"Unable to turn on outlet {self._outlet_index} "
-                f"on device {self._device_id}"
-            ),
+        await self.coordinator.device_coordinator.async_set_outlet_state(
             self._site_id,
             self._device_id,
             self._outlet_index,
             state=True,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.devices.set_outlet_state(
-                    site_name,
-                    self._device_id,
-                    self._outlet_index,
-                    state=True,
-                    current_device=self._get_device_data(),
-                )
-            ),
         )
-        self._update_local_state(relay_state=True)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the outlet."""
@@ -1672,32 +1485,12 @@ class UnifiOutletSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntit
             self._device_id,
             self._site_id,
         )
-        site_name = self._get_legacy_site_name()
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_outlet_state",
-            (
-                f"Unable to turn off outlet {self._outlet_index} "
-                f"on device {self._device_id}"
-            ),
+        await self.coordinator.device_coordinator.async_set_outlet_state(
             self._site_id,
             self._device_id,
             self._outlet_index,
             state=False,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.devices.set_outlet_state(
-                    site_name,
-                    self._device_id,
-                    self._outlet_index,
-                    state=False,
-                    current_device=self._get_device_data(),
-                )
-            ),
         )
-        self._update_local_state(relay_state=False)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
 
 class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], SwitchEntity):
@@ -1765,32 +1558,6 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
                     continue
         return None
 
-    def _update_local_state(
-        self,
-        *,
-        cycle_enabled: bool,
-    ) -> None:
-        """Update local coordinator cache for immediate UI feedback."""
-        devices = self.coordinator.data.setdefault("devices", {})
-        site_devices = devices.setdefault(self._site_id, {})
-        device_data = site_devices.get(self._device_id)
-        if isinstance(device_data, dict):
-            outlet_table = device_data.get("outlet_table", [])
-            if isinstance(outlet_table, list):
-                for outlet in outlet_table:
-                    if not isinstance(outlet, dict):
-                        continue
-                    idx = outlet.get("index")
-                    if idx is None:
-                        idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
-                    if idx is not None:
-                        try:
-                            if int(idx) == self._outlet_index:
-                                outlet["cycle_enabled"] = cycle_enabled
-                                break
-                        except TypeError, ValueError:
-                            continue
-
     @property
     def available(self) -> bool:
         """Return True if switch is available."""
@@ -1814,10 +1581,6 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
             return bool(self._initial_outlet_data.get("cycle_enabled", False))
         return bool(outlet.get("cycle_enabled", False))
 
-    def _get_legacy_site_name(self) -> str:
-        """Resolve the legacy site name via the facade coordinator."""
-        return self.coordinator.resolve_legacy_site_name(self._site_id)
-
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable power cycling on the outlet."""
         _ = kwargs
@@ -1828,34 +1591,13 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
             self._site_id,
         )
         current_relay = self._get_current_relay_state()
-        site_name = self._get_legacy_site_name()
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_outlet_state",
-            (
-                f"Unable to enable power cycle on outlet {self._outlet_index} "
-                f"on device {self._device_id}"
-            ),
+        await self.coordinator.device_coordinator.async_set_outlet_state(
             self._site_id,
             self._device_id,
             self._outlet_index,
             state=current_relay,
             cycle_enabled=True,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.devices.set_outlet_state(
-                    site_name,
-                    self._device_id,
-                    self._outlet_index,
-                    state=current_relay,
-                    cycle_enabled=True,
-                    current_device=self._get_device_data(),
-                )
-            ),
         )
-        self._update_local_state(cycle_enabled=True)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable power cycling on the outlet."""
@@ -1867,31 +1609,10 @@ class UnifiOutletCycleSwitch(CoordinatorEntity["UnifiFacadeCoordinator"], Switch
             self._site_id,
         )
         current_relay = self._get_current_relay_state()
-        site_name = self._get_legacy_site_name()
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_outlet_state",
-            (
-                f"Unable to disable power cycle on outlet {self._outlet_index} "
-                f"on device {self._device_id}"
-            ),
+        await self.coordinator.device_coordinator.async_set_outlet_state(
             self._site_id,
             self._device_id,
             self._outlet_index,
             state=current_relay,
             cycle_enabled=False,
-            fallback_factory=lambda: (
-                self.coordinator.network_client.devices.set_outlet_state(
-                    site_name,
-                    self._device_id,
-                    self._outlet_index,
-                    state=current_relay,
-                    cycle_enabled=False,
-                    current_device=self._get_device_data(),
-                )
-            ),
         )
-        self._update_local_state(cycle_enabled=False)
-        self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()

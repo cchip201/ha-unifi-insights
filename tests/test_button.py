@@ -48,6 +48,7 @@ from custom_components.unifi_insights.coordinators.facade import (
 )
 from custom_components.unifi_insights.coordinators.voucher_state import VoucherSettings
 from custom_components.unifi_insights.data_transforms import device_ports
+from tests.fixtures.command_owners import autospec_command_owners, protect_owner
 from tests.fixtures.http_fakes import FakeJsonResponse, FakeQueuedSession
 
 if TYPE_CHECKING:
@@ -82,6 +83,8 @@ class TestUnifiInsightsButton:
         coordinator.network_client = MagicMock()
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.network_client.devices.restart = AsyncMock(return_value=True)
+        autospec_command_owners(coordinator)
+        coordinator.device_coordinator.async_restart_device.return_value = True
         coordinator.protect_client = None
         coordinator.data = {
             "sites": {"site1": {"id": "site1", "meta": {"name": "Default"}}},
@@ -162,7 +165,7 @@ class TestUnifiInsightsButton:
         assert button.available is False
 
     async def test_button_press_success(self, hass: HomeAssistant, mock_coordinator):
-        """Test button press success."""
+        """Button press calls the device owner's restart command."""
         description = BUTTON_TYPES[0]
 
         button = UnifiInsightsButton(
@@ -174,13 +177,18 @@ class TestUnifiInsightsButton:
 
         await button.async_press()
 
-        mock_coordinator.network_client.devices.restart.assert_called_once_with(
-            "site1", "device1"
-        )
+        restart = mock_coordinator.device_coordinator.async_restart_device
+        restart.assert_awaited_once_with("site1", "device1")
+        mock_coordinator.network_client.devices.restart.assert_not_called()
 
     async def test_button_press_failure(self, hass: HomeAssistant, mock_coordinator):
-        """Test button press failure."""
-        mock_coordinator.network_client.devices.restart = AsyncMock(return_value=False)
+        """The owner's translated restart rejection propagates unchanged."""
+        err = HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="restart_rejected",
+            translation_placeholders={"device_id": "device1"},
+        )
+        mock_coordinator.device_coordinator.async_restart_device.side_effect = err
         description = BUTTON_TYPES[0]
 
         button = UnifiInsightsButton(
@@ -190,46 +198,10 @@ class TestUnifiInsightsButton:
             device_id="device1",
         )
 
-        with pytest.raises(HomeAssistantError, match="Unable to restart device"):
+        with pytest.raises(HomeAssistantError) as exc_info:
             await button.async_press()
 
-        mock_coordinator.network_client.devices.restart.assert_called_once()
-
-    async def test_button_press_exception(self, hass: HomeAssistant, mock_coordinator):
-        """Test button press handles exception."""
-        mock_coordinator.network_client.devices.restart = AsyncMock(
-            side_effect=Exception("API Error")
-        )
-        description = BUTTON_TYPES[0]
-
-        button = UnifiInsightsButton(
-            coordinator=mock_coordinator,
-            description=description,
-            site_id="site1",
-            device_id="device1",
-        )
-
-        with pytest.raises(HomeAssistantError, match="Unable to restart device"):
-            await button.async_press()
-
-    async def test_button_press_uses_facade_restart(
-        self, hass: HomeAssistant, mock_coordinator: MagicMock
-    ) -> None:
-        """The facade coroutine runs when present (no fallback)."""
-        mock_coordinator.async_restart_device = AsyncMock(return_value=True)
-        button = UnifiInsightsButton(
-            coordinator=mock_coordinator,
-            description=BUTTON_TYPES[0],
-            site_id="site1",
-            device_id="device1",
-        )
-
-        await button.async_press()
-
-        mock_coordinator.async_restart_device.assert_awaited_once_with(
-            "site1", "device1"
-        )
-        mock_coordinator.network_client.devices.restart.assert_not_called()
+        assert exc_info.value is err
 
 
 class TestUnifiClientReconnectButton:
@@ -244,7 +216,7 @@ class TestUnifiClientReconnectButton:
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.network_client.clients = MagicMock()
         coordinator.network_client.clients.reconnect = AsyncMock()
-        coordinator.async_reconnect_client = AsyncMock()
+        autospec_command_owners(coordinator)
         coordinator.protect_client = None
         coordinator.data = {
             "sites": {"site1": {"id": "site1"}},
@@ -354,7 +326,7 @@ class TestUnifiClientReconnectButton:
         assert button.available is False
 
     async def test_reconnect_button_press(self, hass: HomeAssistant, mock_coordinator):
-        """Test client reconnect button press."""
+        """Button press calls the device owner's reconnect command."""
         button = UnifiClientReconnectButton(
             coordinator=mock_coordinator,
             site_id="site1",
@@ -363,17 +335,17 @@ class TestUnifiClientReconnectButton:
 
         await button.async_press()
 
-        mock_coordinator.async_reconnect_client.assert_called_once_with(
-            "site1", "client1"
-        )
+        reconnect = mock_coordinator.device_coordinator.async_reconnect_client
+        reconnect.assert_awaited_once_with("site1", "client1")
 
     async def test_reconnect_button_press_exception(
         self, hass: HomeAssistant, mock_coordinator
     ):
-        """Test reconnect button handles exception."""
-        mock_coordinator.async_reconnect_client = AsyncMock(
-            side_effect=Exception("API Error")
+        """The owner's translated error propagates unchanged."""
+        err = HomeAssistantError(
+            translation_domain=DOMAIN, translation_key="command_failed"
         )
+        mock_coordinator.device_coordinator.async_reconnect_client.side_effect = err
 
         button = UnifiClientReconnectButton(
             coordinator=mock_coordinator,
@@ -381,8 +353,10 @@ class TestUnifiClientReconnectButton:
             client_id="client1",
         )
 
-        with pytest.raises(HomeAssistantError, match="Unable to reconnect client"):
+        with pytest.raises(HomeAssistantError) as exc_info:
             await button.async_press()
+
+        assert exc_info.value is err
 
 
 class TestUnifiProtectChimePlayButton:
@@ -397,7 +371,12 @@ class TestUnifiProtectChimePlayButton:
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
-        coordinator.protect_client.chimes.play = AsyncMock()
+        # The owner reports the unsupported playback as a translated error.
+        autospec_command_owners(coordinator)
+        protect_owner(coordinator).async_play_chime.side_effect = HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="chime_playback_unsupported",
+        )
         coordinator.data = {
             "sites": {},
             "devices": {},
@@ -450,15 +429,12 @@ class TestUnifiProtectChimePlayButton:
         assert attrs["chime_name"] == "Front Door Chime"
         assert attrs["chime_ringtone_id"] == "mechanical"
 
-    async def test_chime_button_press_uses_facade(
+    async def test_chime_button_press_uses_owner(
         self, hass: HomeAssistant, mock_coordinator
     ):
-        """The facade receives only the ID and its translated error survives."""
-        error = HomeAssistantError(
-            translation_domain=DOMAIN,
-            translation_key="chime_playback_unsupported",
-        )
-        mock_coordinator.async_play_chime = AsyncMock(side_effect=error)
+        """The owner receives only the ID and its translated error survives."""
+        protect = protect_owner(mock_coordinator)
+        error = protect.async_play_chime.side_effect
         button = UnifiProtectChimePlayButton(
             coordinator=mock_coordinator,
             chime_id="chime1",
@@ -468,40 +444,10 @@ class TestUnifiProtectChimePlayButton:
             await button.async_press()
 
         assert raised.value is error
-        mock_coordinator.async_play_chime.assert_awaited_once_with("chime1")
-        mock_coordinator.protect_client.chimes.play.assert_not_called()
-
-    async def test_chime_button_press(self, hass: HomeAssistant, mock_coordinator):
-        """The fallback raises the translated error without calling the client."""
-        button = UnifiProtectChimePlayButton(
-            coordinator=mock_coordinator,
-            chime_id="chime1",
-        )
-
-        with pytest.raises(HomeAssistantError) as raised:
-            await button.async_press()
         assert raised.value.translation_key == "chime_playback_unsupported"
         assert raised.value.translation_domain == DOMAIN
+        protect.async_play_chime.assert_awaited_once_with("chime1")
         mock_coordinator.protect_client.chimes.play.assert_not_called()
-        mock_coordinator.protect_client._post.assert_not_called()
-
-    async def test_chime_button_press_exception(
-        self, hass: HomeAssistant, mock_coordinator
-    ):
-        """Test chime button handles exception."""
-        mock_coordinator.async_play_chime = AsyncMock(
-            side_effect=Exception("API Error")
-        )
-
-        button = UnifiProtectChimePlayButton(
-            coordinator=mock_coordinator,
-            chime_id="chime1",
-        )
-
-        with pytest.raises(
-            HomeAssistantError, match="Unable to play ringtone on chime"
-        ):
-            await button.async_press()
 
     @pytest.mark.parametrize(
         "data",
@@ -547,8 +493,7 @@ class TestUnifiProtectPTZButtons:
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
-        coordinator.protect_client.ptz_start_patrol = AsyncMock()
-        coordinator.protect_client.ptz_stop_patrol = AsyncMock()
+        autospec_command_owners(coordinator)
         coordinator.data = {
             "sites": {},
             "devices": {},
@@ -592,17 +537,17 @@ class TestUnifiProtectPTZButtons:
 
         await button.async_press()
 
-        mock_coordinator.protect_client.ptz_start_patrol.assert_called_once_with(
-            camera_id="camera1",
-            slot=0,
-        )
+        protect = protect_owner(mock_coordinator)
+        protect.async_start_ptz_patrol.assert_awaited_once_with("camera1", 0)
 
     async def test_ptz_start_button_exception(
         self, hass: HomeAssistant, mock_coordinator
     ):
         """Test PTZ start button handles exception."""
-        mock_coordinator.protect_client.ptz_start_patrol = AsyncMock(
-            side_effect=Exception("API Error")
+        protect_owner(
+            mock_coordinator
+        ).async_start_ptz_patrol.side_effect = HomeAssistantError(
+            "Unable to start PTZ patrol for camera camera1"
         )
 
         button = UnifiProtectPTZPatrolStartButton(
@@ -632,9 +577,8 @@ class TestUnifiProtectPTZButtons:
 
         await button.async_press()
 
-        mock_coordinator.protect_client.ptz_stop_patrol.assert_called_once_with(
-            camera_id="camera1",
-        )
+        protect = protect_owner(mock_coordinator)
+        protect.async_stop_ptz_patrol.assert_awaited_once_with("camera1")
 
 
 class TestAsyncSetupEntry:
@@ -1016,7 +960,12 @@ class TestChimePlayButtonEdgeCases:
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
-        coordinator.protect_client.chimes.play = AsyncMock()
+        # The owner reports the unsupported playback as a translated error.
+        autospec_command_owners(coordinator)
+        protect_owner(coordinator).async_play_chime.side_effect = HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="chime_playback_unsupported",
+        )
         coordinator.data = {
             "sites": {},
             "devices": {},
@@ -1066,7 +1015,9 @@ class TestChimePlayButtonEdgeCases:
         with pytest.raises(HomeAssistantError) as raised:
             await button.async_press()
         assert raised.value.translation_key == "chime_playback_unsupported"
-        mock_coordinator.protect_client.chimes.play.assert_not_called()
+        protect_owner(mock_coordinator).async_play_chime.assert_awaited_once_with(
+            "chime1"
+        )
 
 
 class TestAsyncSetupEntryWithClients:
@@ -1323,8 +1274,11 @@ class TestPTZPatrolStopButtonException:
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
-        coordinator.protect_client.ptz_stop_patrol = AsyncMock(
-            side_effect=Exception("API Error")
+        autospec_command_owners(coordinator)
+        protect_owner(
+            coordinator
+        ).async_stop_ptz_patrol.side_effect = HomeAssistantError(
+            "Unable to stop PTZ patrol for camera camera1"
         )
         coordinator.data = {
             "sites": {},
@@ -1362,9 +1316,8 @@ class TestPTZPatrolStopButtonException:
         with pytest.raises(HomeAssistantError, match="Unable to stop PTZ patrol"):
             await button.async_press()
 
-        mock_coordinator.protect_client.ptz_stop_patrol.assert_called_once_with(
-            camera_id="camera1",
-        )
+        protect = protect_owner(mock_coordinator)
+        protect.async_stop_ptz_patrol.assert_awaited_once_with("camera1")
 
 
 class TestUnifiInsightsPoePowerCycleButton:
@@ -1379,7 +1332,7 @@ class TestUnifiInsightsPoePowerCycleButton:
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.network_client.devices = MagicMock()
         coordinator.network_client.devices.execute_port_action = AsyncMock()
-        coordinator.async_power_cycle_port = AsyncMock()
+        autospec_command_owners(coordinator)
         coordinator.protect_client = None
         coordinator.data = {
             "sites": {"site1": {"id": "site1"}},
@@ -1462,13 +1415,13 @@ class TestUnifiInsightsPoePowerCycleButton:
         mock_coordinator.data["devices"]["site1"]["device1"]["state"] = "OFFLINE"
         assert button.available is False
 
-    async def test_poe_power_cycle_button_press_uses_facade(
+    async def test_poe_power_cycle_button_press_uses_owner(
         self,
         hass: HomeAssistant,
         mock_coordinator: MagicMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Button press uses facade coroutine when present."""
+        """Button press calls the device owner's power-cycle command."""
         button = UnifiInsightsPoePowerCycleButton(
             coordinator=mock_coordinator,
             site_id="site1",
@@ -1482,38 +1435,18 @@ class TestUnifiInsightsPoePowerCycleButton:
 
         assert "Power cycling PoE port 1 on device device1" in caplog.text
 
-        mock_coordinator.async_power_cycle_port.assert_awaited_once_with(
-            "site1", "device1", 1
-        )
+        power_cycle = mock_coordinator.device_coordinator.async_power_cycle_port
+        power_cycle.assert_awaited_once_with("site1", "device1", 1)
         mock_coordinator.network_client.devices.execute_port_action.assert_not_called()
-
-    async def test_poe_power_cycle_button_press_fallback(
-        self, hass: HomeAssistant, mock_coordinator: MagicMock
-    ) -> None:
-        """Test button press falls back to execute_port_action."""
-        mock_coordinator.async_power_cycle_port = None
-        button = UnifiInsightsPoePowerCycleButton(
-            coordinator=mock_coordinator,
-            site_id="site1",
-            device_id="device1",
-            port_idx=1,
-            port_label="Port 1",
-        )
-
-        await button.async_press()
-
-        devices_api = mock_coordinator.network_client.devices
-        devices_api.execute_port_action.assert_awaited_once_with(
-            "site1", "device1", 1, "POWER_CYCLE"
-        )
 
     async def test_poe_power_cycle_button_press_failure(
         self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
-        """Button press raises HomeAssistantError on exception."""
-        mock_coordinator.async_power_cycle_port = AsyncMock(
-            side_effect=Exception("API Error")
+        """The owner's translated error propagates unchanged."""
+        err = HomeAssistantError(
+            translation_domain=DOMAIN, translation_key="command_failed"
         )
+        mock_coordinator.device_coordinator.async_power_cycle_port.side_effect = err
         button = UnifiInsightsPoePowerCycleButton(
             coordinator=mock_coordinator,
             site_id="site1",
@@ -1522,10 +1455,10 @@ class TestUnifiInsightsPoePowerCycleButton:
             port_label="Port 1",
         )
 
-        with pytest.raises(
-            HomeAssistantError, match="Unable to power cycle PoE port 1"
-        ):
+        with pytest.raises(HomeAssistantError) as exc_info:
             await button.async_press()
+
+        assert exc_info.value is err
 
 
 class TestSetupEntryPoeButtons:
@@ -1792,8 +1725,11 @@ class TestGenerateVoucherButton:
             unique_id="console_default_generate_voucher",
         )
         mock_coordinator.async_generate_voucher.return_value = []
-        with pytest.raises(HomeAssistantError, match="UniFi returned no voucher"):
+        with pytest.raises(HomeAssistantError) as caught:
             await button.async_press()
+        assert caught.value.translation_domain == DOMAIN
+        assert caught.value.translation_key == "voucher_not_created"
+        assert caught.value.translation_placeholders == {"site_id": "default"}
 
     async def test_async_press_coordinator_error_raises_error(self, mock_coordinator):
         button = UnifiGenerateVoucherButton(
@@ -1801,13 +1737,12 @@ class TestGenerateVoucherButton:
             "default",
             unique_id="console_default_generate_voucher",
         )
-        mock_coordinator.async_generate_voucher.side_effect = RuntimeError(
-            "API failure"
-        )
-        with pytest.raises(
-            HomeAssistantError, match="Unable to generate a guest voucher"
-        ):
+        # The facade translates the API failure; the button passes it on.
+        error = HomeAssistantError("Unable to generate voucher in site default")
+        mock_coordinator.async_generate_voucher.side_effect = error
+        with pytest.raises(HomeAssistantError) as caught:
             await button.async_press()
+        assert caught.value is error
 
     async def test_discovery_and_deduplication(self, hass, mock_coordinator):
         mock_entry = MagicMock()
@@ -2177,42 +2112,27 @@ class TestUnifiClientWakeButton:
         )
         assert button.available is device_available
 
-    async def test_wake_button_press_calls_facade_with_mac(
+    async def test_wake_button_press_calls_owner_with_mac(
         self, hass: HomeAssistant
     ) -> None:
-        """Button press delegates to coordinator.async_wake_client with MAC."""
-        coordinator = MagicMock()
+        """Button press calls the device owner's wake command with the MAC."""
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.hass = hass
         coordinator.data = {"clients": {}}
-        coordinator.async_wake_client = AsyncMock()
         mac = "00:11:22:33:44:55"
 
         button = UnifiClientWakeButton(coordinator, mac, site_id="site1")
         await button.async_press()
 
-        coordinator.async_wake_client.assert_awaited_once_with(mac, client_name=mac)
-
-    async def test_wake_button_press_wraps_unexpected_errors(
-        self, hass: HomeAssistant
-    ) -> None:
-        """Unexpected error during press is wrapped in HomeAssistantError."""
-        coordinator = MagicMock()
-        coordinator.hass = hass
-        coordinator.data = {"clients": {}}
-        coordinator.async_wake_client = AsyncMock(
-            side_effect=RuntimeError("Socket error")
+        coordinator.device_coordinator.async_wake_client.assert_awaited_once_with(
+            mac, client_name=mac
         )
-        mac = "00:11:22:33:44:55"
-
-        button = UnifiClientWakeButton(coordinator, mac, site_id="site1")
-        with pytest.raises(HomeAssistantError, match=f"Unable to wake client {mac}"):
-            await button.async_press()
 
     async def test_wake_button_press_keeps_translated_errors(
         self, hass: HomeAssistant
     ) -> None:
         """Translated HomeAssistantError passes through without re-wrapping."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.hass = hass
         coordinator.data = {"clients": {}}
         err = HomeAssistantError(
@@ -2220,7 +2140,7 @@ class TestUnifiClientWakeButton:
             translation_key="wake_failed",
             translation_placeholders={"client_name": "Test PC", "error": "test"},
         )
-        coordinator.async_wake_client = AsyncMock(side_effect=err)
+        coordinator.device_coordinator.async_wake_client.side_effect = err
 
         button = UnifiClientWakeButton(
             coordinator, "00:11:22:33:44:55", site_id="site1"
@@ -2404,7 +2324,7 @@ class TestWakeButtonSetup:
             "protect": {},
         }
         coordinator.protect_client = None
-        coordinator.async_wake_client = AsyncMock()
+        autospec_command_owners(coordinator)
         started, proceed = asyncio.Event(), asyncio.Event()
 
         async def history(**kwargs) -> dict[str, tuple[str, str]]:
@@ -2456,7 +2376,7 @@ class TestWakeButtonSetup:
         saved_name = "Registry PC" if registry_name == "Wake Registry PC" else mac
         assert button.translation_placeholders == {"client_name": saved_name}
         await button.async_press()
-        coordinator.async_wake_client.assert_awaited_once_with(
+        coordinator.device_coordinator.async_wake_client.assert_awaited_once_with(
             mac, client_name=saved_name
         )
         assert er.async_get(hass).async_get(row.entity_id).disabled_by is None

@@ -34,7 +34,6 @@ from unifi_official_api import (
     UniFiResponseError,
 )
 
-from .button import get_device_port, port_can_be_power_cycled
 from .carrier_fabric_data import CarrierFabricData
 from .const import (
     CONF_CARRIER_ACTIONS,
@@ -98,6 +97,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
     from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
+
+    from .coordinators import UnifiProtectCoordinator
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -1112,6 +1113,30 @@ def _get_coordinator_for_protect_resource(
     return target_entry.runtime_data.coordinator, native_resource_id
 
 
+def _get_protect_owner(
+    hass: HomeAssistant, call: ServiceCall, resource_type: str, **routing: str | None
+) -> tuple[UnifiProtectCoordinator, str]:
+    """
+    Return the Protect command owner (ADR-010) and native ID of a call's target.
+
+    The target is read from ``<resource_type>_id`` or the call's target and
+    routed to the console that owns it, like the other Protect actions.
+    """
+    raw_id = _extract_target_id(call, f"{resource_type}_id")
+    if not raw_id:
+        msg = f"{resource_type.capitalize()} ID or target is required"
+        raise ServiceValidationError(
+            msg,
+            translation_domain=DOMAIN,
+            translation_key="protect_target_required",
+            translation_placeholders={"resource_type": resource_type},
+        )
+    coordinator, resource_id = _get_coordinator_for_protect_resource(
+        hass, resource_type=resource_type, resource_id=raw_id, **routing
+    )
+    return coordinator.require_protect_coordinator(), str(resource_id)
+
+
 # The doorbell ring binary sensor (binary_sensor.py, key "camera_doorbell_ring")
 # is this integration's only doorbell marker: the public camera schema has no
 # doorbell flag. Its unique_id is f"{DOMAIN}_camera_{camera_id}_camera_doorbell_ring".
@@ -1849,59 +1874,16 @@ async def _async_handle_power_cycle_port(
 
     port_idx = call.data["port_idx"]
 
-    # Validate against the device's interfaces.ports[] where poe.enabled is true
-    devices = (
-        coordinator.data.get("devices") if isinstance(coordinator.data, dict) else None
-    )
-    site_devices = devices.get(site_id) if isinstance(devices, dict) else None
-    device_data = (
-        site_devices.get(device_id) if isinstance(site_devices, dict) else None
-    )
-
-    if not isinstance(device_data, dict):
-        msg = f"Device {device_id} was not found in site {site_id}"
-        raise ServiceValidationError(
-            msg,
-            translation_domain=DOMAIN,
-            translation_key="device_not_found",
-            translation_placeholders={
-                "device_id": str(device_id),
-                "site_id": str(site_id),
-            },
-        )
-
-    port = get_device_port(coordinator.data, site_id, device_id, port_idx)
-    if port is None:
-        msg = f"Port {port_idx} was not found on device {device_id}"
-        raise ServiceValidationError(
-            msg,
-            translation_domain=DOMAIN,
-            translation_key="port_not_found",
-            translation_placeholders={
-                "port_idx": str(port_idx),
-                "device_id": str(device_id),
-            },
-        )
-
-    if not port_can_be_power_cycled(port):
-        msg = f"Port {port_idx} on device {device_id} is not PoE-enabled"
-        raise ServiceValidationError(
-            msg,
-            translation_domain=DOMAIN,
-            translation_key="port_not_poe",
-            translation_placeholders={
-                "port_idx": str(port_idx),
-                "device_id": str(device_id),
-            },
-        )
-
     _LOGGER.info(
         "Power-cycling PoE port %d on device %s in site %s",
         port_idx,
         device_id,
         site_id,
     )
-    await coordinator.async_power_cycle_port(site_id, device_id, port_idx)
+    # The owner checks the device's ports where poe.enabled is true first.
+    await coordinator.device_coordinator.async_power_cycle_port(
+        site_id, device_id, port_idx
+    )
 
 
 def _is_wireless_client(client_record: dict[str, Any]) -> bool:
@@ -1955,7 +1937,7 @@ async def _async_handle_reconnect_client(
             translation_placeholders={"client_id": str(client_id)},
         )
 
-    await coordinator.async_reconnect_client(site_id, client_id)
+    await coordinator.device_coordinator.async_reconnect_client(site_id, client_id)
 
 
 async def _async_handle_remove_clients(hass: HomeAssistant, call: ServiceCall) -> None:
@@ -1980,7 +1962,9 @@ async def _async_handle_remove_clients(hass: HomeAssistant, call: ServiceCall) -
                 )
                 eligible_macs = _filter_clients_for_removal(historical_clients)
                 if eligible_macs:
-                    await coordinator.async_forget_clients_batch(site_id, eligible_macs)
+                    await coordinator.device_coordinator.async_forget_clients_batch(
+                        site_id, eligible_macs
+                    )
                     total_removed_console += len(eligible_macs)
             except HomeAssistantError as err:
                 _LOGGER.debug(
@@ -2210,6 +2194,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         refreshed = 0
         failures: list[str] = []
+        failed_titles: list[str] = []
 
         for title, coordinator in _get_titled_coordinators(hass):
             # If site_id is specified, only refresh the console owning it.
@@ -2232,6 +2217,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 # already logs - an error line here would just duplicate it.
                 _LOGGER.debug("Error refreshing %s: %s", title, err)
                 failures.append(f"{title}: {err}")
+                failed_titles.append(title)
             else:
                 _LOGGER.info("Successfully refreshed coordinator data")
 
@@ -2242,7 +2228,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if failures:
             # Each failure already carries its own "Error refreshing ..."
             # sentence from the facade, so do not prefix a second one.
-            raise HomeAssistantError("; ".join(failures))
+            raise HomeAssistantError(
+                "; ".join(failures),
+                translation_domain=DOMAIN,
+                translation_key="refresh_failed",
+                translation_placeholders={"targets": ", ".join(failed_titles)},
+            )
 
     async def async_handle_restart_device(call: ServiceCall) -> None:
         """Handle the restart device service call."""
@@ -2269,7 +2260,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             raise ServiceValidationError(msg)
 
         _LOGGER.info("Restarting device %s in site %s", device_id, site_id)
-        await coordinator.async_restart_device(site_id, device_id)
+        await coordinator.device_coordinator.async_restart_device(site_id, device_id)
 
     async def async_handle_power_cycle_port(call: ServiceCall) -> None:
         """Handle the power cycle port service call."""
@@ -2277,48 +2268,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_hdr_mode(call: ServiceCall) -> None:
         """Handle the set_hdr_mode service call."""
-        raw_camera_id = _extract_target_id(call, "camera_id")
-        if not raw_camera_id:
-            msg = "Camera ID or target is required"
-            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator, camera_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=raw_camera_id
-        )
+        protect, camera_id = _get_protect_owner(hass, call, "camera")
 
         _LOGGER.info("Setting HDR mode for camera %s to %s", camera_id, mode)
-        await coordinator.async_set_hdr_mode(camera_id, mode)
+        await protect.async_set_hdr_mode(camera_id, mode)
 
     async def async_handle_set_video_mode(call: ServiceCall) -> None:
         """Handle the set_video_mode service call."""
-        raw_camera_id = _extract_target_id(call, "camera_id")
-        if not raw_camera_id:
-            msg = "Camera ID or target is required"
-            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator, camera_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=raw_camera_id
-        )
+        protect, camera_id = _get_protect_owner(hass, call, "camera")
 
         _LOGGER.info("Setting video mode for camera %s to %s", camera_id, mode)
-        await coordinator.async_set_video_mode(camera_id, mode)
+        await protect.async_set_video_mode(camera_id, mode)
 
     async def async_handle_set_mic_volume(call: ServiceCall) -> None:
         """Handle the set_mic_volume service call."""
-        raw_camera_id = _extract_target_id(call, "camera_id")
-        if not raw_camera_id:
-            msg = "Camera ID or target is required"
-            raise ServiceValidationError(msg)
         volume = call.data["volume"]
 
-        coordinator, camera_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=raw_camera_id
-        )
+        protect, camera_id = _get_protect_owner(hass, call, "camera")
 
         _LOGGER.info("Setting mic volume for camera %s to %d%%", camera_id, volume)
-        await coordinator.async_set_microphone_volume(camera_id, volume)
+        await protect.async_set_microphone_volume(camera_id, volume)
 
     # Register services
     _LOGGER.debug("Registering UniFi Insights services")
@@ -2366,30 +2339,18 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_light_mode(call: ServiceCall) -> None:
         """Handle the set_light_mode service call."""
-        raw_light_id = _extract_target_id(call, "light_id")
-        if not raw_light_id:
-            msg = "Light ID or target is required"
-            raise ServiceValidationError(msg)
         mode = call.data["mode"]
 
-        coordinator, light_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="light", resource_id=raw_light_id
-        )
+        protect, light_id = _get_protect_owner(hass, call, "light")
 
         _LOGGER.info("Setting light mode for %s to %s", light_id, mode)
-        await coordinator.async_set_light_mode(light_id, mode)
+        await protect.async_set_light_mode(light_id, mode)
 
     async def async_handle_set_light_level(call: ServiceCall) -> None:
         """Handle the set_light_level service call."""
-        raw_light_id = _extract_target_id(call, "light_id")
-        if not raw_light_id:
-            msg = "Light ID or target is required"
-            raise ServiceValidationError(msg)
         level = call.data["level"]
 
-        coordinator, light_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="light", resource_id=raw_light_id
-        )
+        protect, light_id = _get_protect_owner(hass, call, "light")
 
         led_level = percent_to_led_level(level)
         _LOGGER.info(
@@ -2398,42 +2359,30 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             level,
             led_level,
         )
-        await coordinator.async_set_light_brightness(light_id, led_level)
+        await protect.async_set_light_brightness(light_id, led_level)
 
     async def async_handle_ptz_move(call: ServiceCall) -> None:
         """Handle the ptz_move service call."""
-        raw_camera_id = _extract_target_id(call, "camera_id")
-        if not raw_camera_id:
-            msg = "Camera ID or target is required"
-            raise ServiceValidationError(msg)
         preset = call.data["preset"]
 
-        coordinator, camera_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=raw_camera_id
-        )
+        protect, camera_id = _get_protect_owner(hass, call, "camera")
 
         _LOGGER.info("Moving camera %s to preset %d", camera_id, preset)
-        await coordinator.async_move_ptz_to_preset(camera_id, preset)
+        await protect.async_move_ptz_to_preset(camera_id, preset)
 
     async def async_handle_ptz_patrol(call: ServiceCall) -> None:
         """Handle the ptz_patrol service call."""
-        raw_camera_id = _extract_target_id(call, "camera_id")
-        if not raw_camera_id:
-            msg = "Camera ID or target is required"
-            raise ServiceValidationError(msg)
         action = call.data["action"]
         slot = call.data.get("slot", 0)
 
-        coordinator, camera_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="camera", resource_id=raw_camera_id
-        )
+        protect, camera_id = _get_protect_owner(hass, call, "camera")
 
         if action == "start":
             _LOGGER.info("Starting PTZ patrol slot %d for camera %s", slot, camera_id)
-            await coordinator.async_start_ptz_patrol(camera_id, slot)
+            await protect.async_start_ptz_patrol(camera_id, slot)
         else:
             _LOGGER.info("Stopping PTZ patrol for camera %s", camera_id)
-            await coordinator.async_stop_ptz_patrol(camera_id)
+            await protect.async_stop_ptz_patrol(camera_id)
 
     # Register light services
     hass.services.async_register(
@@ -2467,10 +2416,6 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_chime_volume(call: ServiceCall) -> None:
         """Handle the set_chime_volume service call."""
-        raw_chime_id = _extract_target_id(call, "chime_id")
-        if not raw_chime_id:
-            msg = "Chime ID or target is required"
-            raise ServiceValidationError(msg)
         volume = call.data["volume"]
         raw_camera_id = call.data.get("camera_id")
         if isinstance(raw_camera_id, list):
@@ -2478,10 +2423,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if isinstance(raw_camera_id, str):
             raw_camera_id = raw_camera_id.strip() or None
 
-        coordinator, chime_id = _get_coordinator_for_protect_resource(
+        protect, chime_id = _get_protect_owner(
             hass,
-            resource_type="chime",
-            resource_id=raw_chime_id,
+            call,
+            "chime",
             secondary_resource_type="camera" if raw_camera_id else None,
             secondary_resource_id=raw_camera_id,
         )
@@ -2494,27 +2439,16 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 chime_id,
             )
         _LOGGER.info("Setting chime %s volume to %d%%", chime_id, volume)
-        await coordinator.async_set_chime_volume(chime_id, volume)
+        await protect.async_set_chime_volume(chime_id, volume)
 
     async def async_handle_play_chime_ringtone(call: ServiceCall) -> None:
         """Handle the play_chime_ringtone service call."""
-        raw_chime_id = _extract_target_id(call, "chime_id")
-        if not raw_chime_id:
-            msg = "Chime ID or target is required"
-            raise ServiceValidationError(msg)
+        protect, chime_id = _get_protect_owner(hass, call, "chime")
 
-        coordinator, chime_id = _get_coordinator_for_protect_resource(
-            hass, resource_type="chime", resource_id=raw_chime_id
-        )
-
-        await coordinator.async_play_chime(chime_id)
+        await protect.async_play_chime(chime_id)
 
     async def async_handle_set_chime_ringtone(call: ServiceCall) -> None:
         """Handle the set_chime_ringtone service call."""
-        raw_chime_id = _extract_target_id(call, "chime_id")
-        if not raw_chime_id:
-            msg = "Chime ID or target is required"
-            raise ServiceValidationError(msg)
         ringtone_id = call.data["ringtone_id"]
         raw_camera_id = call.data.get("camera_id")
         if isinstance(raw_camera_id, list):
@@ -2522,10 +2456,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if isinstance(raw_camera_id, str):
             raw_camera_id = raw_camera_id.strip() or None
 
-        coordinator, chime_id = _get_coordinator_for_protect_resource(
+        protect, chime_id = _get_protect_owner(
             hass,
-            resource_type="chime",
-            resource_id=raw_chime_id,
+            call,
+            "chime",
             secondary_resource_type="camera" if raw_camera_id else None,
             secondary_resource_id=raw_camera_id,
         )
@@ -2538,14 +2472,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 chime_id,
             )
         _LOGGER.info("Setting chime %s ringtone to %s", chime_id, ringtone_id)
-        await coordinator.async_set_chime_ringtone(chime_id, ringtone_id)
+        await protect.async_set_chime_ringtone(chime_id, ringtone_id)
 
     async def async_handle_set_chime_repeat_times(call: ServiceCall) -> None:
         """Handle the set_chime_repeat_times service call."""
-        raw_chime_id = _extract_target_id(call, "chime_id")
-        if not raw_chime_id:
-            msg = "Chime ID or target is required"
-            raise ServiceValidationError(msg)
         repeat_times = call.data["repeat_times"]
         raw_camera_id = call.data.get("camera_id")
         if isinstance(raw_camera_id, list):
@@ -2553,10 +2483,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if isinstance(raw_camera_id, str):
             raw_camera_id = raw_camera_id.strip() or None
 
-        coordinator, chime_id = _get_coordinator_for_protect_resource(
+        protect, chime_id = _get_protect_owner(
             hass,
-            resource_type="chime",
-            resource_id=raw_chime_id,
+            call,
+            "chime",
             secondary_resource_type="camera" if raw_camera_id else None,
             secondary_resource_id=raw_camera_id,
         )
@@ -2569,7 +2499,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 chime_id,
             )
         _LOGGER.info("Setting chime %s repeat times to %d", chime_id, repeat_times)
-        await coordinator.async_set_chime_repeat(chime_id, repeat_times)
+        await protect.async_set_chime_repeat(chime_id, repeat_times)
 
     async def async_handle_set_chime_paired_doorbells(call: ServiceCall) -> None:
         """Handle the set_chime_paired_doorbells service call."""
@@ -2590,7 +2520,8 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             coordinator=coordinator,
         )
         _LOGGER.info("Pairing chime %s with doorbell cameras %s", chime_id, camera_ids)
-        await coordinator.async_set_chime_paired_cameras(chime_id, camera_ids)
+        protect = coordinator.require_protect_coordinator()
+        await protect.async_set_chime_paired_cameras(chime_id, camera_ids)
 
     async def async_handle_authorize_guest(call: ServiceCall) -> None:
         """Handle the authorize_guest service call."""
@@ -2626,7 +2557,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         # native client ID from the selected site's cached client records.
         client_id = _resolve_native_client_id(coordinator, site_id, client_id)
 
-        await coordinator.async_authorize_guest(site_id, client_id)
+        await coordinator.config_coordinator.async_authorize_guest(site_id, client_id)
 
     async def async_handle_reconnect_client(call: ServiceCall) -> None:
         """Handle the reconnect_client service call."""
@@ -2676,7 +2607,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             hass, console_id=call.data.get("console_id")
         )
 
-        await coordinator.async_trigger_alarm(alarm_id)
+        await coordinator.require_protect_coordinator().async_trigger_alarm(alarm_id)
 
     async def async_handle_create_liveview(call: ServiceCall) -> None:
         """Handle the create_liveview service call."""
@@ -2688,7 +2619,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             hass, console_id=call.data.get("console_id")
         )
 
-        await coordinator.async_create_liveview(
+        await coordinator.require_protect_coordinator().async_create_liveview(
             name=name,
             layout=layout,
             is_default=is_default,
@@ -2696,21 +2627,17 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_handle_set_liveview(call: ServiceCall) -> None:
         """Handle the set_liveview service call."""
-        raw_viewer_id = _extract_target_id(call, "viewer_id")
-        if not raw_viewer_id:
-            msg = "Viewer ID or target is required"
-            raise ServiceValidationError(msg)
         liveview_id = call.data["liveview_id"]
 
-        coordinator, viewer_id = _get_coordinator_for_protect_resource(
+        protect, viewer_id = _get_protect_owner(
             hass,
-            resource_type="viewer",
-            resource_id=raw_viewer_id,
+            call,
+            "viewer",
             secondary_resource_type="liveview",
             secondary_resource_id=liveview_id,
         )
 
-        await coordinator.async_update_viewer(viewer_id, liveview=liveview_id)
+        await protect.async_update_viewer(viewer_id, liveview=liveview_id)
 
     # Register chime services
     hass.services.async_register(

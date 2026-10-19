@@ -9,8 +9,13 @@ import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
+from homeassistant.exceptions import (
+    HomeAssistantError,
+    ServiceNotFound,
+    ServiceValidationError,
+)
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from unifi_official_api import (
@@ -24,6 +29,14 @@ from unifi_official_api.network.models import (
     parse_outlet_metrics,
 )
 
+from custom_components.unifi_insights.client_wake import (
+    WAKE_ON_LAN_DOMAIN,
+    WAKE_ON_LAN_SERVICE,
+    derive_directed_broadcast,
+    find_client_by_mac,
+    first_non_blank_text,
+    history_network_hint,
+)
 from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
 from custom_components.unifi_insights.data_transforms import (
     CPU_STAT_KEYS,
@@ -31,24 +44,131 @@ from custom_components.unifi_insights.data_transforms import (
     NETWORK_FACTS_KEY,
     UPTIME_STAT_KEYS,
     build_site_network_facts,
+    device_facts,
     normalize_legacy_storage,
     normalize_legacy_wans,
 )
 from custom_components.unifi_insights.helpers import async_get_device_entry
+from custom_components.unifi_insights.topology_contract import (
+    first_present,
+    normalize_mac,
+)
 
-from .base import UnifiBaseCoordinator
+from .base import CommandFailure, UnifiBaseCoordinator, async_execute_command
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable, Mapping
 
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from unifi_official_api.network import UniFiNetworkClient
     from unifi_official_api.protect import UniFiProtectClient
 
+    from custom_components.unifi_insights.data_transforms import NetworkPortFacts
+
     from .config import UnifiConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+WAKE_BROADCAST_TIMEOUT_SECONDS: Final = 5
+
+
+def get_device_port(
+    coordinator_data: Any,
+    site_id: str | None,
+    device_id: str | None,
+    port_idx: int,
+) -> Mapping[str, Any] | None:
+    """
+    Return a device's port record, or None if it is not found.
+
+    Reads the shared port tuple of the published read model and matches the
+    raw index exactly: ``3`` finds ``3``, never ``"03"`` (PoE button and
+    action discovery only accept integer indexes).
+    """
+    if not site_id or not device_id or not isinstance(coordinator_data, dict):
+        return None
+    facts = device_facts(coordinator_data, site_id, device_id)
+    port = facts.port_by_raw_index(port_idx) if facts is not None else None
+    return port.record if port is not None else None
+
+
+def port_can_be_power_cycled(port: Mapping[str, Any]) -> bool:
+    """Return True if port can be power-cycled (PoE is enabled)."""
+    return isinstance(port.get("poe"), dict) and port["poe"].get("enabled") is True
+
+
+def power_cyclable_ports(
+    coordinator_data: Mapping[str, Any], site_id: str, device_id: str
+) -> tuple[NetworkPortFacts, ...]:
+    """
+    Return the device's ports that a PoE power cycle can target.
+
+    A port qualifies when its raw index is an integer (it feeds the button's
+    unique ID, so it is never normalised) and PoE is enabled on it.
+    """
+    facts = device_facts(coordinator_data, site_id, device_id)
+    return tuple(
+        port
+        for port in (facts.ports if facts is not None else ())
+        if isinstance(port.raw_index, int) and port_can_be_power_cycled(port.record)
+    )
+
+
+def require_power_cyclable_port(
+    coordinator_data: Any, site_id: str | None, device_id: str | None, port_idx: int
+) -> Mapping[str, Any]:
+    """
+    Return the port a PoE power cycle targets, or raise a validation error.
+
+    The shared eligibility check for every power-cycle caller: the device
+    must exist in the site, the port must exist on it, and PoE must be
+    enabled on the port.
+    """
+    devices = (
+        coordinator_data.get("devices") if isinstance(coordinator_data, dict) else None
+    )
+    site_devices = devices.get(site_id) if isinstance(devices, dict) else None
+    device_data = (
+        site_devices.get(device_id) if isinstance(site_devices, dict) else None
+    )
+    if not isinstance(device_data, dict):
+        msg = f"Device {device_id} was not found in site {site_id}"
+        raise ServiceValidationError(
+            msg,
+            translation_domain=DOMAIN,
+            translation_key="device_not_found",
+            translation_placeholders={
+                "device_id": str(device_id),
+                "site_id": str(site_id),
+            },
+        )
+
+    port = get_device_port(coordinator_data, site_id, device_id, port_idx)
+    if port is None:
+        msg = f"Port {port_idx} was not found on device {device_id}"
+        raise ServiceValidationError(
+            msg,
+            translation_domain=DOMAIN,
+            translation_key="port_not_found",
+            translation_placeholders={
+                "port_idx": str(port_idx),
+                "device_id": str(device_id),
+            },
+        )
+
+    if not port_can_be_power_cycled(port):
+        msg = f"Port {port_idx} on device {device_id} is not PoE-enabled"
+        raise ServiceValidationError(
+            msg,
+            translation_domain=DOMAIN,
+            translation_key="port_not_poe",
+            translation_placeholders={
+                "port_idx": str(port_idx),
+                "device_id": str(device_id),
+            },
+        )
+    return port
 
 
 def _fill_missing_stat(
@@ -141,10 +261,6 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             update_interval=SCAN_INTERVAL_DEVICE,
         )
         self.config_coordinator = config_coordinator
-        # Map integration site IDs to classic ("legacy") site names used by the
-        # /api/s/{site} endpoints. Populated on each update and reused for
-        # classic-API client actions (block/unblock/reconnect/forget).
-        self._legacy_site_names: dict[str, str] = {}
         # Successful legacy fallback does not fail the coordinator refresh.
         self._legacy_fallback_sites: set[str] = set()
         # Track previous device IDs for stale device cleanup (Gold requirement)
@@ -652,60 +768,6 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             return None
         return {connection["network_id"]: connection for connection in connections}
 
-    def _map_legacy_site_names(
-        self,
-        site_ids: list[str],
-        legacy_sites: list[dict[str, Any]],
-    ) -> dict[str, str]:
-        """Map integration site IDs to legacy site names used by `/api/s/{site}`."""
-        mappings: dict[str, str] = {}
-
-        def _match_string(value: Any) -> str | None:
-            if not isinstance(value, str):
-                return None
-            stripped = value.strip().lower()
-            return stripped or None
-
-        normalized_legacy_sites: list[tuple[str, set[str]]] = []
-        for legacy_site in legacy_sites:
-            legacy_name = legacy_site.get("name")
-            if not isinstance(legacy_name, str) or not legacy_name:
-                continue
-
-            candidates = {
-                candidate
-                for candidate in {
-                    _match_string(legacy_name),
-                    _match_string(legacy_site.get("desc")),
-                    _match_string(legacy_site.get("description")),
-                }
-                if candidate is not None
-            }
-            normalized_legacy_sites.append((legacy_name, candidates))
-
-        for site_id in site_ids:
-            site_data = self.config_coordinator.get_site(site_id) or {}
-            site_candidates = {
-                candidate
-                for candidate in {
-                    _match_string(site_id),
-                    _match_string(site_data.get("name")),
-                    _match_string(site_data.get("description")),
-                    _match_string(site_data.get("desc")),
-                }
-                if candidate is not None
-            }
-
-            for legacy_name, legacy_candidates in normalized_legacy_sites:
-                if site_candidates & legacy_candidates:
-                    mappings[site_id] = legacy_name
-                    break
-
-            if site_id not in mappings and len(normalized_legacy_sites) == 1:
-                mappings[site_id] = normalized_legacy_sites[0][0]
-
-        return mappings
-
     async def _process_device(
         self,
         site_id: str,
@@ -1133,16 +1195,10 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             )
 
             self._reused_stats = set()
-            legacy_site_names: dict[str, str] = {}
-            try:
-                legacy_sites = await self.network_client.sites.get_legacy_all()
-                legacy_site_names = self._map_legacy_site_names(site_ids, legacy_sites)
-                self._legacy_site_names = legacy_site_names
-            except Exception as err:
-                _LOGGER.debug(
-                    "Device coordinator: Unable to fetch legacy site mapping: %s",
-                    err,
-                )
+            # The config coordinator's published mapping (ADR-010), not a
+            # classic site lookup of our own: last-good during a lookup
+            # outage, pruned to the selected sites.
+            legacy_site_names = self.config_coordinator.legacy_site_names
 
             # Process all sites in parallel
             tasks = [
@@ -1390,11 +1446,336 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         result: dict[str, Any] = self.data.get("clients", {}).get(site_id, {})
         return result
 
-    def get_legacy_site_name(self, site_id: str) -> str | None:
-        """
-        Return the classic ("legacy") site name for an integration site ID.
+    async def async_restart_device(self, site_id: str, device_id: str) -> bool:
+        """Restart a network device; a falsy result raises ``restart_rejected``."""
+        return await async_execute_command(
+            CommandFailure(
+                translation_key="command_failed",
+                translation_placeholders={"device_id": device_id},
+                message=f"Unable to restart device {device_id}",
+                rejected_translation_key="restart_rejected",
+            ),
+            self.network_client.devices.restart,
+            site_id,
+            device_id,
+        )
 
-        Used for classic-API client actions, which are scoped by the site name
-        (for example ``default``) rather than the integration site UUID.
+    async def async_power_cycle_port(
+        self, site_id: str, device_id: str, port_idx: int
+    ) -> bool:
+        """Power cycle a PoE port, after the shared eligibility check."""
+        require_power_cyclable_port(self.data, site_id, device_id, port_idx)
+        return await async_execute_command(
+            CommandFailure(
+                translation_key="command_failed",
+                message=f"Unable to power-cycle port {port_idx} on device {device_id}",
+            ),
+            self.network_client.devices.execute_port_action,
+            site_id,
+            device_id,
+            port_idx,
+            "POWER_CYCLE",
+        )
+
+    async def async_set_outlet_state(
+        self,
+        site_id: str,
+        device_id: str,
+        outlet_index: int,
+        *,
+        state: bool,
+        cycle_enabled: bool | None = None,
+    ) -> bool:
         """
-        return self._legacy_site_names.get(site_id)
+        Set outlet relay state and/or cycle_enabled on a PDU device.
+
+        The classic call is addressed by the device's classic ``_id`` and
+        carries its current ``outlet_overrides``. After success the written
+        fields are published as a copy-on-write overlay and a deferred
+        refresh is requested.
+        """
+        site_name = await self.config_coordinator.async_resolve_legacy_site_name(
+            site_id, verified_only=False
+        )
+        device_data = self.get_device(site_id, device_id) or {}
+        result = await async_execute_command(
+            CommandFailure(
+                translation_key="command_failed",
+                message=(
+                    f"Unable to set outlet {outlet_index} state on device {device_id}"
+                ),
+            ),
+            self.network_client.devices.set_outlet_state,
+            site_name,
+            device_data.get("_id") or device_id,
+            outlet_index,
+            state=state,
+            cycle_enabled=cycle_enabled,
+            current_device=device_data,
+        )
+        changes: dict[str, bool] = {"relay_state": state}
+        if cycle_enabled is not None:
+            changes["cycle_enabled"] = cycle_enabled
+        self._publish_outlet(site_id, device_id, outlet_index, changes)
+        await self.async_request_refresh()
+        return result
+
+    @staticmethod
+    def _is_outlet(outlet: Any, outlet_index: int) -> bool:
+        """Return True if an ``outlet_table`` entry is the given outlet."""
+        if not isinstance(outlet, dict):
+            return False
+        idx = outlet.get("index")
+        if idx is None:
+            idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
+        try:
+            return idx is not None and int(idx) == outlet_index
+        except TypeError, ValueError:
+            return False
+
+    def _publish_outlet(
+        self,
+        site_id: str,
+        device_id: str,
+        outlet_index: int,
+        changes: dict[str, bool],
+    ) -> None:
+        """
+        Publish an outlet write as a copy-on-write overlay (ADR-010).
+
+        The data root, ``devices``, the site map, the device record, its
+        ``outlet_table`` list and the written outlet are replaced; the other
+        outlets stay shared. Listeners are notified without
+        ``async_set_updated_data()``. A poll that started before the write
+        may briefly restore the old value until the next refresh.
+        """
+        devices = self.data.get("devices", {})
+        site_devices = devices.get(site_id)
+        device = site_devices.get(device_id) if isinstance(site_devices, dict) else None
+        outlets = device.get("outlet_table") if isinstance(device, dict) else None
+        if not (
+            isinstance(site_devices, dict)
+            and isinstance(device, dict)
+            and isinstance(outlets, list)
+        ):
+            return
+        position = next(
+            (i for i, o in enumerate(outlets) if self._is_outlet(o, outlet_index)),
+            None,
+        )
+        if position is None:
+            return
+        table = list(outlets)
+        table[position] = {**outlets[position], **changes}
+        self.data = {
+            **self.data,
+            "devices": {
+                **devices,
+                site_id: {**site_devices, device_id: {**device, "outlet_table": table}},
+            },
+        }
+        self.async_update_listeners()
+
+    async def _async_client_target(
+        self, site_id: str, client_id: str
+    ) -> tuple[str, str]:
+        """
+        Resolve the classic site name and client MAC for a client action.
+
+        The official Integration API has no block/unblock/reconnect/forget
+        operations, so these are issued against the classic ``cmd/stamgr``
+        endpoint, which is scoped by the classic site name and identifies the
+        client by MAC address rather than the integration client UUID.
+        """
+        clients = self.data.get("clients", {}).get(site_id, {})
+        client_data = clients.get(client_id, {}) if isinstance(clients, dict) else {}
+        mac = (
+            client_data.get("macAddress")
+            or client_data.get("mac_address")
+            or client_data.get("mac")
+        )
+        if not mac:
+            msg = f"Unable to determine MAC address for client {client_id}"
+            raise HomeAssistantError(
+                msg,
+                translation_domain=DOMAIN,
+                translation_key="client_not_resolvable",
+                translation_placeholders={"client_id": client_id},
+            )
+        site_name = await self.config_coordinator.async_resolve_legacy_site_name(
+            site_id, verified_only=False
+        )
+        return site_name, mac
+
+    async def _async_client_command(
+        self,
+        verb: str,
+        site_id: str,
+        client_id: str,
+        action: Callable[[str, str], Awaitable[bool]],
+    ) -> None:
+        """Run one classic client command against a resolved site and MAC."""
+        site_name, mac = await self._async_client_target(site_id, client_id)
+        await async_execute_command(
+            CommandFailure(
+                translation_key="command_failed",
+                message=f"Unable to {verb} client {client_id}",
+            ),
+            action,
+            site_name,
+            mac,
+        )
+
+    async def async_block_client(self, site_id: str, client_id: str) -> None:
+        """Block a network client, then request a deferred refresh."""
+        await self._async_client_command(
+            "block", site_id, client_id, self.network_client.clients.block
+        )
+        await self.async_request_refresh()
+
+    async def async_unblock_client(self, site_id: str, client_id: str) -> None:
+        """Unblock a network client, then request a deferred refresh."""
+        await self._async_client_command(
+            "unblock", site_id, client_id, self.network_client.clients.unblock
+        )
+        await self.async_request_refresh()
+
+    async def async_reconnect_client(self, site_id: str, client_id: str) -> None:
+        """Reconnect a network client."""
+        await self._async_client_command(
+            "reconnect", site_id, client_id, self.network_client.clients.reconnect
+        )
+
+    async def async_forget_client(self, site_id: str, client_id: str) -> None:
+        """Forget/remove a network client."""
+        await self._async_client_command(
+            "forget", site_id, client_id, self.network_client.clients.forget
+        )
+
+    async def async_forget_clients_batch(self, site_id: str, macs: list[str]) -> bool:
+        """Forget/remove a list of client MACs for a site."""
+        site_name = self.config_coordinator.resolve_legacy_site_name(
+            site_id, verified_only=True
+        )
+        return await async_execute_command(
+            CommandFailure(
+                translation_key="command_failed",
+                message=f"Unable to forget clients for site {site_id}",
+            ),
+            self.network_client.clients.forget_batch,
+            site_name,
+            macs,
+        )
+
+    async def _async_derive_wake_broadcast(self, mac: str) -> str | None:
+        """
+        Return the client's subnet directed broadcast address, or None if unknown.
+
+        Never raises: any failure means "unknown", so the packet goes to the
+        default 255.255.255.255. A connected client with an IP needs one request
+        (the site's networks). Any other client also reads the classic history for
+        its last network, which makes it two.
+        """
+        live = find_client_by_mac(self.data.get("clients"), mac)
+        live_ip = (
+            first_present(live[1], "ipAddress", "ip_address", "ip") if live else None
+        )
+
+        async def _query_site(site_id: str) -> str | None:
+            try:
+                site_name = self.config_coordinator.resolve_legacy_site_name(
+                    site_id, verified_only=True
+                )
+                ip: str | None
+                network_id: str | None
+                if isinstance(live_ip, str) and live_ip:
+                    networks = await self.network_client.networks.get_legacy_all(
+                        site_name
+                    )
+                    ip, network_id = live_ip, None
+                else:
+                    networks, records = await asyncio.gather(
+                        self.network_client.networks.get_legacy_all(site_name),
+                        self.network_client.clients.get_historical_legacy(site_name),
+                    )
+                    ip, network_id = history_network_hint(records, mac)
+                return derive_directed_broadcast(networks, ip=ip, network_id=network_id)
+            except Exception:
+                _LOGGER.debug("Wake-on-LAN: no broadcast address from site %s", site_id)
+                return None
+
+        if live and live[0]:
+            return await _query_site(live[0])
+
+        site_ids = self.config_coordinator.get_site_ids()
+        results = await asyncio.gather(*(_query_site(s) for s in site_ids))
+        return next((b for b in results if b is not None), None)
+
+    async def async_wake_client(
+        self, mac: str, *, client_name: str | None = None
+    ) -> None:
+        """
+        Send a Wake-on-LAN magic packet to a client through Home Assistant core.
+
+        UniFi has no wake action, so this calls ``wake_on_lan.send_magic_packet``
+        (loaded through this integration's manifest dependencies). The packet goes
+        to the client's subnet directed broadcast when UniFi data allows deriving
+        it, otherwise to the default 255.255.255.255.
+        """
+        normalized = normalize_mac(mac)
+        live = (
+            find_client_by_mac(self.data.get("clients"), normalized)
+            if normalized
+            else None
+        )
+        display_name = (
+            client_name
+            or (first_non_blank_text(live[1], "name", "hostname") if live else None)
+            or (f"Client {normalized}" if normalized else str(mac))
+        )
+        if normalized is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="wake_failed",
+                translation_placeholders={
+                    "client_name": display_name,
+                    "error": "invalid MAC address",
+                },
+            )
+
+        broadcast: str | None = None
+        if self.config_coordinator.last_update_success and self.last_update_success:
+            try:
+                async with asyncio.timeout(WAKE_BROADCAST_TIMEOUT_SECONDS):
+                    broadcast = await self._async_derive_wake_broadcast(normalized)
+            except TimeoutError:
+                _LOGGER.debug("Wake-on-LAN: broadcast address derivation timed out")
+            except Exception:
+                _LOGGER.debug("Wake-on-LAN: broadcast address derivation failed")
+
+        service_data: dict[str, str] = {"mac": normalized}
+        if broadcast is not None:
+            service_data["broadcast_address"] = broadcast
+        try:
+            await self.hass.services.async_call(
+                WAKE_ON_LAN_DOMAIN, WAKE_ON_LAN_SERVICE, service_data, blocking=True
+            )
+        except ServiceNotFound as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="wake_on_lan_unavailable",
+            ) from err
+        except HomeAssistantError:
+            raise
+        except (OSError, ValueError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="wake_failed",
+                translation_placeholders={
+                    "client_name": display_name,
+                    "error": str(err),
+                },
+            ) from err
+        _LOGGER.debug(
+            "Sent Wake-on-LAN packet (directed broadcast: %s)", broadcast is not None
+        )

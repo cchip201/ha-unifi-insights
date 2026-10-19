@@ -78,7 +78,6 @@ def mock_sub_coordinators() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]
     device_coord.last_update_success = True
     device_coord.last_exception = None
     device_coord.async_refresh = AsyncMock()
-    device_coord.get_legacy_site_name.return_value = "default"
 
     protect_coord = MagicMock()
     protect_coord.data = {
@@ -200,42 +199,6 @@ class TestFacadeAsyncRefreshChildren:
         )
         assert failures == []
         innerspace_coord.async_refresh.assert_awaited_once()
-
-
-class TestFacadeClientTargetResolution:
-    """Tests for _resolve_client_action_target."""
-
-    def test_resolve_client_action_target_success(
-        self, facade: UnifiFacadeCoordinator
-    ) -> None:
-        """Test resolving valid client target."""
-        facade._device_coordinator.get_legacy_site_name.return_value = "legacy-site"
-        facade._aggregate_data()
-        site_name, mac = facade._resolve_client_action_target("site1", "client1")
-        assert site_name == "legacy-site"
-        assert mac == "AA:BB:CC:DD:EE:01"
-
-    def test_resolve_client_action_target_missing_mac(
-        self, facade: UnifiFacadeCoordinator
-    ) -> None:
-        """Test resolving client without MAC raises HomeAssistantError."""
-        facade._aggregate_data()
-        with pytest.raises(
-            HomeAssistantError,
-            match="Unable to determine MAC address for client client_no_mac",
-        ):
-            facade._resolve_client_action_target("site1", "client_no_mac")
-
-    def test_resolve_client_action_target_missing_client(
-        self, facade: UnifiFacadeCoordinator
-    ) -> None:
-        """Test resolving non-existent client raises HomeAssistantError."""
-        facade._aggregate_data()
-        with pytest.raises(
-            HomeAssistantError,
-            match="Unable to determine MAC address for client unknown_client",
-        ):
-            facade._resolve_client_action_target("site1", "unknown_client")
 
 
 class TestFacadeGenerateVoucher:
