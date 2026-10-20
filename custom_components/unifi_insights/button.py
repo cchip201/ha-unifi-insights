@@ -19,13 +19,6 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .access_entity import (
-    UnifiAccessDoorEntity,
-    access_coordinator_for,
-    access_unique_id,
-    async_discover_access_entities,
-    door_device_info,
-)
 from .client_wake import (
     find_client_by_mac,
     first_non_blank_text,
@@ -58,10 +51,16 @@ from .data_transforms import (
     voucher_site_ids,
 )
 from .entity import (
+    UnifiAccessDoorEntity,
     UnifiInsightsEntity,
     UnifiProtectEntity,
+    UnifiSiteEntity,
+    access_coordinator_for,
+    access_unique_id,
+    async_discover_access_entities,
     build_site_device_info,
     camera_supports_ptz,
+    door_device_info,
     get_client_type,
     get_field,
 )
@@ -815,12 +814,9 @@ class UnifiProtectPTZPatrolStopButton(UnifiProtectEntity, ButtonEntity):
         _LOGGER.info("Successfully stopped PTZ patrol for camera %s", self._device_id)
 
 
-class UnifiGenerateVoucherButton(
-    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ButtonEntity
-):
+class UnifiGenerateVoucherButton(UnifiSiteEntity, ButtonEntity):
     """Button entity that creates a new hotspot voucher using HA-stored settings."""
 
-    _attr_has_entity_name = True
     _attr_translation_key = "generate_voucher"
 
     def __init__(
@@ -831,12 +827,7 @@ class UnifiGenerateVoucherButton(
         unique_id: str,
     ) -> None:
         """Initialize the voucher generation button."""
-        super().__init__(coordinator)
-        self._site_id = site_id
-        self._attr_unique_id = unique_id
-        self._attr_device_info = DeviceInfo(
-            **build_site_device_info(coordinator.data, site_id)  # type: ignore[typeddict-item]
-        )
+        super().__init__(coordinator, site_id, unique_id=unique_id)
 
     @property
     def available(self) -> bool:

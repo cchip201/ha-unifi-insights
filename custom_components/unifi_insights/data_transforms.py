@@ -29,6 +29,7 @@ import ipaddress
 import logging
 import math
 import re
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,8 @@ from .const import (
     CAMERA_TYPE_DOORBELL_MAIN,
     CAMERA_TYPE_DOORBELL_PACKAGE,
     CAMERA_TYPE_DOORBELL_WITH_PACKAGE_DETECTION,
+    DEVICE_TYPE_ALARM_HUB,
+    DEVICE_TYPE_LINK_STATION,
     GATEWAY_MODEL_PREFIXES,
     STORAGE_NEARLY_FULL_PERCENT,
 )
@@ -1342,3 +1345,116 @@ def is_doorbell_camera_model(camera_data: dict[str, Any]) -> bool:
             "aidoorbell",
         )
     )
+
+
+# --- Storage mounts ----------------------------------------------------------
+
+
+def get_storage_mounts(device_data: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the usable normalised mounts of a device (empty when none)."""
+    mounts = device_data.get("storage_mounts") if device_data else None
+    if not isinstance(mounts, list):
+        return []
+    return [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict)
+        and isinstance(mount.get("mount_point"), str)
+        and mount["mount_point"]
+    ]
+
+
+def find_storage_mount(
+    device_data: dict[str, Any] | None, mount_point: str
+) -> dict[str, Any] | None:
+    """Return the mount with this mount point, or None when it is gone."""
+    for mount in get_storage_mounts(device_data):
+        if mount["mount_point"] == mount_point:
+            return mount
+    return None
+
+
+def storage_mount_labels(mounts: list[dict[str, Any]]) -> dict[str, str]:
+    """
+    Return a display label per mount point, unique within the device.
+
+    The label is the console's ``name`` ("eMMC", "Backup") or the mount path
+    when it has none. Labels that two mounts share (compared case-insensitively)
+    get the mount path appended so entity names never repeat.
+    """
+    bases = {
+        mount["mount_point"]: mount.get("name") or mount["mount_point"]
+        for mount in mounts
+    }
+    counts = Counter(base.casefold() for base in bases.values())
+    return {
+        mount_point: f"{base} ({mount_point})" if counts[base.casefold()] > 1 else base
+        for mount_point, base in bases.items()
+    }
+
+
+def persistent_storage_mounts(
+    device_data: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return the mounts that count towards "storage nearly full"."""
+    return [
+        mount
+        for mount in get_storage_mounts(device_data)
+        if not is_volatile_storage_mount(mount)
+    ]
+
+
+def fullest_persistent_storage_mount(
+    device_data: dict[str, Any] | None,
+) -> tuple[dict[str, Any], float] | None:
+    """Return the persistent mount with the highest valid fill level."""
+    scored = [
+        (mount, percent)
+        for mount in persistent_storage_mounts(device_data)
+        if (percent := storage_used_percent(mount)) is not None
+    ]
+    return max(scored, key=lambda item: item[1]) if scored else None
+
+
+# --- Protect security devices ------------------------------------------------
+
+THREAD_DEVICE_TYPES = (DEVICE_TYPE_LINK_STATION, DEVICE_TYPE_ALARM_HUB)
+
+
+def nested_dict(data: dict[str, Any], *keys: str) -> dict[str, Any] | None:
+    """
+    Follow ``keys`` through nested dicts, or return None.
+
+    Coordinator dicts come from ``model_dump(exclude_none=False)``, so an
+    absent object is an explicit ``None`` and ``data.get(key, {})`` would not
+    fall back.
+    """
+    value: Any = data
+    for key in keys:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else None
+
+
+def thread_network(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return ``threadState.network``; None on SKUs without Thread."""
+    return nested_dict(data, "threadState", "network")
+
+
+def has_thread_network(data: dict[str, Any]) -> bool:
+    """Return True if the gateway reports a Thread network."""
+    return thread_network(data) is not None
+
+
+def has_keypad(data: dict[str, Any]) -> bool:
+    """Return True for a fob with a PIN keypad."""
+    flags = data.get("featureFlags")
+    return isinstance(flags, dict) and flags.get("hasKeypad") is True
+
+
+def always_true(_data: dict[str, Any]) -> bool:
+    return True
+
+
+def present_attributes(**attributes: Any) -> dict[str, Any]:
+    """Drop attributes that are None rather than reporting null values."""
+    return {key: value for key, value in attributes.items() if value is not None}

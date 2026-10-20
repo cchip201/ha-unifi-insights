@@ -13,12 +13,14 @@ from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import PERCENTAGE, EntityCategory
 
-from custom_components.unifi_insights.const import DOMAIN
-from custom_components.unifi_insights.protect_security_entity import (
-    THREAD_ROLES,
-    UnifiProtectSecurityBinarySensor,
-    UnifiProtectSecuritySensor,
+from custom_components.unifi_insights.binary_sensor import (
+    UnifiProtectBinarySensor,
     discover_protect_security_binary_sensors,
+)
+from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.sensor import (
+    THREAD_ROLES,
+    UnifiProtectSensor,
     discover_protect_security_sensors,
 )
 from tests.fixtures.library_responses import (
@@ -78,14 +80,14 @@ def _find(entities: list[Any], device_type: str, device_id: str, key: str) -> An
 
 def _binary(
     coordinator: MagicMock, device_type: str, device_id: str, key: str
-) -> UnifiProtectSecurityBinarySensor:
+) -> UnifiProtectBinarySensor:
     entities = discover_protect_security_binary_sensors(coordinator, set())
     return _find(entities, device_type, device_id, key)
 
 
 def _sensor(
     coordinator: MagicMock, device_type: str, device_id: str, key: str
-) -> UnifiProtectSecuritySensor:
+) -> UnifiProtectSensor:
     entities = discover_protect_security_sensors(coordinator, set())
     return _find(entities, device_type, device_id, key)
 
@@ -333,6 +335,8 @@ class TestThreadNetworkProblem:
         ]["network"]
         network["status"] = "error"
         network["errorReason"] = "radio fault"
+        # Attributes refresh on the coordinator update, as for every Protect entity.
+        entity._update_from_data()
         assert entity.extra_state_attributes == {"error_reason": "radio fault"}
 
     def test_network_disappearing_reads_unknown(self, hass: HomeAssistant) -> None:
@@ -486,7 +490,7 @@ class TestThreadJoinedDevices:
         assert entity.native_value == expected
         assert entity.state_class == SensorStateClass.MEASUREMENT
         assert entity.native_unit_of_measurement is None
-        assert entity.extra_state_attributes == {}
+        assert not entity.extra_state_attributes
 
 
 class TestFobSensors:

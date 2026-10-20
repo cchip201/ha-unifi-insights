@@ -19,28 +19,24 @@ from typing import Any, Final, cast
 import pytest
 import yaml
 
-from custom_components.unifi_insights.binary_sensor import BINARY_SENSOR_TYPES
+from custom_components.unifi_insights.binary_sensor import (
+    BINARY_SENSOR_TYPES,
+    SECURITY_BINARY_SENSOR_TYPES,
+    STORAGE_NEARLY_FULL_DESCRIPTION,
+)
 from custom_components.unifi_insights.coordinators.rule_audit import (
     RULE_CHANGE_TYPES,
 )
-from custom_components.unifi_insights.mobility_entity import (
-    LOCATION_DESCRIPTION,
+from custom_components.unifi_insights.device_tracker import LOCATION_DESCRIPTION
+from custom_components.unifi_insights.sensor import (
     ROUTER_SENSORS,
+    SECURITY_SENSOR_TYPES,
+    SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
+    STORAGE_SENSOR_TYPES,
     WORKSPACE_SENSORS,
 )
-from custom_components.unifi_insights.network_rule_switch import (
+from custom_components.unifi_insights.switch import (
     NETWORK_RULE_SWITCH_TYPES,
-)
-from custom_components.unifi_insights.protect_security_entity import (
-    SECURITY_BINARY_SENSOR_TYPES,
-    SECURITY_SENSOR_TYPES,
-)
-from custom_components.unifi_insights.site_internet_activity_sensor import (
-    SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
-)
-from custom_components.unifi_insights.storage_entity import (
-    STORAGE_NEARLY_FULL_DESCRIPTION,
-    STORAGE_SENSOR_TYPES,
 )
 
 _INTEGRATION_DIR = Path(__file__).parent.parent / "custom_components" / "unifi_insights"
@@ -140,17 +136,6 @@ _DESC_CLASS_TO_PLATFORM: Final = {
     "UnifiInsightsImageEntityDescription": "image",
 }
 
-_MODULE_DEFAULT_PLATFORM: Final = {
-    "carrier_fabric_sensor": "sensor",
-    "mobility_entity": "sensor",
-    "network_rule_switch": "switch",
-    "network_rule_audit_event": "event",
-    "site_internet_activity_sensor": "sensor",
-    "storage_entity": "sensor",
-    "voucher_sensor": "sensor",
-    "innerspace_entity": "sensor",
-}
-
 # Explicit allow-list for finite f-string keys.
 # In switch.py (UnifiAccessEmergencySwitch.__init__):
 #   (constructs access_emergency_lockdown and access_emergency_evacuation)
@@ -181,21 +166,11 @@ def _collect_live_entity_translation_keys() -> tuple[
     inventory: set[tuple[str, str]] = set()
     dynamic_unresolved: list[tuple[str, int, str]] = []
 
-    entity_modules = [
-        f
-        for f in _INTEGRATION_DIR.glob("*.py")
-        if f.stem in _PLATFORMS
-        or f.stem in _MODULE_DEFAULT_PLATFORM
-        or f.stem == "protect_security_entity"
-    ]
+    # ADR-007: every entity lives in its platform module.
+    entity_modules = [f for f in _INTEGRATION_DIR.glob("*.py") if f.stem in _PLATFORMS]
 
     for py_file in entity_modules:
-        module_name = py_file.stem
-        default_platform = (
-            module_name
-            if module_name in _PLATFORMS
-            else _MODULE_DEFAULT_PLATFORM.get(module_name)
-        )
+        default_platform = py_file.stem
         tree = ast.parse(py_file.read_text(encoding="utf-8"))
 
         for node in ast.walk(tree):
@@ -210,11 +185,6 @@ def _collect_live_entity_translation_keys() -> tuple[
                     call_platform = _DESC_CLASS_TO_PLATFORM.get(
                         call_func, default_platform
                     )
-                    if (
-                        call_func == "EntityDescription"
-                        and module_name == "mobility_entity"
-                    ):
-                        call_platform = "device_tracker"
                     for kw in node.keywords:
                         if kw.arg in ("translation_key", "unnamed_translation_key"):
                             if (
@@ -264,7 +234,7 @@ def _collect_live_entity_translation_keys() -> tuple[
                             if plat:
                                 inventory.add((plat, constants[node.value.id]))
                         elif (
-                            module_name == "switch"
+                            default_platform == "switch"
                             and isinstance(node.value, ast.JoinedStr)
                             and ast.unparse(node.value) == "f'access_emergency_{mode}'"
                         ):
@@ -294,7 +264,7 @@ def _switch_translation_keys() -> set[str]:
 def _switch_supplied_placeholders() -> set[str]:
     """Collect every key passed to placeholders in switch modules."""
     placeholders: set[str] = set()
-    for fname in ("switch.py", "network_rule_switch.py"):
+    for fname in ("switch.py",):
         tree = ast.parse((_INTEGRATION_DIR / fname).read_text(encoding="utf-8"))
         placeholders |= {
             key.value
@@ -305,6 +275,21 @@ def _switch_supplied_placeholders() -> set[str]:
             and target.attr == "_attr_translation_placeholders"
             for key in node.value.keys
             if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        # Rule switches name their placeholders in the description.
+        placeholders |= {
+            value.value
+            for node in ast.walk(tree)
+            for name, value in (
+                [(kw.arg, kw.value) for kw in node.keywords]
+                if isinstance(node, ast.Call)
+                else [(getattr(node.target, "id", None), node.value)]
+                if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            if name in ("name_placeholder", "id_placeholder")
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
         }
     return placeholders
 
@@ -522,8 +507,11 @@ def test_network_rule_switch_translations_resolve_in_both_files() -> None:
 
     for desc in NETWORK_RULE_SWITCH_TYPES:
         for key, placeholder in (
-            (desc.translation_key, "{rule_name}"),
-            (desc.unnamed_translation_key, "{rule_id}"),
+            (desc.translation_key, f"{{{desc.name_placeholder}}}"),
+            (
+                desc.unnamed_translation_key,
+                f"{{{desc.id_placeholder}}}" if desc.id_placeholder else "",
+            ),
         ):
             assert key in strings_switch, f"{key} missing from strings.json"
             assert key in en_switch, f"{key} missing from translations/en.json"
@@ -718,9 +706,8 @@ def test_all_icons_json_entity_keys_match_live_inventory() -> None:
 # Four state-dependent icon choices: firewall, VPN route, ordinary route, VPN
 # client. The two route choices share one property in the current implementation.
 _DYNAMIC_ICON_PROPERTIES: Final = {
-    ("switch.py", "UnifiFirewallRuleSwitch"),
-    ("switch.py", "UnifiInsightsPolicyBasedRouteSwitch"),
-    ("switch.py", "UnifiInsightsVpnClientSwitch"),
+    # A policy-based route that sends traffic over a VPN shows the VPN icon.
+    ("switch.py", "UnifiInsightsNetworkRuleSwitch"),
 }
 
 
@@ -801,7 +788,7 @@ def test_no_static_mdi_strings_in_python_code() -> None:
         "SensorEntityDescription(key='test', icon=f'mdi:{kind}')",
         'class NewSwitch:\n @property\n def icon(self):\n  return "mdi:power"',
         (
-            "class UnifiFirewallRuleSwitch:\n @property\n"
+            "class UnifiInsightsNetworkRuleSwitch:\n @property\n"
             ' def icon(self):\n  return "mdi:power"'
         ),
     ],
@@ -819,7 +806,7 @@ def test_static_icon_guard_rejects_overrides_inside_reviewed_properties(
 ) -> None:
     """Only returned state icons are exempt; overrides cannot hide in properties."""
     source = (
-        "class UnifiFirewallRuleSwitch:\n @property\n def icon(self):\n"
+        "class UnifiInsightsNetworkRuleSwitch:\n @property\n def icon(self):\n"
         f"  {override}\n"
         '  return "mdi:power" if self.is_on else "mdi:power-off"'
     )

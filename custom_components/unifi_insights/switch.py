@@ -4,22 +4,20 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
+from homeassistant.components.switch import (
+    SwitchDeviceClass,
+    SwitchEntity,
+    SwitchEntityDescription,
+)
+from homeassistant.const import EntityCategory
 from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .access_entity import (
-    UnifiAccessEntity,
-    access_coordinator_for,
-    access_unique_id,
-    async_discover_access_entities,
-    console_device_info,
-)
 from .const import (
     ATTR_CAMERA_ID,
     ATTR_CAMERA_NAME,
@@ -41,11 +39,16 @@ from .coordinators.config_sections import (
 )
 from .data_transforms import get_site_gateway_id
 from .entity import (
+    UnifiAccessEntity,
     UnifiProtectEntity,
+    UnifiSiteEntity,
+    access_coordinator_for,
+    access_unique_id,
+    async_discover_access_entities,
+    console_device_info,
     get_field,
     is_device_online,
 )
-from .network_rule_switch import discover_network_rule_switches
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -56,6 +59,7 @@ if TYPE_CHECKING:
     from . import UnifiInsightsConfigEntry
     from .coordinators import UnifiInsightsFacadeCoordinator
     from .coordinators.access import EmergencyMode, UnifiInsightsAccessCoordinator
+    from .coordinators.config import UnifiInsightsConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -499,29 +503,6 @@ async def async_setup_entry(
                         )
                     )
 
-        # Add firewall policy enable/disable switches for user-defined rules.
-        firewall_rules_by_site = coordinator.data.get("firewall_rules", {})
-        if isinstance(firewall_rules_by_site, dict):
-            for site_id, firewall_rules in firewall_rules_by_site.items():
-                if not isinstance(firewall_rules, dict):
-                    continue
-                for rule_id, rule_data in firewall_rules.items():
-                    if not isinstance(rule_data, dict):
-                        continue
-                    if _is_predefined_firewall_rule(rule_data):
-                        continue
-                    key = (site_id, rule_id, "firewall_rule")
-                    if key in known_switch_keys:
-                        continue
-                    known_switch_keys.add(key)
-                    entities.append(
-                        UnifiFirewallRuleSwitch(
-                            coordinator=coordinator,
-                            site_id=site_id,
-                            rule_id=rule_id,
-                        )
-                    )
-
         # Add PDU outlet relay and power cycle switches
         devices_by_site = coordinator.data.get("devices", {})
         if isinstance(devices_by_site, dict):
@@ -547,79 +528,32 @@ async def async_setup_entry(
                         except TypeError, ValueError:
                             continue
 
-                        switch_key = (site_id, device_id, outlet_idx, "outlet_switch")
-                        if switch_key not in known_switch_keys:
-                            known_switch_keys.add(switch_key)
+                        for description in (OUTLET_RELAY_SWITCH, OUTLET_CYCLE_SWITCH):
+                            # Only outlets that report cycling get a cycle switch.
+                            if (
+                                description is OUTLET_CYCLE_SWITCH
+                                and outlet.get("cycle_enabled") is None
+                            ):
+                                continue
+                            outlet_key = (
+                                site_id,
+                                device_id,
+                                outlet_idx,
+                                description.key,
+                            )
+                            if outlet_key in known_switch_keys:
+                                continue
+                            known_switch_keys.add(outlet_key)
                             entities.append(
                                 UnifiOutletSwitch(
-                                    coordinator=coordinator,
-                                    site_id=site_id,
-                                    device_id=device_id,
+                                    coordinator,
+                                    description,
+                                    site_id,
+                                    device_id,
                                     outlet_index=outlet_idx,
                                     outlet_data=outlet,
                                 )
                             )
-
-                        if outlet.get("cycle_enabled") is not None:
-                            cycle_key = (
-                                site_id,
-                                device_id,
-                                outlet_idx,
-                                "outlet_cycle_switch",
-                            )
-                            if cycle_key not in known_switch_keys:
-                                known_switch_keys.add(cycle_key)
-                                entities.append(
-                                    UnifiOutletCycleSwitch(
-                                        coordinator=coordinator,
-                                        site_id=site_id,
-                                        device_id=device_id,
-                                        outlet_index=outlet_idx,
-                                        outlet_data=outlet,
-                                    )
-                                )
-
-        # Add policy-based route enable/disable switches
-        routes_by_site = coordinator.data.get("policy_based_routes", {})
-        if isinstance(routes_by_site, dict):
-            for site_id, routes in routes_by_site.items():
-                if not isinstance(routes, dict):
-                    continue
-                for route_id, route_data in routes.items():
-                    if not isinstance(route_data, dict):
-                        continue
-                    key = (site_id, route_id, "pbr_switch")
-                    if key in known_switch_keys:
-                        continue
-                    known_switch_keys.add(key)
-                    entities.append(
-                        UnifiInsightsPolicyBasedRouteSwitch(
-                            coordinator=coordinator,
-                            site_id=site_id,
-                            route_id=route_id,
-                        )
-                    )
-
-        # Add VPN client enable/disable switches
-        vpn_clients_by_site = coordinator.data.get("vpn_clients", {})
-        if isinstance(vpn_clients_by_site, dict):
-            for site_id, vpn_clients in vpn_clients_by_site.items():
-                if not isinstance(vpn_clients, dict):
-                    continue
-                for client_id, vpn_client_data in vpn_clients.items():
-                    if not isinstance(vpn_client_data, dict):
-                        continue
-                    key = (site_id, client_id, "vpn_switch")
-                    if key in known_switch_keys:
-                        continue
-                    known_switch_keys.add(key)
-                    entities.append(
-                        UnifiInsightsVpnClientSwitch(
-                            coordinator=coordinator,
-                            site_id=site_id,
-                            client_id=client_id,
-                        )
-                    )
 
         entities.extend(discover_network_rule_switches(coordinator, known_switch_keys))
 
@@ -636,403 +570,6 @@ async def async_setup_entry(
     _prune_orphaned_switch_entities(hass, entry, coordinator)
 
     entry.async_on_unload(coordinator.async_add_listener(async_discover_switches))
-
-
-class UnifiFirewallRuleSwitch(
-    CoordinatorEntity["UnifiInsightsFacadeCoordinator"], SwitchEntity
-):
-    """Switch to enable or disable a user-defined firewall rule."""
-
-    _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
-
-    def __init__(
-        self,
-        coordinator: UnifiInsightsFacadeCoordinator,
-        site_id: str,
-        rule_id: str,
-    ) -> None:
-        """Initialize the firewall rule switch."""
-        super().__init__(coordinator)
-        self._site_id = site_id
-        self._rule_id = rule_id
-
-        rule_data = self._get_rule_data()
-        rule_name = rule_data.get("name") or rule_id
-
-        self._attr_unique_id = f"{site_id}_{rule_id}_firewall_rule"
-        self._attr_translation_key = "firewall_rule"
-        self._attr_translation_placeholders = {"rule_name": str(rule_name)}
-        self._attr_device_info = self._build_device_info()
-
-    def _get_rule_data(self) -> dict[str, Any]:
-        """Get firewall rule data from the coordinator."""
-        result: dict[str, Any] = (
-            self.coordinator.data.get("firewall_rules", {})
-            .get(self._site_id, {})
-            .get(self._rule_id, {})
-        )
-        return result
-
-    def _build_device_info(self) -> DeviceInfo:
-        """Build device info for firewall rule grouping."""
-        gateway_device_id = get_site_gateway_id(self.coordinator.data, self._site_id)
-        if gateway_device_id is not None:
-            return DeviceInfo(
-                identifiers={(DOMAIN, f"{self._site_id}_{gateway_device_id}")}
-            )
-
-        site_name = _resolve_site_name(self.coordinator, self._site_id)
-        return DeviceInfo(
-            identifiers={(DOMAIN, f"firewall_policies_{self._site_id}")},
-            name=f"Firewall Policies ({site_name})",
-            manufacturer=MANUFACTURER,
-            model="UniFi Firewall Policies",
-        )
-
-    @property
-    def available(self) -> bool:
-        """Return if the switch is available."""
-        return bool(
-            self.coordinator.firewall_available(self._site_id) and self._get_rule_data()
-        )
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if the firewall rule is enabled."""
-        rule_data = self._get_rule_data()
-        return bool(rule_data.get("enabled", True))
-
-    @property
-    def icon(self) -> str:
-        """Return a context-specific icon for the firewall rule state."""
-        return "mdi:shield-lock" if self.is_on else "mdi:shield-off"
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return firewall rule metadata useful in automations and debugging."""
-        rule_data = self._get_rule_data()
-        return {
-            "rule_id": self._rule_id,
-            "action": _get_firewall_rule_action(rule_data),
-            "protocol": rule_data.get("protocol"),
-            "source_zone_id": rule_data.get("sourceZoneId")
-            or rule_data.get("source_zone_id"),
-            "destination_zone_id": rule_data.get("destinationZoneId")
-            or rule_data.get("destination_zone_id"),
-            "logging": rule_data.get("logging", False),
-            "index": rule_data.get("index"),
-        }
-
-    async def _async_set_enabled(self, *, enabled: bool) -> None:
-        """Enable or disable the firewall rule."""
-        action = "Enabling" if enabled else "Disabling"
-        _LOGGER.debug(
-            "%s firewall rule %s in site %s",
-            action,
-            self._rule_id,
-            self._site_id,
-        )
-
-        await self.coordinator.config_coordinator.async_set_firewall_rule_enabled(
-            self._site_id, self._rule_id, enabled=enabled
-        )
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Enable the firewall rule."""
-        _ = kwargs
-        await self._async_set_enabled(enabled=True)
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Disable the firewall rule."""
-        _ = kwargs
-        await self._async_set_enabled(enabled=False)
-
-
-class UnifiInsightsPolicyBasedRouteSwitch(
-    CoordinatorEntity["UnifiInsightsFacadeCoordinator"], SwitchEntity
-):
-    """Switch to enable or disable a policy-based route (traffic route)."""
-
-    _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
-
-    def __init__(
-        self,
-        coordinator: UnifiInsightsFacadeCoordinator,
-        site_id: str,
-        route_id: str,
-    ) -> None:
-        """Initialize the policy-based route switch."""
-        super().__init__(coordinator)
-        self._site_id = site_id
-        self._route_id = route_id
-
-        route_data = self._get_route_data()
-        route_name = route_data.get("description") or route_data.get("name")
-
-        self._attr_unique_id = f"{site_id}_{route_id}_policy_based_route"
-        if route_name:
-            self._attr_translation_key = "policy_based_route"
-            self._attr_translation_placeholders = {"route_name": str(route_name)}
-        else:
-            self._attr_translation_key = "policy_based_route_unnamed"
-            self._attr_translation_placeholders = {"route_id": route_id}
-        self._attr_device_info = self._build_device_info()
-
-    def _get_route_data(self) -> dict[str, Any]:
-        """Get policy-based route data from the coordinator."""
-        result: dict[str, Any] = (
-            self.coordinator.data.get("policy_based_routes", {})
-            .get(self._site_id, {})
-            .get(self._route_id, {})
-        )
-        return result
-
-    def _build_device_info(self) -> DeviceInfo:
-        """Build device info for policy-based route grouping."""
-        gateway_device_id = get_site_gateway_id(self.coordinator.data, self._site_id)
-        if gateway_device_id is not None:
-            return DeviceInfo(
-                identifiers={(DOMAIN, f"{self._site_id}_{gateway_device_id}")}
-            )
-
-        site_name = _resolve_site_name(self.coordinator, self._site_id)
-        return DeviceInfo(
-            identifiers={(DOMAIN, f"policy_based_routes_{self._site_id}")},
-            name=f"Policy-Based Routes ({site_name})",
-            manufacturer=MANUFACTURER,
-            model="UniFi Policy-Based Routes",
-        )
-
-    @property
-    def available(self) -> bool:
-        """Return if the switch is available."""
-        return bool(self.coordinator.config_available and self._get_route_data())
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if the policy-based route is enabled."""
-        route_data = self._get_route_data()
-        return bool(route_data.get("enabled", True))
-
-    @property
-    def icon(self) -> str:
-        """Return a context-specific icon for the route state."""
-        route_data = self._get_route_data()
-        if route_data.get("vpn_client_id") or route_data.get("vpnClientId"):
-            return "mdi:vpn" if self.is_on else "mdi:vpn-off"
-        return "mdi:routes" if self.is_on else "mdi:routes-clock"
-
-    @property
-    def _kill_switch_enabled(self) -> bool | None:
-        """
-        Return the route's kill switch state, if known.
-
-        Prefers the controller's own field names (``kill_switch_enabled`` /
-        ``killSwitchEnabled``), falling back to the maintainer's original
-        ``kill_switch`` / ``killSwitch`` names so both payload shapes work.
-        """
-        route_data = self._get_route_data()
-        for key in (
-            "kill_switch_enabled",
-            "killSwitchEnabled",
-            "killSwitch",
-            "kill_switch",
-        ):
-            val = route_data.get(key)
-            if val is not None:
-                return bool(val)
-        return None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return route metadata useful in automations and debugging."""
-        route_data = self._get_route_data()
-        kill_switch = self._kill_switch_enabled
-        fall_back = get_field(
-            route_data,
-            "fallBackToDefaultWAN",
-            "fall_back_to_default_wan",
-            default=None,
-        )
-        return {
-            "route_id": self._route_id,
-            "description": route_data.get("description"),
-            "target": route_data.get("target"),
-            "matching_target": route_data.get("matchingTarget")
-            or route_data.get("matching_target"),
-            "interface": route_data.get("interface"),
-            "vpn_client_id": route_data.get("vpnClientId")
-            or route_data.get("vpn_client_id"),
-            "kill_switch_enabled": kill_switch,
-            "fall_back_to_default_wan": fall_back,
-            "domains": route_data.get("domains", []),
-            "ip_addresses": route_data.get("ipAddresses")
-            or route_data.get("ip_addresses")
-            or route_data.get("ips", []),
-            "client_macs": route_data.get("clientMacs")
-            or route_data.get("client_macs", []),
-            "network_ids": route_data.get("networkIds")
-            or route_data.get("network_ids", []),
-            "network_id": route_data.get("networkId") or route_data.get("network_id"),
-            "next_hop": route_data.get("nextHop") or route_data.get("next_hop"),
-            "regions": route_data.get("regions", []),
-            "ip_ranges": route_data.get("ipRanges") or route_data.get("ip_ranges", []),
-            "target_devices": route_data.get("targetDevices")
-            or route_data.get("target_devices", []),
-        }
-
-    async def _async_set_enabled(self, *, enabled: bool) -> None:
-        """Enable or disable the policy-based route."""
-        action = "Enabling" if enabled else "Disabling"
-        _LOGGER.debug(
-            "%s policy-based route %s in site %s",
-            action,
-            self._route_id,
-            self._site_id,
-        )
-
-        if not enabled and self._kill_switch_enabled:
-            _LOGGER.warning(
-                "Disabling policy-based route %s in site %s while its kill switch "
-                "is enabled; matched traffic will keep being dropped instead of "
-                "falling back to the default route",
-                self._route_id,
-                self._site_id,
-            )
-
-        config = self.coordinator.config_coordinator
-        await config.async_set_policy_based_route_enabled(
-            self._site_id, self._route_id, enabled=enabled
-        )
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Enable the policy-based route."""
-        _ = kwargs
-        await self._async_set_enabled(enabled=True)
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Disable the policy-based route."""
-        _ = kwargs
-        await self._async_set_enabled(enabled=False)
-
-
-class UnifiInsightsVpnClientSwitch(
-    CoordinatorEntity["UnifiInsightsFacadeCoordinator"], SwitchEntity
-):
-    """Switch to enable or disable a UniFi VPN Client network connection."""
-
-    _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
-
-    def __init__(
-        self,
-        coordinator: UnifiInsightsFacadeCoordinator,
-        site_id: str,
-        client_id: str,
-    ) -> None:
-        """Initialize the VPN client switch."""
-        super().__init__(coordinator)
-        self._site_id = site_id
-        self._client_id = client_id
-        self._attr_unique_id = f"{site_id}_{client_id}_vpn_client"
-
-        vpn_client_data = self._get_vpn_client_data()
-        vpn_client_name = vpn_client_data.get("name")
-        if vpn_client_name:
-            self._attr_translation_key = "vpn_client"
-            self._attr_translation_placeholders = {
-                "vpn_client_name": str(vpn_client_name)
-            }
-        else:
-            self._attr_translation_key = "vpn_client_unnamed"
-
-        self._attr_device_info = self._build_device_info()
-
-    def _build_device_info(self) -> DeviceInfo:
-        """Build device info for VPN client grouping."""
-        gateway_device_id = get_site_gateway_id(self.coordinator.data, self._site_id)
-        if gateway_device_id is not None:
-            return DeviceInfo(
-                identifiers={(DOMAIN, f"{self._site_id}_{gateway_device_id}")}
-            )
-
-        site_name = _resolve_site_name(self.coordinator, self._site_id)
-        return DeviceInfo(
-            identifiers={(DOMAIN, f"vpn_clients_{self._site_id}")},
-            name=f"VPN Clients ({site_name})",
-            manufacturer=MANUFACTURER,
-            model="UniFi VPN Clients",
-        )
-
-    def _get_vpn_client_data(self) -> dict[str, Any]:
-        """Get VPN client data from coordinator."""
-        vpn_clients = self.coordinator.data.get("vpn_clients", {}).get(
-            self._site_id, {}
-        )
-        data = vpn_clients.get(self._client_id, {})
-        return data if isinstance(data, dict) else {}
-
-    @property
-    def available(self) -> bool:
-        """Return if the switch is available."""
-        return bool(self.coordinator.config_available and self._get_vpn_client_data())
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if the VPN client is enabled."""
-        vpn_client_data = self._get_vpn_client_data()
-        return bool(vpn_client_data.get("enabled", True))
-
-    @property
-    def icon(self) -> str:
-        """Return icon representing VPN client status."""
-        return "mdi:vpn" if self.is_on else "mdi:vpn-off"
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return VPN client extra state attributes."""
-        vpn_client_data = self._get_vpn_client_data()
-        return {
-            "client_id": self._client_id,
-            "name": vpn_client_data.get("name"),
-            "purpose": vpn_client_data.get("purpose", "vpn-client"),
-            "vpn_type": vpn_client_data.get("vpn_type"),
-            "ip_subnet": vpn_client_data.get("ip_subnet"),
-            "openvpn_id": vpn_client_data.get("openvpn_id"),
-            "wireguard_id": vpn_client_data.get("wireguard_id"),
-            "remote_host": vpn_client_data.get("remote_host"),
-        }
-
-    async def _async_set_enabled(self, *, enabled: bool) -> None:
-        """Enable or disable the VPN client."""
-        action = "Enabling" if enabled else "Disabling"
-        _LOGGER.debug(
-            "%s VPN client %s in site %s",
-            action,
-            self._client_id,
-            self._site_id,
-        )
-
-        await self.coordinator.config_coordinator.async_set_vpn_client_enabled(
-            self._site_id, self._client_id, enabled=enabled
-        )
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Enable the VPN client."""
-        _ = kwargs
-        await self._async_set_enabled(enabled=True)
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Disable the VPN client."""
-        _ = kwargs
-        await self._async_set_enabled(enabled=False)
-
-
-# Backward compatibility aliases for switch classes
-UnifiPolicyBasedRouteSwitch = UnifiInsightsPolicyBasedRouteSwitch
-UnifiVpnClientSwitch = UnifiInsightsVpnClientSwitch
 
 
 class UnifiProtectStatusLightSwitch(UnifiProtectEntity, SwitchEntity):
@@ -1367,159 +904,66 @@ class UnifiWifiSwitch(
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class UnifiOutletSwitchEntityDescription(SwitchEntityDescription):
+    """One kind of PDU outlet switch: the relay, or automatic power cycling."""
+
+    unique_id_suffix: str
+    # Outlet field the switch reports: "relay_state" or "cycle_enabled".
+    state_field: str
+
+
+OUTLET_RELAY_SWITCH = UnifiOutletSwitchEntityDescription(
+    key="outlet_switch",
+    translation_key="outlet",
+    device_class=SwitchDeviceClass.OUTLET,
+    unique_id_suffix="",
+    state_field="relay_state",
+)
+
+OUTLET_CYCLE_SWITCH = UnifiOutletSwitchEntityDescription(
+    key="outlet_cycle_switch",
+    translation_key="outlet_cycle_enabled",
+    entity_category=EntityCategory.CONFIG,
+    entity_registry_enabled_default=False,
+    unique_id_suffix="_cycle_enabled",
+    state_field="cycle_enabled",
+)
+
+# Outlet fields the relay switch reports as attributes.
+_OUTLET_ATTRIBUTES = (
+    "name",
+    "relay_state",
+    "cycle_enabled",
+    "outlet_caps",
+    "outlet_voltage",
+    "outlet_current",
+    "outlet_power",
+    "outlet_power_factor",
+)
+
+
 class UnifiOutletSwitch(
     CoordinatorEntity["UnifiInsightsFacadeCoordinator"], SwitchEntity
 ):
-    """Per-outlet relay switch for UniFi PDU and smart power strip devices."""
+    """Relay or power-cycle switch of one UniFi PDU or smart power strip outlet."""
 
     _attr_has_entity_name = True
-    _attr_device_class = SwitchDeviceClass.OUTLET
+    entity_description: UnifiOutletSwitchEntityDescription
 
     def __init__(
         self,
         coordinator: UnifiInsightsFacadeCoordinator,
+        description: UnifiOutletSwitchEntityDescription,
         site_id: str,
         device_id: str,
+        *,
         outlet_index: int,
         outlet_data: dict[str, Any] | None = None,
     ) -> None:
         """Initialize the outlet switch."""
         super().__init__(coordinator)
-        self._site_id = site_id
-        self._device_id = device_id
-        self._outlet_index = outlet_index
-        self._initial_outlet_data = outlet_data or {}
-
-        outlet = self._get_outlet_data() or self._initial_outlet_data
-        outlet_name = outlet.get("name") or f"Outlet {outlet_index}"
-
-        self._attr_unique_id = f"{site_id}_{device_id}_outlet_{outlet_index}"
-        self._attr_translation_key = "outlet"
-        self._attr_translation_placeholders = {"outlet_name": str(outlet_name)}
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{site_id}_{device_id}")},
-        )
-
-    def _get_device_data(self) -> dict[str, Any]:
-        """Return the coordinator's cached snapshot for this PDU device."""
-        device_data = (
-            self.coordinator.data.get("devices", {})
-            .get(self._site_id, {})
-            .get(self._device_id, {})
-        )
-        return device_data if isinstance(device_data, dict) else {}
-
-    def _get_outlet_data(self) -> dict[str, Any] | None:
-        """Get current outlet data from coordinator."""
-        device_data = self._get_device_data()
-        if not device_data:
-            return None
-        outlets = device_data.get("outlet_table", [])
-        if not isinstance(outlets, list):
-            return None
-        for outlet in outlets:
-            if not isinstance(outlet, dict):
-                continue
-            idx = outlet.get("index")
-            if idx is None:
-                idx = outlet.get("outlet_idx") or outlet.get("outletIdx")
-            if idx is not None:
-                try:
-                    if int(idx) == self._outlet_index:
-                        return outlet
-                except TypeError, ValueError:
-                    continue
-        return None
-
-    @property
-    def available(self) -> bool:
-        """Return True if switch is available."""
-        if not self.coordinator.device_available:
-            return False
-        device_data = self._get_device_data()
-        if not device_data or not is_device_online(device_data):
-            return False
-        return self._get_outlet_data() is not None
-
-    @property
-    def is_on(self) -> bool:
-        """Return True if outlet relay is energized (ON)."""
-        outlet = self._get_outlet_data()
-        if not outlet:
-            return bool(self._initial_outlet_data.get("relay_state", False))
-        return bool(outlet.get("relay_state", False))
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return outlet extra state attributes."""
-        outlet = self._get_outlet_data() or self._initial_outlet_data
-        attrs: dict[str, Any] = {"index": self._outlet_index}
-        for key in (
-            "name",
-            "relay_state",
-            "cycle_enabled",
-            "outlet_caps",
-            "outlet_voltage",
-            "outlet_current",
-            "outlet_power",
-            "outlet_power_factor",
-        ):
-            if key in outlet and outlet[key] is not None:
-                attrs[key] = outlet[key]
-        return attrs
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn on the outlet."""
-        _ = kwargs
-        _LOGGER.debug(
-            "Turning on outlet %d for device %s in site %s",
-            self._outlet_index,
-            self._device_id,
-            self._site_id,
-        )
-        await self.coordinator.device_coordinator.async_set_outlet_state(
-            self._site_id,
-            self._device_id,
-            self._outlet_index,
-            state=True,
-        )
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn off the outlet."""
-        _ = kwargs
-        _LOGGER.debug(
-            "Turning off outlet %d for device %s in site %s",
-            self._outlet_index,
-            self._device_id,
-            self._site_id,
-        )
-        await self.coordinator.device_coordinator.async_set_outlet_state(
-            self._site_id,
-            self._device_id,
-            self._outlet_index,
-            state=False,
-        )
-
-
-class UnifiOutletCycleSwitch(
-    CoordinatorEntity["UnifiInsightsFacadeCoordinator"], SwitchEntity
-):
-    """Switch to enable or disable automatic modem power cycling for a PDU outlet."""
-
-    _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.CONFIG
-    _attr_entity_registry_enabled_default = False
-
-    def __init__(
-        self,
-        coordinator: UnifiInsightsFacadeCoordinator,
-        site_id: str,
-        device_id: str,
-        outlet_index: int,
-        outlet_data: dict[str, Any] | None = None,
-    ) -> None:
-        """Initialize the outlet cycle switch."""
-        super().__init__(coordinator)
+        self.entity_description = description
         self._site_id = site_id
         self._device_id = device_id
         self._outlet_index = outlet_index
@@ -1529,9 +973,8 @@ class UnifiOutletCycleSwitch(
         outlet_name = outlet.get("name") or f"Outlet {outlet_index}"
 
         self._attr_unique_id = (
-            f"{site_id}_{device_id}_outlet_{outlet_index}_cycle_enabled"
+            f"{site_id}_{device_id}_outlet_{outlet_index}{description.unique_id_suffix}"
         )
-        self._attr_translation_key = "outlet_cycle_enabled"
         self._attr_translation_placeholders = {"outlet_name": str(outlet_name)}
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{site_id}_{device_id}")},
@@ -1578,51 +1021,518 @@ class UnifiOutletCycleSwitch(
             return False
         return self._get_outlet_data() is not None
 
-    def _get_current_relay_state(self) -> bool:
-        """Return the outlet's reported relay state, defaulting to OFF."""
+    @property
+    def is_on(self) -> bool:
+        """Return the outlet's relay or power-cycling state."""
         outlet = self._get_outlet_data() or self._initial_outlet_data
-        return bool(outlet.get("relay_state", False))
+        return bool(outlet.get(self.entity_description.state_field, False))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return outlet attributes for the relay switch."""
+        if self.entity_description.state_field != "relay_state":
+            return None
+        outlet = self._get_outlet_data() or self._initial_outlet_data
+        attrs: dict[str, Any] = {"index": self._outlet_index}
+        for key in _OUTLET_ATTRIBUTES:
+            if key in outlet and outlet[key] is not None:
+                attrs[key] = outlet[key]
+        return attrs
+
+    async def _async_set(self, *, on: bool) -> None:
+        """Set the relay, or power cycling while keeping the relay as it is."""
+        owner = self.coordinator.device_coordinator
+        if self.entity_description.state_field == "relay_state":
+            await owner.async_set_outlet_state(
+                self._site_id, self._device_id, self._outlet_index, state=on
+            )
+            return
+        outlet = self._get_outlet_data() or self._initial_outlet_data
+        await owner.async_set_outlet_state(
+            self._site_id,
+            self._device_id,
+            self._outlet_index,
+            state=bool(outlet.get("relay_state", False)),
+            cycle_enabled=on,
+        )
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn on the relay or enable power cycling."""
+        _ = kwargs
+        await self._async_set(on=True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn off the relay or disable power cycling."""
+        _ = kwargs
+        await self._async_set(on=False)
+
+
+# --- Network rules -----------------------------------------------------------
+
+# Switches for UniFi network rules (port forwards, traffic rules, NAT, routes).
+
+
+class RuleToggleCommand(Protocol):
+    """A config-coordinator command that enables or disables one rule."""
+
+    async def __call__(self, site_id: str, rule_id: str, /, *, enabled: bool) -> None:
+        """Enable or disable the rule."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnifiInsightsNetworkRuleSwitchEntityDescription(
+    SwitchEntityDescription,
+):
+    """Static metadata for one family of console rule switches."""
+
+    data_key: str
+    unique_id_suffix: str
+    name_fields: tuple[str, ...]
+    unnamed_translation_key: str
+    available_fn: Callable[[UnifiInsightsFacadeCoordinator, str], bool]
+    command: Callable[[UnifiInsightsConfigCoordinator], RuleToggleCommand]
+    attributes_fn: Callable[[dict[str, Any]], dict[str, Any]]
+    is_hidden_fn: Callable[[dict[str, Any]], bool] | None = None
+    # Placeholder that carries the rule name, and the one that carries the rule
+    # id when the rule has no name (None: the unnamed translation has none).
+    name_placeholder: str = "rule_name"
+    id_placeholder: str | None = "rule_id"
+    # Attribute that reports the rule id.
+    id_attribute: str = "rule_id"
+    # Strict: the rule needs a boolean ``enabled`` and is on only when it is
+    # True. Lenient (firewall policies, policy-based routes, VPN clients): any
+    # non-empty rule counts, and a missing ``enabled`` counts as on.
+    strict_enabled: bool = True
+    # (identifier prefix, device name, model) of the device the switches use
+    # when the site has no gateway; None uses the site device.
+    fallback_device: tuple[str, str, str] | None = None
+    # True for a rule that should show the VPN icon instead of its icons.json icon.
+    vpn_icon_fn: Callable[[dict[str, Any]], bool] | None = None
+    before_disable_fn: Callable[[str, str, dict[str, Any]], None] | None = None
+
+
+def _port_forward_attributes(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a port forward rule."""
+    return {
+        "protocol": rule.get("proto"),
+        "external_port": rule.get("dst_port"),
+        "forward_port": rule.get("fwd_port"),
+        "interface": rule.get("pfwd_interface"),
+        "logging": rule.get("log"),
+        "source_limiting_enabled": rule.get("src_limiting_enabled"),
+    }
+
+
+def _traffic_rule_attributes(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a traffic rule."""
+    return {
+        "action": rule.get("action"),
+        "matching_target": rule.get("matching_target"),
+    }
+
+
+def _nat_rule_attributes(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a NAT rule."""
+    return {
+        "nat_type": rule.get("type"),
+        "protocol": rule.get("protocol"),
+        "ip_version": rule.get("ip_version"),
+        "logging": rule.get("logging"),
+    }
+
+
+def _static_route_attributes(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a static route."""
+    return {
+        "route_type": rule.get("static-route_type"),
+        "distance": rule.get("static-route_distance"),
+    }
+
+
+PORT_FORWARD_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="port_forward",
+    translation_key="port_forward",
+    unnamed_translation_key="port_forward_unnamed",
+    entity_category=EntityCategory.CONFIG,
+    data_key="port_forwards",
+    unique_id_suffix="port_forward",
+    name_fields=("name",),
+    available_fn=lambda coordinator, site_id: coordinator.port_forwards_available(
+        site_id
+    ),
+    command=lambda owner: owner.async_set_port_forward_enabled,
+    attributes_fn=_port_forward_attributes,
+)
+
+TRAFFIC_RULE_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="traffic_rule",
+    translation_key="traffic_rule",
+    unnamed_translation_key="traffic_rule_unnamed",
+    entity_category=EntityCategory.CONFIG,
+    data_key="traffic_rules",
+    unique_id_suffix="traffic_rule",
+    name_fields=("description",),
+    available_fn=lambda coordinator, site_id: coordinator.traffic_rules_available(
+        site_id
+    ),
+    command=lambda owner: owner.async_set_traffic_rule_enabled,
+    attributes_fn=_traffic_rule_attributes,
+)
+
+NAT_RULE_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="nat_rule",
+    translation_key="nat_rule",
+    unnamed_translation_key="nat_rule_unnamed",
+    entity_category=EntityCategory.CONFIG,
+    data_key="nat_rules",
+    unique_id_suffix="nat_rule",
+    name_fields=("description",),
+    available_fn=lambda coordinator, site_id: coordinator.nat_rules_available(site_id),
+    command=lambda owner: owner.async_set_nat_rule_enabled,
+    attributes_fn=_nat_rule_attributes,
+    is_hidden_fn=is_predefined_nat_rule,
+)
+
+# Disabled by default: turning off a static route can cut the path Home Assistant
+# itself uses to reach the console, and then the switch cannot turn it back on.
+STATIC_ROUTE_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="static_route",
+    translation_key="static_route",
+    unnamed_translation_key="static_route_unnamed",
+    entity_category=EntityCategory.CONFIG,
+    entity_registry_enabled_default=False,
+    data_key="static_routes",
+    unique_id_suffix="static_route",
+    name_fields=("name",),
+    available_fn=lambda coordinator, site_id: coordinator.static_routes_available(
+        site_id
+    ),
+    command=lambda owner: owner.async_set_static_route_enabled,
+    attributes_fn=_static_route_attributes,
+)
+
+
+def _firewall_rule_attributes(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a firewall policy."""
+    return {
+        "action": _get_firewall_rule_action(rule),
+        "protocol": rule.get("protocol"),
+        "source_zone_id": rule.get("sourceZoneId") or rule.get("source_zone_id"),
+        "destination_zone_id": rule.get("destinationZoneId")
+        or rule.get("destination_zone_id"),
+        "logging": rule.get("logging", False),
+        "index": rule.get("index"),
+    }
+
+
+def _route_kill_switch(route: dict[str, Any]) -> bool | None:
+    """
+    Return a policy-based route's kill switch state, if known.
+
+    Prefers the controller's own field names (``kill_switch_enabled`` /
+    ``killSwitchEnabled``), falling back to the maintainer's original
+    ``kill_switch`` / ``killSwitch`` names so both payload shapes work.
+    """
+    for key in (
+        "kill_switch_enabled",
+        "killSwitchEnabled",
+        "killSwitch",
+        "kill_switch",
+    ):
+        val = route.get(key)
+        if val is not None:
+            return bool(val)
+    return None
+
+
+def _policy_based_route_attributes(route: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a policy-based route."""
+    return {
+        "description": route.get("description"),
+        "target": route.get("target"),
+        "matching_target": route.get("matchingTarget") or route.get("matching_target"),
+        "interface": route.get("interface"),
+        "vpn_client_id": route.get("vpnClientId") or route.get("vpn_client_id"),
+        "kill_switch_enabled": _route_kill_switch(route),
+        "fall_back_to_default_wan": get_field(
+            route, "fallBackToDefaultWAN", "fall_back_to_default_wan", default=None
+        ),
+        "domains": route.get("domains", []),
+        "ip_addresses": route.get("ipAddresses")
+        or route.get("ip_addresses")
+        or route.get("ips", []),
+        "client_macs": route.get("clientMacs") or route.get("client_macs", []),
+        "network_ids": route.get("networkIds") or route.get("network_ids", []),
+        "network_id": route.get("networkId") or route.get("network_id"),
+        "next_hop": route.get("nextHop") or route.get("next_hop"),
+        "regions": route.get("regions", []),
+        "ip_ranges": route.get("ipRanges") or route.get("ip_ranges", []),
+        "target_devices": route.get("targetDevices") or route.get("target_devices", []),
+    }
+
+
+def _routes_over_vpn(route: dict[str, Any]) -> bool:
+    """Return True for a policy-based route that sends traffic over a VPN."""
+    return bool(route.get("vpn_client_id") or route.get("vpnClientId"))
+
+
+def _warn_kill_switch(site_id: str, route_id: str, route: dict[str, Any]) -> None:
+    """Warn that disabling a kill-switched route keeps dropping its traffic."""
+    if _route_kill_switch(route):
+        _LOGGER.warning(
+            "Disabling policy-based route %s in site %s while its kill switch "
+            "is enabled; matched traffic will keep being dropped instead of "
+            "falling back to the default route",
+            route_id,
+            site_id,
+        )
+
+
+def _vpn_client_attributes(client: dict[str, Any]) -> dict[str, Any]:
+    """Return extra state attributes for a VPN client."""
+    return {
+        "name": client.get("name"),
+        "purpose": client.get("purpose", "vpn-client"),
+        "vpn_type": client.get("vpn_type"),
+        "ip_subnet": client.get("ip_subnet"),
+        "openvpn_id": client.get("openvpn_id"),
+        "wireguard_id": client.get("wireguard_id"),
+        "remote_host": client.get("remote_host"),
+    }
+
+
+FIREWALL_RULE_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="firewall_rule",
+    translation_key="firewall_rule",
+    # An unnamed policy shows its id under the same translation.
+    unnamed_translation_key="firewall_rule",
+    id_placeholder="rule_name",
+    entity_category=EntityCategory.CONFIG,
+    data_key="firewall_rules",
+    unique_id_suffix="firewall_rule",
+    name_fields=("name",),
+    available_fn=lambda coordinator, site_id: coordinator.firewall_available(site_id),
+    command=lambda owner: owner.async_set_firewall_rule_enabled,
+    attributes_fn=_firewall_rule_attributes,
+    is_hidden_fn=_is_predefined_firewall_rule,
+    strict_enabled=False,
+    fallback_device=(
+        "firewall_policies",
+        "Firewall Policies",
+        "UniFi Firewall Policies",
+    ),
+)
+
+POLICY_BASED_ROUTE_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="pbr_switch",
+    translation_key="policy_based_route",
+    unnamed_translation_key="policy_based_route_unnamed",
+    name_placeholder="route_name",
+    id_placeholder="route_id",
+    id_attribute="route_id",
+    entity_category=EntityCategory.CONFIG,
+    data_key="policy_based_routes",
+    unique_id_suffix="policy_based_route",
+    name_fields=("description", "name"),
+    available_fn=lambda coordinator, _site_id: coordinator.config_available,
+    command=lambda owner: owner.async_set_policy_based_route_enabled,
+    attributes_fn=_policy_based_route_attributes,
+    strict_enabled=False,
+    fallback_device=(
+        "policy_based_routes",
+        "Policy-Based Routes",
+        "UniFi Policy-Based Routes",
+    ),
+    vpn_icon_fn=_routes_over_vpn,
+    before_disable_fn=_warn_kill_switch,
+)
+
+VPN_CLIENT_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
+    key="vpn_switch",
+    translation_key="vpn_client",
+    unnamed_translation_key="vpn_client_unnamed",
+    name_placeholder="vpn_client_name",
+    id_placeholder=None,
+    id_attribute="client_id",
+    entity_category=EntityCategory.CONFIG,
+    data_key="vpn_clients",
+    unique_id_suffix="vpn_client",
+    name_fields=("name",),
+    available_fn=lambda coordinator, _site_id: coordinator.config_available,
+    command=lambda owner: owner.async_set_vpn_client_enabled,
+    attributes_fn=_vpn_client_attributes,
+    strict_enabled=False,
+    fallback_device=("vpn_clients", "VPN Clients", "UniFi VPN Clients"),
+)
+
+NETWORK_RULE_SWITCH_TYPES = (
+    FIREWALL_RULE_SWITCH,
+    POLICY_BASED_ROUTE_SWITCH,
+    VPN_CLIENT_SWITCH,
+    PORT_FORWARD_SWITCH,
+    TRAFFIC_RULE_SWITCH,
+    NAT_RULE_SWITCH,
+    STATIC_ROUTE_SWITCH,
+)
+
+
+class UnifiInsightsNetworkRuleSwitch(
+    UnifiSiteEntity,
+    SwitchEntity,
+):
+    """Switch to enable or disable one UniFi network rule."""
+
+    entity_description: UnifiInsightsNetworkRuleSwitchEntityDescription
+
+    def __init__(
+        self,
+        coordinator: UnifiInsightsFacadeCoordinator,
+        description: UnifiInsightsNetworkRuleSwitchEntityDescription,
+        site_id: str,
+        rule_id: str,
+    ) -> None:
+        """Initialize the network rule switch."""
+        super().__init__(
+            coordinator,
+            site_id,
+            unique_id=f"{site_id}_{rule_id}_{description.unique_id_suffix}",
+            description=description,
+        )
+        self._rule_id = rule_id
+
+        rule = self._get_rule_data()
+        rule_name = next(
+            (
+                name.strip()
+                for field in description.name_fields
+                if isinstance(name := rule.get(field), str) and name.strip()
+            ),
+            None,
+        )
+        if rule_name is not None:
+            self._attr_translation_key = description.translation_key
+            self._attr_translation_placeholders = {
+                description.name_placeholder: rule_name
+            }
+        else:
+            self._attr_translation_key = description.unnamed_translation_key
+            self._attr_translation_placeholders = (
+                {description.id_placeholder: rule_id}
+                if description.id_placeholder
+                else {}
+            )
+        if (
+            description.fallback_device is not None
+            and get_site_gateway_id(coordinator.data, site_id) is None
+        ):
+            prefix, name, model = description.fallback_device
+            self._attr_device_info = DeviceInfo(
+                identifiers={(DOMAIN, f"{prefix}_{site_id}")},
+                name=f"{name} ({_resolve_site_name(coordinator, site_id)})",
+                manufacturer=MANUFACTURER,
+                model=model,
+            )
+
+    def _get_rule_data(self) -> dict[str, Any]:
+        """Get rule data from coordinator."""
+        data: Any = self.coordinator.data
+        if not isinstance(data, dict):
+            return {}
+        section = data.get(self.entity_description.data_key)
+        if not isinstance(section, dict):
+            return {}
+        site_rules = section.get(self._site_id)
+        if not isinstance(site_rules, dict):
+            return {}
+        rule = site_rules.get(self._rule_id)
+        return rule if isinstance(rule, dict) else {}
+
+    @property
+    def available(self) -> bool:
+        """Return if the switch is available."""
+        desc = self.entity_description
+        rule = self._get_rule_data()
+        if desc.is_hidden_fn is not None and desc.is_hidden_fn(rule):
+            return False
+        if not desc.available_fn(self.coordinator, self._site_id):
+            return False
+        if desc.strict_enabled:
+            return isinstance(rule.get("enabled"), bool)
+        return bool(rule)
 
     @property
     def is_on(self) -> bool:
-        """Return True if power cycling is enabled on this outlet."""
-        outlet = self._get_outlet_data()
-        if not outlet:
-            return bool(self._initial_outlet_data.get("cycle_enabled", False))
-        return bool(outlet.get("cycle_enabled", False))
+        """Return True if the rule is enabled."""
+        rule = self._get_rule_data()
+        if self.entity_description.strict_enabled:
+            return rule.get("enabled") is True
+        return bool(rule.get("enabled", True))
+
+    @property
+    def icon(self) -> str | None:
+        """Show the VPN icon for a VPN route; otherwise use icons.json."""
+        vpn_icon_fn = self.entity_description.vpn_icon_fn
+        if vpn_icon_fn is not None and vpn_icon_fn(self._get_rule_data()):
+            return "mdi:vpn" if self.is_on else "mdi:vpn-off"
+        return super().icon
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return rule extra state attributes."""
+        return {
+            self.entity_description.id_attribute: self._rule_id,
+            **self.entity_description.attributes_fn(self._get_rule_data()),
+        }
+
+    async def _async_set_enabled(self, *, enabled: bool) -> None:
+        """Enable or disable the network rule through its command owner."""
+        desc = self.entity_description
+        if not enabled and desc.before_disable_fn is not None:
+            desc.before_disable_fn(self._site_id, self._rule_id, self._get_rule_data())
+        command = desc.command(self.coordinator.config_coordinator)
+        await command(self._site_id, self._rule_id, enabled=enabled)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Enable power cycling on the outlet."""
+        """Enable the network rule."""
         _ = kwargs
-        _LOGGER.debug(
-            "Enabling power cycle for outlet %d on device %s in site %s",
-            self._outlet_index,
-            self._device_id,
-            self._site_id,
-        )
-        current_relay = self._get_current_relay_state()
-        await self.coordinator.device_coordinator.async_set_outlet_state(
-            self._site_id,
-            self._device_id,
-            self._outlet_index,
-            state=current_relay,
-            cycle_enabled=True,
-        )
+        await self._async_set_enabled(enabled=True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Disable power cycling on the outlet."""
+        """Disable the network rule."""
         _ = kwargs
-        _LOGGER.debug(
-            "Disabling power cycle for outlet %d on device %s in site %s",
-            self._outlet_index,
-            self._device_id,
-            self._site_id,
-        )
-        current_relay = self._get_current_relay_state()
-        await self.coordinator.device_coordinator.async_set_outlet_state(
-            self._site_id,
-            self._device_id,
-            self._outlet_index,
-            state=current_relay,
-            cycle_enabled=False,
-        )
+        await self._async_set_enabled(enabled=False)
+
+
+def discover_network_rule_switches(
+    coordinator: UnifiInsightsFacadeCoordinator,
+    known_keys: set[tuple[Any, ...]],
+) -> list[SwitchEntity]:
+    """Discover the switch entities of every network rule family."""
+    entities: list[SwitchEntity] = []
+    data: Any = coordinator.data
+    if not isinstance(data, dict):
+        return entities
+
+    for desc in NETWORK_RULE_SWITCH_TYPES:
+        section = data.get(desc.data_key)
+        if not isinstance(section, dict):
+            continue
+        for site_id, site_rules in section.items():
+            if not isinstance(site_rules, dict):
+                continue
+            for rule_id, rule in site_rules.items():
+                if not isinstance(rule, dict):
+                    continue
+                if desc.strict_enabled and not isinstance(rule.get("enabled"), bool):
+                    continue
+                if desc.is_hidden_fn is not None and desc.is_hidden_fn(rule):
+                    continue
+                key = (site_id, rule_id, desc.key)
+                if key in known_keys:
+                    continue
+                known_keys.add(key)
+                entities.append(
+                    UnifiInsightsNetworkRuleSwitch(coordinator, desc, site_id, rule_id)
+                )
+
+    return entities
