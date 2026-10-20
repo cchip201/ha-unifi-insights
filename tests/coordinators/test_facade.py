@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util.read_only_dict import ReadOnlyDict
 from unifi_official_api import UniFiConnectionError
 
 from custom_components.unifi_insights.const import (
@@ -21,6 +24,13 @@ from custom_components.unifi_insights.coordinators.config import (
 from custom_components.unifi_insights.coordinators.device import (
     UnifiInsightsDeviceCoordinator,
 )
+from custom_components.unifi_insights.coordinators.facade import (
+    EMPTY_PROTECT,
+    SITE_SECTIONS,
+    FacadeData,
+    build_facade_data,
+    capture_availability,
+)
 from custom_components.unifi_insights.coordinators.protect import (
     UnifiInsightsProtectCoordinator,
 )
@@ -28,6 +38,7 @@ from custom_components.unifi_insights.data_transforms import (
     NETWORK_FACTS_KEY,
     build_site_network_facts,
 )
+from tests.fixtures.command_owners import SITE_ID
 from tests.fixtures.coordinator_clients import (
     RULE_SECTION_PARAMS,
     _create_mock_network_client,
@@ -39,7 +50,7 @@ from tests.fixtures.library_responses import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from homeassistant.core import HomeAssistant
     from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -198,60 +209,140 @@ def facade(
     )
 
 
-class TestFacadeBuildInnerspaceCorrKey:
-    """Tests for _build_innerspace_corr_key."""
+class TestFacadeInnerSpaceMemo:
+    """The InnerSpace view is rebuilt only when what it reads changed (ADR-013)."""
 
-    def test_build_innerspace_corr_key_full(self) -> None:
-        """Test building correlation key with devices and protect data."""
-        raw_innerspace = {"raw": 1}
-        devices = {
-            "site1": {
-                "dev1": {"macAddress": "00:11:22:33:44:55"},
-                "dev2": {"mac_address": "00:11:22:33:44:66"},
-                "dev3": {"mac": "00:11:22:33:44:77"},
-                "dev_invalid": "not_a_dict",
-            },
-            "site2": "not_a_dict",
-        }
-        protect_data = {
-            "cameras": {"cam1": {"mac": "11:22:33:44:55:66"}},
-            "lights": {"light1": {"macAddress": "22:33:44:55:66:77"}},
-            "sensors": {"sens1": {"mac_address": "33:44:55:66:77:88"}},
-            "nvrs": {"nvr1": {"mac": "44:55:66:77:88:99"}},
-            "doorlocks": {"lock1": {"mac": "55:66:77:88:99:AA"}},
-            "viewports": {"vp1": {"mac": "66:77:88:99:AA:BB"}},
-        }
-        key = UnifiInsightsFacadeCoordinator._build_innerspace_corr_key(
-            raw_innerspace, devices, protect_data
-        )
-        assert isinstance(key, tuple)
-        assert len(key) == 3
-        assert key[0] == id(raw_innerspace)
-        assert ("site1", "dev1", "00:11:22:33:44:55") in key[1]
-        assert ("cameras", "cam1", "11:22:33:44:55:66") in key[2]
+    @staticmethod
+    def _rebuild(facade: UnifiInsightsFacadeCoordinator) -> Any:
+        """Rebuild the snapshot and return its InnerSpace view."""
+        facade._aggregate_data()
+        return facade.data["innerspace"]
 
-    def test_build_innerspace_corr_key_non_dict_inputs(self) -> None:
-        """Test building correlation key with non-dict devices and protect data."""
-        raw_innerspace = {"raw": 2}
-        key = UnifiInsightsFacadeCoordinator._build_innerspace_corr_key(
-            raw_innerspace, "not_dict", None
-        )
-        assert key == (id(raw_innerspace), (), ())
-
-
-class TestFacadeInnerSpaceCaching:
-    """Tests for InnerSpace data aggregation caching."""
-
-    def test_aggregate_data_innerspace_cache_hit(
+    def test_unchanged_inputs_reuse_the_view(
         self, facade: UnifiInsightsFacadeCoordinator
     ) -> None:
-        """Test that repeated _aggregate_data calls reuse cached innerspace data."""
-        facade._aggregate_data()
-        assert facade._cached_innerspace_data is not None
-        cached_before = facade._cached_innerspace_data
+        """A rebuild with the same objects returns the same view, uncomputed."""
+        before = facade.data["innerspace"]
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade."
+            "innerspace_correlation_key"
+        ) as key:
+            assert self._rebuild(facade) is before
+        key.assert_not_called()
 
-        facade._aggregate_data()
-        assert facade.data["innerspace"] is cached_before
+    def test_unrelated_protect_frame_reuses_the_view(
+        self,
+        facade: UnifiInsightsFacadeCoordinator,
+        mock_sub_coordinators: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    ) -> None:
+        """A frame that replaces only events reads no device field."""
+        protect_coord = mock_sub_coordinators[2]
+        before = facade.data["innerspace"]
+        protect_coord.data = {**protect_coord.data, "events": {"motion": {}}}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade."
+            "innerspace_correlation_key"
+        ) as key:
+            assert self._rebuild(facade) is before
+        key.assert_not_called()
+
+    @pytest.mark.parametrize("collection", ["cameras", "nvrs"])
+    def test_replaced_collection_with_the_same_devices_reuses_the_view(
+        self,
+        facade: UnifiInsightsFacadeCoordinator,
+        mock_sub_coordinators: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+        collection: str,
+    ) -> None:
+        """A frame that replaces a collection with the same MACs rebuilds nothing."""
+        protect_coord = mock_sub_coordinators[2]
+        before = facade.data["innerspace"]
+        protect_coord.data = {
+            **protect_coord.data,
+            collection: {**protect_coord.data[collection]},
+        }
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade.build_innerspace_view"
+        ) as build:
+            assert self._rebuild(facade) is before
+        build.assert_not_called()
+
+    def test_changed_protect_mac_rebuilds_the_view(
+        self,
+        facade: UnifiInsightsFacadeCoordinator,
+        mock_sub_coordinators: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    ) -> None:
+        """A camera whose MAC now matches an InnerSpace record is correlated."""
+        _, _, protect_coord, innerspace_coord = mock_sub_coordinators
+        innerspace_coord.data = {
+            **innerspace_coord.data,
+            "access_points": {"ap1": {"name": "AP Hall", "mac": "AA:00:00:00:00:01"}},
+        }
+        before = self._rebuild(facade)
+        assert before["correlations"]["ap1"] is None
+
+        protect_coord.data = {
+            **protect_coord.data,
+            "cameras": {"cam1": {"id": "cam1", "mac": "AA:00:00:00:00:01"}},
+        }
+        after = self._rebuild(facade)
+
+        assert after is not before
+        assert after["correlations"]["ap1"]["device_id"] == "cam1"
+        assert self._rebuild(facade) is after
+
+    def test_new_device_poll_rebuilds_only_on_changed_fields(
+        self,
+        facade: UnifiInsightsFacadeCoordinator,
+        mock_sub_coordinators: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    ) -> None:
+        """A poll with the same devices reuses the view; a changed MAC rebuilds it."""
+        device_coord = mock_sub_coordinators[1]
+        before = facade.data["innerspace"]
+
+        device_coord.data = {
+            **device_coord.data,
+            "devices": {"site1": {**device_coord.data["devices"]["site1"]}},
+        }
+        assert self._rebuild(facade) is before
+
+        device_coord.data = {
+            **device_coord.data,
+            "devices": {
+                "site1": {"dev1": {"id": "dev1", "macAddress": "00:11:22:33:44:66"}}
+            },
+        }
+        assert self._rebuild(facade) is not before
+
+    def test_new_innerspace_data_rebuilds_the_view(
+        self,
+        facade: UnifiInsightsFacadeCoordinator,
+        mock_sub_coordinators: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    ) -> None:
+        """New InnerSpace data is always correlated again."""
+        innerspace_coord = mock_sub_coordinators[3]
+        before = facade.data["innerspace"]
+        innerspace_coord.data = {**innerspace_coord.data}
+
+        after = self._rebuild(facade)
+
+        assert after is not before
+        assert after == before
+
+    def test_without_innerspace_the_empty_view_is_reused(
+        self,
+        facade: UnifiInsightsFacadeCoordinator,
+        mock_sub_coordinators: tuple[MagicMock, MagicMock, MagicMock, MagicMock],
+    ) -> None:
+        """Without InnerSpace data the empty view is built once."""
+        innerspace_coord = mock_sub_coordinators[3]
+        innerspace_coord.data = {}
+        empty = self._rebuild(facade)
+
+        assert empty["devices"] == {}
+        assert empty["last_update"] is None
+        assert self._rebuild(facade) is empty
 
 
 class TestFacadeAsyncRefreshChildren:
@@ -319,21 +410,6 @@ class TestFacadeVoucherReads:
             "_async_refresh_vouchers",
         ):
             assert not hasattr(facade, name), name
-
-
-def test_build_innerspace_corr_key_skips_non_dict_devices() -> None:
-    """Test that _build_innerspace_corr_key handles non-dict entries defensively."""
-    protect_data = {
-        "cameras": {
-            "cam_bad": None,
-            "cam_good": {"mac": "11:22:33:44:55:66"},
-        }
-    }
-    key = UnifiInsightsFacadeCoordinator._build_innerspace_corr_key(
-        {}, {}, protect_data
-    )
-    assert len(key[2]) == 1
-    assert key[2][0] == ("cameras", "cam_good", "11:22:33:44:55:66")
 
 
 class TestFacadeNetworkFacts:
@@ -565,6 +641,20 @@ class TestUnifiFacadeCoordinator:
         # Protect data should have default empty structure
         assert facade_coordinator_no_protect.data["protect"]["cameras"] == {}
         assert facade_coordinator_no_protect.data["protect"]["lights"] == {}
+
+    def test_empty_protect_stand_in_is_one_read_only_object(
+        self, facade_coordinator_no_protect: UnifiInsightsFacadeCoordinator
+    ) -> None:
+        """Without Protect every rebuild publishes the same read-only stand-in."""
+        before = facade_coordinator_no_protect.data["protect"]
+        facade_coordinator_no_protect._aggregate_data()
+
+        protect = facade_coordinator_no_protect.data["protect"]
+        assert protect is before
+        assert protect is EMPTY_PROTECT
+        assert protect["cameras"] is before["cameras"]
+        with pytest.raises(RuntimeError):
+            protect["cameras"]["cam-1"] = {}  # type: ignore[index]
 
     def test_aggregate_data_includes_rule_changes(
         self,
@@ -1274,3 +1364,278 @@ class TestCoordinatorDataFlow:
         await config_coord.async_shutdown()
         await device_coord.async_shutdown()
         await protect_coord.async_shutdown()
+
+
+# --- Pure snapshot builder (ADR-013) ------------------------------------------
+
+NOW = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+AVAILABLE = capture_availability(
+    device=True,
+    config=True,
+    protect=True,
+    innerspace=True,
+    network=True,
+    failed_sections=frozenset(),
+    site_ids=(),
+)
+
+
+def test_build_facade_data_passes_the_owners_sections_through() -> None:
+    """The builder copies no section and publishes a read-only root."""
+    config = {
+        "sites": {"site1": {"id": "site1"}},
+        "latest_vouchers": {"site1": {"id": "v1"}},
+        "internet_activity_unavailable": {"site1"},
+    }
+    facts = {"site1": build_site_network_facts({}, {})}
+    device = {
+        "devices": {"site1": {}},
+        "stats": {"site1": {}},
+        NETWORK_FACTS_KEY: facts,
+    }
+    protect = {"cameras": {"cam1": {"id": "cam1"}}}
+    innerspace = {"devices": {}}
+
+    snapshot = build_facade_data(
+        config,
+        device,
+        protect,
+        innerspace,
+        availability=AVAILABLE,
+        site_manager=None,
+        site_manager_host_id=None,
+        now=NOW,
+    )
+
+    assert type(snapshot) is ReadOnlyDict
+    for key in ("sites", "latest_vouchers", "internet_activity_unavailable"):
+        assert snapshot[key] is config[key], key
+    assert snapshot["devices"] is device["devices"]
+    assert snapshot["stats"] is device["stats"]
+    assert snapshot[NETWORK_FACTS_KEY] is facts
+    assert snapshot["protect"] is protect
+    assert snapshot["innerspace"] is innerspace
+    assert snapshot["last_update"] == NOW
+    assert snapshot["availability"] == AVAILABLE
+    assert snapshot["firewall_rules"] == {}
+    assert snapshot["clients"] == {}
+    assert "site_manager" not in snapshot
+    assert set(snapshot) == (
+        FacadeData.__required_keys__ | FacadeData.__optional_keys__
+    ) - {"site_manager"}
+    with pytest.raises(RuntimeError):
+        snapshot["sites"] = {}  # type: ignore[typeddict-readonly-mutated]
+
+
+def test_build_facade_data_without_protect_uses_the_stand_in() -> None:
+    """A console without Protect gets the shared empty Protect data."""
+    snapshot = build_facade_data(
+        {},
+        {},
+        None,
+        {},
+        availability=AVAILABLE,
+        site_manager=None,
+        site_manager_host_id=None,
+        now=NOW,
+    )
+
+    assert snapshot["protect"] is EMPTY_PROTECT
+    assert snapshot["internet_activity_unavailable"] == set()
+    assert snapshot[NETWORK_FACTS_KEY] is None
+
+
+@pytest.mark.parametrize(
+    ("host_id", "selected"),
+    [("host-1", "host-1"), ("host-9", None), (None, None)],
+)
+def test_build_facade_data_selects_the_entry_site_manager_host(
+    host_id: str | None, selected: str | None
+) -> None:
+    """The Site Manager section names this entry's console only when listed."""
+    account = {"hosts": {"host-1": {"id": "host-1"}}}
+
+    snapshot = build_facade_data(
+        {},
+        {},
+        None,
+        {},
+        availability=AVAILABLE,
+        site_manager=account,
+        site_manager_host_id=host_id,
+        now=NOW,
+    )
+
+    assert snapshot["site_manager"] == {**account, "selected_host_id": selected}
+    assert "selected_host_id" not in account
+
+
+# --- Captured availability (ADR-013) ------------------------------------------
+
+# The facade method that answers each site section live.
+SECTION_METHODS = {
+    "wifi": "wifi_available",
+    "firewall_rules": "firewall_available",
+    "vouchers": "vouchers_available",
+    "port_forwards": "port_forwards_available",
+    "traffic_rules": "traffic_rules_available",
+    "nat_rules": "nat_rules_available",
+    "static_routes": "static_routes_available",
+    "internet_activity": "internet_activity_available",
+}
+
+
+def test_section_methods_cover_every_site_section() -> None:
+    """Every captured site section has a live facade method."""
+    assert set(SECTION_METHODS) == set(SITE_SECTIONS)
+
+
+@pytest.mark.parametrize("config", [True, False])
+def test_capture_availability_per_site(*, config: bool) -> None:
+    """A failed section is unavailable for its site only, and all with config."""
+    availability = capture_availability(
+        device=True,
+        config=config,
+        protect=False,
+        innerspace=True,
+        network=True,
+        failed_sections=frozenset({("wifi", "site1"), ("vouchers", "gone")}),
+        site_ids=("site1", "site2"),
+    )
+
+    assert availability["config"] is config
+    assert availability["protect"] is False
+    assert set(availability["sites"]) == {"site1", "site2", "gone"}
+    for site_id, failed in (("site1", "wifi"), ("site2", None), ("gone", "vouchers")):
+        for section in SITE_SECTIONS:
+            expected = config and section != failed
+            assert availability["sites"][site_id][section] is expected, (
+                site_id,
+                section,
+            )
+
+
+def _assert_captured_matches_live(facade: UnifiInsightsFacadeCoordinator) -> None:
+    """Assert the snapshot's availability is what the live properties answer."""
+    availability = facade.data["availability"]
+    assert availability["device"] is facade.device_available
+    assert availability["config"] is facade.config_available
+    assert availability["protect"] is facade.protect_available
+    assert availability["innerspace"] is facade.innerspace_available
+    assert availability["network"] is facade.network_available
+    for site_id in (*facade.data["sites"], "unknown-site"):
+        captured = availability["sites"].get(site_id, {})
+        for section, method in SECTION_METHODS.items():
+            assert captured.get(section, availability["config"]) is getattr(
+                facade, method
+            )(site_id), (site_id, section)
+
+
+async def _fail_wifi(owners: SeededOwners) -> None:
+    """Refresh the config with the site's WiFi fetch failing."""
+    owners.network_client.wifi.get_all.side_effect = UniFiConnectionError("down")
+    await owners.config.async_refresh()
+
+
+async def _fail_config(owners: SeededOwners) -> None:
+    """Fail the whole config refresh."""
+    owners.network_client.sites.get_all.side_effect = UniFiConnectionError("down")
+    await owners.config.async_refresh()
+
+
+async def _fail_vouchers(owners: SeededOwners) -> None:
+    """Fail the targeted voucher refresh of one site."""
+    owners.network_client.vouchers.get_all_pages.side_effect = UniFiConnectionError(
+        "down"
+    )
+    await owners.config.async_refresh_vouchers(SITE_ID)
+
+
+async def _recover_vouchers(owners: SeededOwners) -> None:
+    """Fail the targeted voucher refresh, then refresh it successfully."""
+    await _fail_vouchers(owners)
+    owners.network_client.vouchers.get_all_pages.side_effect = None
+    await owners.config.async_refresh_vouchers(SITE_ID)
+
+
+async def _fail_device(owners: SeededOwners) -> None:
+    """Fail the device refresh."""
+    owners.network_client.devices.get_all.side_effect = UniFiConnectionError("down")
+    await owners.device.async_refresh()
+
+
+async def _fail_protect(owners: SeededOwners) -> None:
+    """Record a failed Protect update, as a lost Protect session does."""
+    owners.protect.async_set_update_error(UpdateFailed("down"))
+
+
+async def _refresh_all(owners: SeededOwners) -> None:
+    """Refresh every owner successfully."""
+    await owners.facade.async_request_refresh()
+
+
+@pytest.mark.parametrize(
+    ("update", "changed"),
+    [
+        pytest.param(_refresh_all, None, id="refresh_all"),
+        pytest.param(_fail_wifi, ("sites", SITE_ID, "wifi"), id="wifi_failed"),
+        pytest.param(_fail_config, ("config",), id="config_failed"),
+        pytest.param(_fail_vouchers, ("sites", SITE_ID, "vouchers"), id="vouchers"),
+        pytest.param(_recover_vouchers, None, id="vouchers_recovered"),
+        pytest.param(_fail_device, ("device",), id="device_failed"),
+        pytest.param(_fail_protect, ("protect",), id="protect_failed"),
+    ],
+)
+async def test_captured_availability_follows_each_owner_update(
+    seeded_owners: SeededOwners,
+    update: Callable[[SeededOwners], Awaitable[None]],
+    changed: tuple[str, ...] | None,
+) -> None:
+    """After each owner update the snapshot carries the live availability."""
+    facade = seeded_owners.facade
+    _assert_captured_matches_live(facade)
+
+    await update(seeded_owners)
+
+    _assert_captured_matches_live(facade)
+    if changed is not None:
+        value: Any = facade.data["availability"]
+        for key in changed:
+            value = value[key]
+        assert value is False
+
+
+async def test_unchanged_availability_is_one_object(
+    seeded_owners: SeededOwners,
+) -> None:
+    """A rebuild with unchanged availability publishes the same capture."""
+    facade = seeded_owners.facade
+    before = facade.data["availability"]
+
+    seeded_owners.protect.async_update_listeners()
+    assert facade.data["availability"] is before
+
+    await _fail_device(seeded_owners)
+    assert facade.data["availability"] is not before
+    assert facade.data["availability"]["device"] is False
+
+
+async def test_captured_availability_without_protect_or_innerspace(
+    seeded_owners: SeededOwners,
+) -> None:
+    """A console without Protect or InnerSpace captures both as available."""
+    facade = UnifiInsightsFacadeCoordinator(
+        seeded_owners.facade.hass,
+        seeded_owners.network_client,
+        None,
+        seeded_owners.entry,
+        seeded_owners.config,
+        device_coordinator=seeded_owners.device,
+        protect_coordinator=None,
+    )
+    try:
+        _assert_captured_matches_live(facade)
+        assert facade.data["availability"]["protect"] is True
+        assert facade.data["availability"]["innerspace"] is True
+    finally:
+        await facade.async_shutdown()

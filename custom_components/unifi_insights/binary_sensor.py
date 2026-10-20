@@ -76,7 +76,7 @@ from .entity import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
@@ -462,7 +462,8 @@ async def async_setup_entry(
     @callback
     def async_discover_binary_sensors() -> None:
         """Discover and add new binary sensors."""
-        if not coordinator.data or not isinstance(coordinator.data, dict):
+        snapshot: Mapping[str, Any] = coordinator.data
+        if not snapshot or not isinstance(snapshot, dict):
             return
 
         entities: list[BinarySensorEntity] = []
@@ -695,7 +696,7 @@ async def async_setup_entry(
                                     )
                                 )
 
-        if coordinator.protect_client and isinstance(coordinator.data, dict):
+        if coordinator.protect_client and isinstance(snapshot, dict):
             protect = coordinator.data.get("protect", {})
             nvrs = protect.get("nvrs", {}) if isinstance(protect, dict) else {}
             if isinstance(nvrs, dict):
