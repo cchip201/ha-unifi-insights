@@ -224,6 +224,102 @@ def _merge_legacy_system_stats(
     _fill_missing_stat(stats, "uptimeSec", UPTIME_STAT_KEYS, uptime, int)
 
 
+def _seed_outlet_overrides(device: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """
+    Seed a full ``outlet_overrides`` array from the sensed ``outlet_table``.
+
+    Copies ``_seed_outlet_overrides`` from ``unifi-official-api`` 2.0.0; see
+    ``_build_outlet_overrides``.
+    """
+    outlet_table = device.get("outlet_table")
+    if not isinstance(outlet_table, list):
+        return []
+
+    overrides: list[dict[str, Any]] = []
+    for outlet in outlet_table:
+        if not isinstance(outlet, dict):
+            continue
+
+        index = outlet.get("index")
+        if index is None:
+            index = outlet.get("outlet_idx")
+        try:
+            index_int = int(index)  # type: ignore[arg-type]
+        except TypeError, ValueError:
+            continue
+
+        override: dict[str, Any] = {
+            "index": index_int,
+            "relay_state": bool(outlet.get("relay_state", False)),
+        }
+        if "name" in outlet:
+            override["name"] = outlet["name"]
+        if "cycle_enabled" in outlet:
+            override["cycle_enabled"] = bool(outlet["cycle_enabled"])
+        overrides.append(override)
+
+    return overrides
+
+
+def _build_outlet_overrides(
+    device: Mapping[str, Any],
+    outlet_index: int,
+    *,
+    state: bool,
+    cycle_enabled: bool | None,
+) -> list[dict[str, Any]] | None:
+    """
+    Return the complete ``outlet_overrides`` array an outlet write sends.
+
+    The controller treats ``outlet_overrides`` as the complete desired state,
+    so the cache must hold exactly what was sent or the next write reverts
+    earlier outlets (#358). This copies the read-modify-write rule of
+    ``DevicesEndpoint.set_outlet_state`` in ``unifi-official-api`` 2.0.0 and
+    returns ``None`` where that method raises ``UniFiValidationError``.
+    Re-check it against the library whenever the version pin changes.
+    """
+    raw_overrides = device.get("outlet_overrides")
+    outlet_overrides: list[dict[str, Any]] = []
+    if isinstance(raw_overrides, list):
+        outlet_overrides = [
+            dict(item) for item in raw_overrides if isinstance(item, dict)
+        ]
+
+    if not outlet_overrides:
+        outlet_overrides = _seed_outlet_overrides(device)
+
+    if not outlet_overrides:
+        return None
+
+    found = False
+    for override in outlet_overrides:
+        idx = override.get("index")
+        if idx is None:
+            idx = override.get("outlet_idx")
+        try:
+            idx_int = int(idx)  # type: ignore[arg-type]
+        except TypeError, ValueError:
+            continue
+
+        if idx_int == outlet_index:
+            override["relay_state"] = state
+            if cycle_enabled is not None:
+                override["cycle_enabled"] = cycle_enabled
+            found = True
+            break
+
+    if not found:
+        new_override: dict[str, Any] = {
+            "index": outlet_index,
+            "relay_state": state,
+        }
+        if cycle_enabled is not None:
+            new_override["cycle_enabled"] = cycle_enabled
+        outlet_overrides.append(new_override)
+
+    return outlet_overrides
+
+
 # How many consecutive polls a device's last good statistics are reused for
 # when its statistics call keeps failing, before its stats are dropped. Site
 # VPN connection state is bounded the same way.
@@ -1494,32 +1590,47 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
 
         The classic call is addressed by the device's classic ``_id`` and
         carries its current ``outlet_overrides``. After success the written
-        fields are published as a copy-on-write overlay and a deferred
-        refresh is requested.
+        fields and the complete ``outlet_overrides`` array that was sent are
+        published as a copy-on-write overlay and a deferred refresh is
+        requested.
+
+        The write holds the coordinator's refresh lock from reading the cached
+        record to publishing (#371 review). A poll already in flight finishes
+        first, so it cannot replace the published array with its older one,
+        and two overlapping outlet commands run one after the other, each
+        built from the array the previous one sent.
         """
         site_name = await self.config_coordinator.async_resolve_legacy_site_name(
             site_id, verified_only=False
         )
-        device_data = self.get_device(site_id, device_id) or {}
-        result = await async_execute_command(
-            CommandFailure(
-                translation_key="command_failed",
-                message=(
-                    f"Unable to set outlet {outlet_index} state on device {device_id}"
+        async with self._debounced_refresh.async_lock():
+            device_data = self.get_device(site_id, device_id) or {}
+            sent = _build_outlet_overrides(
+                device_data,
+                outlet_index,
+                state=state,
+                cycle_enabled=cycle_enabled,
+            )
+            result = await async_execute_command(
+                CommandFailure(
+                    translation_key="command_failed",
+                    message=(
+                        f"Unable to set outlet {outlet_index} state "
+                        f"on device {device_id}"
+                    ),
                 ),
-            ),
-            self.network_client.devices.set_outlet_state,
-            site_name,
-            device_data.get("_id") or device_id,
-            outlet_index,
-            state=state,
-            cycle_enabled=cycle_enabled,
-            current_device=device_data,
-        )
-        changes: dict[str, bool] = {"relay_state": state}
-        if cycle_enabled is not None:
-            changes["cycle_enabled"] = cycle_enabled
-        self._publish_outlet(site_id, device_id, outlet_index, changes)
+                self.network_client.devices.set_outlet_state,
+                site_name,
+                device_data.get("_id") or device_id,
+                outlet_index,
+                state=state,
+                cycle_enabled=cycle_enabled,
+                current_device=device_data,
+            )
+            changes: dict[str, bool] = {"relay_state": state}
+            if cycle_enabled is not None:
+                changes["cycle_enabled"] = cycle_enabled
+            self._publish_outlet(site_id, device_id, outlet_index, changes, sent)
         await self.async_request_refresh()
         return result
 
@@ -1542,39 +1653,56 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
         device_id: str,
         outlet_index: int,
         changes: dict[str, bool],
+        overrides: list[dict[str, Any]] | None,
     ) -> None:
         """
         Publish an outlet write as a copy-on-write overlay (ADR-010).
 
-        The data root, ``devices``, the site map, the device record, its
-        ``outlet_table`` list and the written outlet are replaced; the other
-        outlets stay shared. Listeners are notified without
-        ``async_set_updated_data()``. A poll that started before the write
-        may briefly restore the old value until the next refresh.
+        The data root, ``devices``, the site map and the device record are
+        replaced. The device's ``outlet_overrides`` becomes a new list of the
+        sent entries, and when the written outlet is in ``outlet_table`` that
+        list and the outlet are replaced too; the other outlets stay shared.
+        Listeners are notified without ``async_set_updated_data()``. The
+        caller holds the refresh lock, so no poll that started before the
+        write can finish after this overlay. A poll that starts after it can
+        still read the controller's older values for a few seconds while the
+        PDU applies the change; the next refresh corrects them.
         """
         devices = self.data.get("devices", {})
         site_devices = devices.get(site_id)
-        device = site_devices.get(device_id) if isinstance(site_devices, dict) else None
-        outlets = device.get("outlet_table") if isinstance(device, dict) else None
-        if not (
-            isinstance(site_devices, dict)
-            and isinstance(device, dict)
-            and isinstance(outlets, list)
-        ):
+        if not isinstance(site_devices, dict):
             return
-        position = next(
-            (i for i, o in enumerate(outlets) if self._is_outlet(o, outlet_index)),
-            None,
-        )
-        if position is None:
+        device = site_devices.get(device_id)
+        if not isinstance(device, dict):
             return
-        table = list(outlets)
-        table[position] = {**outlets[position], **changes}
+
+        updated_device = dict(device)
+        applied = False
+
+        if overrides is not None:
+            updated_device["outlet_overrides"] = overrides
+            applied = True
+
+        outlets = device.get("outlet_table")
+        if isinstance(outlets, list):
+            position = next(
+                (i for i, o in enumerate(outlets) if self._is_outlet(o, outlet_index)),
+                None,
+            )
+            if position is not None:
+                table = list(outlets)
+                table[position] = {**outlets[position], **changes}
+                updated_device["outlet_table"] = table
+                applied = True
+
+        if not applied:
+            return
+
         self.data = {
             **self.data,
             "devices": {
                 **devices,
-                site_id: {**site_devices, device_id: {**device, "outlet_table": table}},
+                site_id: {**site_devices, device_id: updated_device},
             },
         }
         self.async_update_listeners()
