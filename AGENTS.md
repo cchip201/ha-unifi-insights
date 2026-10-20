@@ -205,7 +205,7 @@ This integration uses the following identifiers consistently:
 
 **Package organization:**
 
-- `coordinators/` — Multi-coordinator system (`base`, `config`, `config_sections`, `device`, `protect`, `facade`, `access`, `carrier_fabric`, `innerspace`, `internet_activity`, `mobility`, `rule_audit`, `rule_export`, `site_manager`, `voucher_state`)
+- `coordinators/` — Multi-coordinator system (`base`, `config`, `config_sections`, `device`, `protect`, `facade`, `access`, `carrier_fabric`, `innerspace`, `mobility`, `rule_audit`, `site_manager`)
 - `config_flow.py` — Config and options flows (`local`, `remote`, and `carrier_fabric` connection modes; reauth and reconfigure)
 - `console_identity.py` — Console identity resolution and namespace normalization
 - `probe.py` — Service availability probing (Network, Protect, Access, InnerSpace, Carrier Fabric)
@@ -213,7 +213,7 @@ This integration uses the following identifiers consistently:
 - Specialized entity modules: `access_entity.py`, `carrier_fabric_entity.py`, `carrier_fabric_sensor.py`, `innerspace_entity.py`, `mobility_entity.py`, `protect_security_entity.py`, `storage_entity.py`, `site_internet_activity_sensor.py`, `voucher_sensor.py`, `network_rule_switch.py`, `network_rule_audit_event.py`
 - `data_transforms.py` & `innerspace_transforms.py` — API response to internal data mapping
 - `services.py` & `services.yaml` — Service action implementations and schema definitions
-- `websocket_api.py`, `topology.py`, `topology_contract.py`, `topology_keys.py`, `frontend.py` — WebSocket commands and Lovelace card bundle registration
+- `websocket_api.py`, `topology.py`, `dashboard_snapshots.py`, `frontend.py` — WebSocket commands, card snapshot builders and Lovelace card bundle registration
 - `access_webhook.py` — UniFi Access webhook lifecycle management
 - `const.py` — Constants and endpoint paths
 - `diagnostics.py` — Three-layer redacted diagnostic data export
@@ -221,7 +221,7 @@ This integration uses the following identifiers consistently:
 
 **Do NOT create:**
 
-- `helpers/`, `ha_helpers/`, or similar packages — use existing modules (`helpers.py` is a single module, not a package)
+- `helpers/`, `ha_helpers/`, or similar packages — use the existing module of the right role (`data_transforms.py` for pure transforms, `console_identity.py` for identity and registry lookups, `entity.py` for base entities)
 - `common/`, `shared/`, `lib/` — use existing modules
 - New top-level packages without explicit approval
 
@@ -504,7 +504,7 @@ See `.github/instructions/tests.instructions.md` for comprehensive testing patte
 - **Device Discovery:** Handle dynamic device discovery as UniFi networks can change
 - **Connection Resilience:** UniFi controllers may restart or become temporarily unavailable
 - **Multiple Sites & Consoles:** Support multi-site and multi-console UniFi deployments; always scope device and coordinator lookups to the owning config entry/console
-- **Protect Integration:** Protect entities are handled separately from network devices via `UnifiProtectCoordinator` and `UnifiProtectEntity`
+- **Protect Integration:** Protect entities are handled separately from network devices via `UnifiInsightsProtectCoordinator` and `UnifiProtectEntity`
 - **camelCase Tolerance:** UniFi API uses camelCase; use `get_field()` and `first_not_none()` for field access
 - **Data Transforms:** Extend `data_transforms.py` (or `innerspace_transforms.py`) when adding new API fields
 

@@ -19,7 +19,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .console_identity import resolve_console_namespace
+from .console_identity import async_migrate_site_entity, resolve_console_namespace
 from .const import (
     ATTR_CAMERA_ID,
     ATTR_CAMERA_NAME,
@@ -35,10 +35,12 @@ from .const import (
     DEVICE_TYPE_CHIME,
     DEVICE_TYPE_LIGHT,
 )
-from .coordinators import UnifiFacadeCoordinator
-from .coordinators.voucher_state import (
+from .coordinators import UnifiInsightsFacadeCoordinator
+from .data_transforms import (
     VOUCHER_INPUTS,
     cast_input,
+    led_level_to_percent,
+    percent_to_led_level,
     restore_input,
     voucher_site_ids,
 )
@@ -46,8 +48,6 @@ from .entity import (
     UnifiProtectEntity,
     build_site_device_info,
 )
-from .helpers import async_migrate_site_entity
-from .led_level import led_level_to_percent, percent_to_led_level
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -118,7 +118,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up number entities for UniFi Protect integration."""
-    coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = entry.runtime_data.coordinator
     _async_setup_voucher_numbers(hass, entry, coordinator, async_add_entities)
 
     # Skip if Protect API is not available
@@ -239,7 +239,7 @@ class UnifiProtectMicrophoneVolumeNumber(UnifiProtectEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -297,7 +297,7 @@ class UnifiProtectLightLevelNumber(UnifiProtectEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         light_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -358,7 +358,7 @@ class UnifiProtectChimeVolumeNumber(UnifiProtectEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         chime_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -412,7 +412,7 @@ class UnifiProtectChimeRepeatTimesNumber(UnifiProtectEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         chime_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -459,7 +459,7 @@ class UnifiProtectChimeRepeatTimesNumber(UnifiProtectEntity, NumberEntity):
 def _async_setup_voucher_numbers(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
-    coordinator: UnifiFacadeCoordinator,
+    coordinator: UnifiInsightsFacadeCoordinator,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up hotspot voucher input number entities."""
@@ -495,7 +495,9 @@ def _async_setup_voucher_numbers(
     discover()
 
 
-class UnifiVoucherInputNumber(CoordinatorEntity[UnifiFacadeCoordinator], RestoreNumber):
+class UnifiVoucherInputNumber(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], RestoreNumber
+):
     """Input number entity holding parameters for next generated voucher."""
 
     _attr_has_entity_name = True
@@ -504,7 +506,7 @@ class UnifiVoucherInputNumber(CoordinatorEntity[UnifiFacadeCoordinator], Restore
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         description: NumberEntityDescription,
         site_id: str,
         *,

@@ -42,24 +42,29 @@ from .const import (
     SMART_DETECT_PERSON,
     SMART_DETECT_VEHICLE,
 )
-from .data_transforms import NetworkDeviceFacts, NetworkPortFacts, device_facts
+from .data_transforms import (
+    NetworkDeviceFacts,
+    NetworkPortFacts,
+    device_facts,
+    get_port_label,
+    is_doorbell_camera_model,
+    normalize_nvr_storage,
+)
 from .entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
     get_field,
 )
-from .helpers import get_port_label, is_doorbell_camera_model
 from .mobility_entity import async_setup_mobility_binary_sensors
 from .protect_security_entity import discover_protect_security_binary_sensors
 from .storage_entity import discover_storage_binary_sensors
-from .storage_telemetry import normalize_nvr_storage
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
-    from .coordinators import UnifiFacadeCoordinator
+    from .coordinators import UnifiInsightsFacadeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -424,7 +429,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary sensors for UniFi Insights integration."""
     _ = hass
-    coordinator: UnifiFacadeCoordinator = config_entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = config_entry.runtime_data.coordinator
     known_sensor_keys: set[tuple[Any, ...]] = set()
 
     @callback
@@ -714,7 +719,7 @@ class UnifiInsightsBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         description: UnifiInsightsBinarySensorEntityDescription,
         site_id: str,
         device_id: str,
@@ -761,7 +766,7 @@ class UnifiProtectBinarySensor(UnifiProtectEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         description: UnifiInsightsBinarySensorEntityDescription,
         device_id: str,
     ) -> None:
@@ -874,7 +879,7 @@ class UnifiPortBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         device_id: str,
         port_idx: Any,
@@ -936,7 +941,7 @@ class UnifiInsightsWanLinkBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         device_id: str,
         wan_key: str,
@@ -994,7 +999,7 @@ class UnifiInsightsSiteToSiteVpnBinarySensor(UnifiInsightsEntity, BinarySensorEn
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         device_id: str,
         tunnel_id: str,

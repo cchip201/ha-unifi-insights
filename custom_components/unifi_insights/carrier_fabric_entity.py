@@ -11,18 +11,20 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 
 if TYPE_CHECKING:
-    from .carrier_fabric_data import CarrierFabricConfigEntry
-    from .coordinators.carrier_fabric import UnifiCarrierFabricCoordinator
+    from . import CarrierFabricConfigEntry
+    from .coordinators.carrier_fabric import UnifiInsightsCarrierFabricCoordinator
 
 
-class UnifiCarrierFabricEntity(CoordinatorEntity["UnifiCarrierFabricCoordinator"]):
+class UnifiCarrierFabricEntity(
+    CoordinatorEntity["UnifiInsightsCarrierFabricCoordinator"]
+):
     """Base entity for UniFi Carrier Fabric organisation-level entities."""
 
     _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: UnifiCarrierFabricCoordinator,
+        coordinator: UnifiInsightsCarrierFabricCoordinator,
         entry: CarrierFabricConfigEntry,
     ) -> None:
         """Initialize the Carrier Fabric entity."""
@@ -47,7 +49,7 @@ class UnifiCarrierFabricSubscriberEntity(UnifiCarrierFabricEntity):
 
     def __init__(
         self,
-        coordinator: UnifiCarrierFabricCoordinator,
+        coordinator: UnifiInsightsCarrierFabricCoordinator,
         entry: CarrierFabricConfigEntry,
         subscriber_id: str,
     ) -> None:

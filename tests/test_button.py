@@ -31,7 +31,6 @@ from custom_components.unifi_insights.button import (
     UnifiProtectPTZPatrolStartButton,
     UnifiProtectPTZPatrolStopButton,
     _connected_client_macs,
-    _get_port_label,
     _registered_wake_macs,
     async_setup_entry,
     get_device_port,
@@ -44,10 +43,13 @@ from custom_components.unifi_insights.const import (
     MANUFACTURER,
 )
 from custom_components.unifi_insights.coordinators.facade import (
-    UnifiFacadeCoordinator,
+    UnifiInsightsFacadeCoordinator,
 )
-from custom_components.unifi_insights.coordinators.voucher_state import VoucherSettings
-from custom_components.unifi_insights.data_transforms import device_ports
+from custom_components.unifi_insights.data_transforms import (
+    VoucherSettings,
+    device_ports,
+    get_port_label,
+)
 from tests.fixtures.command_owners import autospec_command_owners, protect_owner
 from tests.fixtures.http_fakes import FakeJsonResponse, FakeQueuedSession
 
@@ -1524,11 +1526,11 @@ class TestSetupEntryPoeButtons:
         assert poe_buttons[0].entity_registry_enabled_default is False
 
     def test_get_port_label(self):
-        """Test _get_port_label helper variations."""
-        assert _get_port_label({"name": "Custom Name"}, 1) == "Custom Name"
-        assert _get_port_label({"name": "Port 1"}, 1) == "Port 1"
-        assert _get_port_label({"media": "SFP+"}, 2) == "SFP+ 2"
-        assert _get_port_label({}, 3) == "Port 3"
+        """Test get_port_label helper variations."""
+        assert get_port_label({"name": "Custom Name"}, 1) == "Custom Name"
+        assert get_port_label({"name": "Port 1"}, 1) == "Port 1"
+        assert get_port_label({"media": "SFP+"}, 2) == "SFP+ 2"
+        assert get_port_label({}, 3) == "Port 3"
 
     def test_get_device_port_and_helpers(self):
         """Test get_device_port and related helper edge cases."""
@@ -1809,7 +1811,7 @@ class TestGenerateVoucherButton:
         config_coord.vouchers_available.return_value = True
         config_coord.async_refresh_vouchers = AsyncMock()
 
-        facade = UnifiFacadeCoordinator(
+        facade = UnifiInsightsFacadeCoordinator(
             hass=hass,
             network_client=client,
             protect_client=None,

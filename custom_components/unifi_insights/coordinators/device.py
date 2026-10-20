@@ -16,7 +16,6 @@ from homeassistant.exceptions import (
     ServiceNotFound,
     ServiceValidationError,
 )
-from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from unifi_official_api import (
     UniFiAuthenticationError,
@@ -48,13 +47,12 @@ from custom_components.unifi_insights.data_transforms import (
     normalize_legacy_storage,
     normalize_legacy_wans,
 )
-from custom_components.unifi_insights.helpers import async_get_device_entry
-from custom_components.unifi_insights.topology_contract import (
+from custom_components.unifi_insights.topology import (
     first_present,
     normalize_mac,
 )
 
-from .base import CommandFailure, UnifiBaseCoordinator, async_execute_command
+from .base import CommandFailure, UnifiInsightsBaseCoordinator, async_execute_command
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -66,7 +64,7 @@ if TYPE_CHECKING:
 
     from custom_components.unifi_insights.data_transforms import NetworkPortFacts
 
-    from .config import UnifiConfigCoordinator
+    from .config import UnifiInsightsConfigCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -232,7 +230,7 @@ def _merge_legacy_system_stats(
 MAX_STATS_REUSE_POLLS = 3
 
 
-class UnifiDeviceCoordinator(UnifiBaseCoordinator):
+class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
     """
     Coordinator for fast-changing device data (30 second updates).
 
@@ -249,7 +247,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         network_client: UniFiNetworkClient,
         protect_client: UniFiProtectClient | None,
         entry: ConfigEntry,
-        config_coordinator: UnifiConfigCoordinator,
+        config_coordinator: UnifiInsightsConfigCoordinator,
     ) -> None:
         """Initialize the device coordinator."""
         super().__init__(
@@ -1399,33 +1397,15 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
     def _cleanup_stale_devices(self) -> None:
         """Remove stale network devices from the device registry (Gold requirement)."""
-        device_registry = dr.async_get(self.hass)
-
-        # Collect current network device IDs
         current_network_device_ids: set[str] = set()
         for site_id, devices in self.data.get("devices", {}).items():
             for device_id in devices:
                 current_network_device_ids.add(f"{site_id}_{device_id}")
 
-        # Find and remove stale network devices
-        stale_network_ids = (
+        for device_identifier in (
             self._previous_network_device_ids - current_network_device_ids
-        )
-        for device_identifier in stale_network_ids:
-            device = async_get_device_entry(
-                device_registry,
-                (DOMAIN, device_identifier),
-                self.config_entry.entry_id,
-            )
-            if device:
-                _LOGGER.info(
-                    "Device coordinator: Removing stale network device: %s",
-                    device_identifier,
-                )
-                device_registry.async_update_device(
-                    device_id=device.id,
-                    remove_config_entry_id=self.config_entry.entry_id,
-                )
+        ):
+            self._remove_stale_device(device_identifier)
 
         self._previous_network_device_ids = current_network_device_ids
 

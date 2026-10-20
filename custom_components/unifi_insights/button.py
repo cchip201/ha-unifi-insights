@@ -32,7 +32,7 @@ from .client_wake import (
     mac_from_wake_unique_id,
     wake_unique_id,
 )
-from .console_identity import resolve_console_namespace
+from .console_identity import async_migrate_site_entity, resolve_console_namespace
 from .const import (
     ATTR_CHIME_ID,
     ATTR_CHIME_NAME,
@@ -45,14 +45,18 @@ from .const import (
     DOMAIN,
     MANUFACTURER,
 )
-from .coordinators import UnifiFacadeCoordinator
+from .coordinators import UnifiInsightsFacadeCoordinator
 from .coordinators.device import (
     get_device_port,
     port_can_be_power_cycled,
     power_cyclable_ports,
 )
-from .coordinators.voucher_state import voucher_request_kwargs, voucher_site_ids
-from .data_transforms import current_chime_ringtone_id
+from .data_transforms import (
+    current_chime_ringtone_id,
+    get_port_label,
+    voucher_request_kwargs,
+    voucher_site_ids,
+)
 from .entity import (
     UnifiInsightsEntity,
     UnifiProtectEntity,
@@ -61,12 +65,9 @@ from .entity import (
     get_client_type,
     get_field,
 )
-from .helpers import async_migrate_site_entity
-from .topology_contract import normalize_mac
+from .topology import normalize_mac
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -84,17 +85,6 @@ class UnifiInsightsButtonEntityDescription(ButtonEntityDescription):  # type: ig
     """Class describing UniFi Insights button entities."""
 
 
-def _get_port_label(port: Mapping[str, Any], port_idx: int) -> str:
-    """Return user-friendly port label based on port type."""
-    name = port.get("name")
-    if name and name != f"Port {port_idx}":
-        return str(name)
-    media = port.get("media", "")
-    if isinstance(media, str) and media.startswith("SFP"):
-        return f"{media} {port_idx}"
-    return f"Port {port_idx}"
-
-
 def _wired_client_mac(client: dict[str, Any]) -> str | None:
     """Return a wired client's normalized MAC, or None for any other client."""
     if get_client_type(client) != "WIRED":
@@ -102,7 +92,7 @@ def _wired_client_mac(client: dict[str, Any]) -> str | None:
     return normalize_mac(get_field(client, "macAddress", "mac_address", "mac"))
 
 
-def _connected_client_macs(coordinator: UnifiFacadeCoordinator) -> set[str]:
+def _connected_client_macs(coordinator: UnifiInsightsFacadeCoordinator) -> set[str]:
     """Return the normalized MACs of all clients currently connected."""
     macs: set[str] = set()
     clients_by_site = (coordinator.data or {}).get("clients")
@@ -196,7 +186,7 @@ async def async_setup_entry(
     """Set up buttons for UniFi Insights integration."""
     # Access is set up before the Protect-dependent buttons below.
     async_setup_access_buttons(config_entry, async_add_entities)
-    coordinator: UnifiFacadeCoordinator = config_entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = config_entry.runtime_data.coordinator
     client_control = config_entry.options.get(
         CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
     )
@@ -386,7 +376,7 @@ async def async_setup_entry(
                             continue
                         known_button_keys.add(poe_btn_key)
 
-                        port_label = _get_port_label(port, port_idx)
+                        port_label = get_port_label(port, port_idx)
                         entities.append(
                             UnifiInsightsPoePowerCycleButton(
                                 coordinator=coordinator,
@@ -496,7 +486,7 @@ class UnifiInsightsButton(UnifiInsightsEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         description: UnifiInsightsButtonEntityDescription,
         site_id: str,
         device_id: str,
@@ -542,7 +532,7 @@ class UnifiInsightsPoePowerCycleButton(UnifiInsightsEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         device_id: str,
         port_idx: int,
@@ -599,7 +589,7 @@ class UnifiProtectChimePlayButton(UnifiProtectEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         chime_id: str,
     ) -> None:
         """Initialize the button."""
@@ -630,7 +620,7 @@ class UnifiProtectChimePlayButton(UnifiProtectEntity, ButtonEntity):
 
 
 class UnifiClientReconnectButton(
-    CoordinatorEntity[UnifiFacadeCoordinator], ButtonEntity
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ButtonEntity
 ):
     """Button to force a client to reconnect."""
 
@@ -639,7 +629,7 @@ class UnifiClientReconnectButton(
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         client_id: str,
     ) -> None:
@@ -711,7 +701,9 @@ class UnifiClientReconnectButton(
         )
 
 
-class UnifiClientWakeButton(CoordinatorEntity[UnifiFacadeCoordinator], ButtonEntity):
+class UnifiClientWakeButton(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ButtonEntity
+):
     """Button that wakes a wired client with a Wake-on-LAN magic packet."""
 
     _attr_has_entity_name = True
@@ -720,7 +712,7 @@ class UnifiClientWakeButton(CoordinatorEntity[UnifiFacadeCoordinator], ButtonEnt
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         mac: str,
         *,
         site_id: str,
@@ -785,7 +777,7 @@ class UnifiProtectPTZPatrolStartButton(UnifiProtectEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the button."""
@@ -808,7 +800,7 @@ class UnifiProtectPTZPatrolStopButton(UnifiProtectEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the button."""
@@ -824,7 +816,7 @@ class UnifiProtectPTZPatrolStopButton(UnifiProtectEntity, ButtonEntity):
 
 
 class UnifiGenerateVoucherButton(
-    CoordinatorEntity[UnifiFacadeCoordinator], ButtonEntity
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ButtonEntity
 ):
     """Button entity that creates a new hotspot voucher using HA-stored settings."""
 
@@ -833,7 +825,7 @@ class UnifiGenerateVoucherButton(
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         *,
         unique_id: str,

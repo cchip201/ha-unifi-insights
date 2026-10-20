@@ -36,8 +36,8 @@ if TYPE_CHECKING:
 
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-    from .carrier_fabric_data import CarrierFabricConfigEntry
-    from .coordinators.carrier_fabric import UnifiCarrierFabricCoordinator
+    from . import CarrierFabricConfigEntry
+    from .coordinators.carrier_fabric import UnifiInsightsCarrierFabricCoordinator
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -137,7 +137,7 @@ class UnifiCarrierFabricAggregateSensor(UnifiCarrierFabricEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: UnifiCarrierFabricCoordinator,
+        coordinator: UnifiInsightsCarrierFabricCoordinator,
         entry: CarrierFabricConfigEntry,
         description: CarrierFabricAggregateSensorDescription,
     ) -> None:
@@ -164,7 +164,7 @@ class UnifiCarrierFabricPlanSubscribersSensor(UnifiCarrierFabricEntity, SensorEn
 
     def __init__(
         self,
-        coordinator: UnifiCarrierFabricCoordinator,
+        coordinator: UnifiInsightsCarrierFabricCoordinator,
         entry: CarrierFabricConfigEntry,
         plan_id: str,
     ) -> None:
@@ -244,7 +244,7 @@ class UnifiCarrierFabricSubscriberStateSensor(
 
     def __init__(
         self,
-        coordinator: UnifiCarrierFabricCoordinator,
+        coordinator: UnifiInsightsCarrierFabricCoordinator,
         entry: CarrierFabricConfigEntry,
         subscriber_id: str,
     ) -> None:
@@ -285,7 +285,7 @@ class UnifiCarrierFabricSubscriberPlanSensor(
 
     def __init__(
         self,
-        coordinator: UnifiCarrierFabricCoordinator,
+        coordinator: UnifiInsightsCarrierFabricCoordinator,
         entry: CarrierFabricConfigEntry,
         subscriber_id: str,
     ) -> None:

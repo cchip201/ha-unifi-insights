@@ -14,6 +14,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .console_identity import async_get_device_entry
 from .const import (
     CONF_TRACK_CLIENTS,
     CONF_TRACK_WIFI_CLIENTS,
@@ -23,10 +24,9 @@ from .const import (
     MANUFACTURER,
     MOBILITY_DEVICE_PREFIX,
 )
-from .coordinators import UnifiFacadeCoordinator
+from .coordinators import UnifiInsightsFacadeCoordinator
 from .entity import get_client_type as _get_client_type
 from .entity import get_field
-from .helpers import async_get_device_entry
 from .mobility_entity import async_setup_mobility_trackers
 
 if TYPE_CHECKING:
@@ -58,7 +58,7 @@ def _client_should_be_tracked(
 
 
 def _partition_connected_clients(
-    coordinator: UnifiFacadeCoordinator,
+    coordinator: UnifiInsightsFacadeCoordinator,
     *,
     track_wifi: bool,
     track_wired: bool,
@@ -83,7 +83,7 @@ def _partition_connected_clients(
 
 
 def _connected_clients_to_track(
-    coordinator: UnifiFacadeCoordinator,
+    coordinator: UnifiInsightsFacadeCoordinator,
     *,
     track_wifi: bool,
     track_wired: bool,
@@ -305,14 +305,16 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(async_add_clients))
 
 
-class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntity):
+class UnifiClientTracker(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ScannerEntity
+):
     """Representation of a UniFi network client."""
 
     _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         mac: str,
         site_id: str | None = None,
         restored_name: str | None = None,

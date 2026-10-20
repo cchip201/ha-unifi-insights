@@ -30,34 +30,32 @@ from custom_components.unifi_insights.const import (
     SCAN_INTERVAL_CONFIG,
 )
 
-from .base import CommandFailure, UnifiBaseCoordinator, async_execute_command
+from .base import CommandFailure, UnifiInsightsBaseCoordinator, async_execute_command
 from .config_sections import (
     SECTION_OUTCOME_FAILED,
     SECTION_OUTCOME_OK,
     SECTION_OUTCOME_UNSUPPORTED,
-    async_fetch_site_firewall,
-    async_fetch_site_routes,
-    async_fetch_site_rule_section,
-    async_fetch_site_vouchers,
-    async_fetch_site_vpn_clients,
-    async_fetch_site_vpns,
-    async_fetch_site_wifi_and_links,
-    client_links,
-    enrich_wifi,
-    map_legacy_site_names,
-    rule_display_name,
-    verified_legacy_site_name,
-    wifi_qr_payload,
-)
-from .internet_activity import (
     WINDOW_1D_MS,
     WINDOW_1H_MS,
     WINDOW_1M_MS,
     WINDOW_1W_MS,
     aggregate_internet_activity_windows,
     async_call_site_report,
+    async_fetch_site_firewall,
     async_fetch_site_internet_activity,
+    async_fetch_site_routes,
+    async_fetch_site_rule_section,
+    async_fetch_site_vouchers,
+    async_fetch_site_vpn_clients,
+    async_fetch_site_vpns,
+    async_fetch_site_wifi_and_links,
     async_update_site_internet_activity,
+    client_links,
+    enrich_wifi,
+    map_legacy_site_names,
+    rule_display_name,
+    verified_legacy_site_name,
+    wifi_qr_payload,
 )
 from .rule_audit import RuleAuditTracker
 
@@ -66,7 +64,7 @@ __all__ = [
     "WINDOW_1H_MS",
     "WINDOW_1M_MS",
     "WINDOW_1W_MS",
-    "UnifiConfigCoordinator",
+    "UnifiInsightsConfigCoordinator",
     "aggregate_internet_activity_windows",
 ]
 
@@ -98,7 +96,7 @@ RULE_REFRESH_RETRY_DELAY: Final = 15
 LEGACY_REMAP_COOLDOWN: Final = 60
 
 
-class UnifiConfigCoordinator(UnifiBaseCoordinator):
+class UnifiInsightsConfigCoordinator(UnifiInsightsBaseCoordinator):
     """Coordinator for slow-changing configuration data (5 minute updates)."""
 
     _map_legacy_site_names = staticmethod(map_legacy_site_names)

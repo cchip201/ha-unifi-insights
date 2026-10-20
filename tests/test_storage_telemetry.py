@@ -22,17 +22,19 @@ from custom_components.unifi_insights.binary_sensor import (
     async_setup_entry as setup_binary_sensors,
 )
 from custom_components.unifi_insights.coordinators.protect import (
-    UnifiProtectCoordinator,
+    UnifiInsightsProtectCoordinator,
 )
-from custom_components.unifi_insights.data_transforms import normalize_legacy_storage
-from custom_components.unifi_insights.protect_snapshot import build_protect_snapshot
+from custom_components.unifi_insights.dashboard_snapshots import build_protect_snapshot
+from custom_components.unifi_insights.data_transforms import (
+    normalize_legacy_storage,
+    normalize_nvr_storage,
+)
 from custom_components.unifi_insights.sensor import (
     UnifiProtectNVRSensor,
 )
 from custom_components.unifi_insights.sensor import (
     async_setup_entry as setup_sensors,
 )
-from custom_components.unifi_insights.storage_telemetry import normalize_nvr_storage
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -282,7 +284,7 @@ async def test_poll_model_wss_delta_null_and_generation(
     mock_coordinator,
 ) -> None:
     """Poll feeds entities/snapshot; WSS deltas preserve siblings and win races."""
-    coordinator = UnifiProtectCoordinator(
+    coordinator = UnifiInsightsProtectCoordinator(
         hass, mock_network_client, mock_protect_client, mock_config_entry
     )
     try:

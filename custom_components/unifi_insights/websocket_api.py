@@ -25,39 +25,42 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util.hass_dict import HassKey
 
-from .carrier_fabric_data import CarrierFabricData
-from .console_identity import resolve_console_namespace
+from .console_identity import async_get_device_entry, resolve_console_namespace
 from .const import DOMAIN
-from .dashboard_contract_utils import as_dict, content_revision
+from .dashboard_snapshots import (
+    as_dict,
+    build_internet_activity_snapshot,
+    build_no_protect_snapshot,
+    build_performance_snapshot,
+    build_protect_snapshot,
+    build_site_health_snapshot,
+    build_timeline_snapshot,
+    build_unavailable_internet_activity,
+    build_unavailable_performance,
+    build_unavailable_protect_snapshot,
+    build_unavailable_site_health,
+    build_unavailable_timeline,
+    content_revision,
+)
 from .data_transforms import NETWORK_FACTS_KEY
 from .device_tracker import _client_tracker_entries, _mac_from_unique_id
 from .entity import get_field
-from .helpers import async_get_device_entry
-from .internet_activity_snapshot import (
-    build_internet_activity_snapshot,
-    build_unavailable_internet_activity,
-)
-from .performance import build_performance_snapshot, build_unavailable_performance
-from .protect_snapshot import (
-    build_no_protect_snapshot,
-    build_protect_snapshot,
-    build_unavailable_protect_snapshot,
-)
-from .site_health import build_site_health_snapshot, build_unavailable_site_health
-from .timeline import build_timeline_snapshot, build_unavailable_timeline
-from .topology import build_site_topology, build_unavailable_topology
-from .topology_contract import (
+from .topology import (
     MAX_CLIENTS_PER_SITE,
+    async_get_node_key,
+    build_site_topology,
+    build_unavailable_topology,
     device_kind,
     opaque_node_id,
     site_display_name,
     wan_node_id,
 )
-from .topology_keys import async_get_node_key
 
 # Schemas are typed against probatio, the library HA 2026.10 annotates its schema
 # arguments with. Runtime still imports voluptuous: HA 2026.10 aliases it to probatio,
 # and the 2026.9 minimum ships real voluptuous, so only the type checker sees probatio.
+# CarrierFabricData is imported inside functions: __init__.py imports this
+# module while it loads, before the class exists.
 if TYPE_CHECKING:
     import probatio as vol
 else:
@@ -69,7 +72,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
     from . import UnifiInsightsConfigEntry
-    from .topology_contract import NodeKind, SiteTopology
+    from .topology import NodeKind, SiteTopology
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,6 +142,8 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
 
 def _resolve_entry(hass: HomeAssistant, entry_id: str) -> UnifiInsightsConfigEntry:
     """Return a loaded UniFi Insights entry or raise _RequestError."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     entry = hass.config_entries.async_get_entry(entry_id)
     if entry is None or entry.domain != DOMAIN:
         msg = f"No UniFi Insights config entry {entry_id}"
@@ -591,6 +596,8 @@ def ws_topology_sources(
     msg: dict[str, Any],
 ) -> None:
     """List loaded entries and their selected sites for the card editor."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     sources = []
     for entry in hass.config_entries.async_loaded_entries(DOMAIN):
         runtime = getattr(entry, "runtime_data", None)
@@ -978,6 +985,8 @@ def ws_protect_sources(
     msg: dict[str, Any],
 ) -> None:
     """List loaded entries that can provide Protect snapshots."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     sources = []
     for entry in hass.config_entries.async_loaded_entries(DOMAIN):
         runtime = getattr(entry, "runtime_data", None)
