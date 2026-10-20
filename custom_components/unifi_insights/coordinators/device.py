@@ -9,7 +9,7 @@ import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
 from homeassistant.exceptions import (
     HomeAssistantError,
@@ -36,7 +36,11 @@ from custom_components.unifi_insights.client_wake import (
     first_non_blank_text,
     history_network_hint,
 )
-from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_DEVICE
+from custom_components.unifi_insights.const import (
+    DOMAIN,
+    MAX_CONSECUTIVE_MISSING_POLLS,
+    SCAN_INTERVAL_DEVICE,
+)
 from custom_components.unifi_insights.data_transforms import (
     CPU_STAT_KEYS,
     MEMORY_STAT_KEYS,
@@ -69,6 +73,16 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 WAKE_BROADCAST_TIMEOUT_SECONDS: Final = 5
+
+
+class SiteProcessResult(NamedTuple):
+    """Result of processing a single site's devices and clients."""
+
+    devices: dict[str, dict[str, Any]]
+    stats: dict[str, dict[str, Any]]
+    clients: dict[str, dict[str, Any]]
+    source: Literal["v1", "legacy"]
+    device_macs: dict[str, str]
 
 
 def get_device_port(
@@ -355,10 +369,18 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
             update_interval=SCAN_INTERVAL_DEVICE,
         )
         self.config_coordinator = config_coordinator
-        # Successful legacy fallback does not fail the coordinator refresh.
+        # Track sites operating on legacy fallback to avoid spamming the log
         self._legacy_fallback_sites: set[str] = set()
-        # Track previous device IDs for stale device cleanup (Gold requirement)
-        self._previous_network_device_ids: set[str] = set()
+        # Track per-site coordinator state committed at snapshot publication
+        # (ADR-013, #391). Commits occur only when all sites succeed.
+        # site_id -> source ("v1" | "legacy")
+        self._site_sources: dict[str, str] = {}
+        # site_id -> {normalized_mac: v1_device_id} (only from v1 polls)
+        self._site_aliases: dict[str, dict[str, str]] = {}
+        # site_id -> {device_id: normalized_mac}
+        self._site_tracked_devices: dict[str, dict[str, str]] = {}
+        # site_id -> {device_id: consecutive_missing_polls}
+        self._site_absence_counts: dict[str, dict[str, int]] = {}
         # Track previous port byte counts for rate computation
         # device_id -> (monotonic sample time, per-port byte counters)
         self._prev_port_bytes: dict[str, tuple[float, dict[int, dict[str, int]]]] = {}
@@ -1028,11 +1050,7 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
 
     async def _process_site(
         self, site_id: str, legacy_site_name: str | None = None
-    ) -> tuple[
-        dict[str, dict[str, Any]],
-        dict[str, dict[str, Any]],
-        dict[str, dict[str, Any]],
-    ]:
+    ) -> SiteProcessResult:
         """
         Process a single site's devices and clients.
 
@@ -1131,7 +1149,14 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
                 for legacy_device in legacy_devices
                 if isinstance(legacy_device, dict)
             ]
+            site_aliases = self._site_aliases.get(site_id, {})
+            for device in devices:
+                mac = self._normalize_mac(device.get("macAddress") or device.get("mac"))
+                if mac and mac in site_aliases:
+                    device["id"] = site_aliases[mac]
+
             legacy_as_primary = True
+            source: Literal["v1", "legacy"] = "legacy"
             log = (
                 _LOGGER.debug
                 if site_id in self._legacy_fallback_sites
@@ -1147,6 +1172,7 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
         else:
             # Convert model objects to dictionaries
             devices = [self._model_to_dict(d) for d in devices_models]
+            source = "v1"
             if site_id in self._legacy_fallback_sites:
                 self._legacy_fallback_sites.remove(site_id)
                 _LOGGER.info(
@@ -1155,6 +1181,13 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
                 )
 
         clients = [self._model_to_dict(c) for c in clients_models]
+
+        device_macs: dict[str, str] = {}
+        for device in devices:
+            dev_id = device.get("id")
+            mac = self._normalize_mac(device.get("macAddress") or device.get("mac"))
+            if dev_id and mac:
+                device_macs[str(dev_id)] = mac
 
         legacy_devices_by_mac = {
             normalized_mac: legacy_device
@@ -1236,7 +1269,13 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
             str(client.get("id")): client for client in clients if client.get("id")
         }
 
-        return devices_dict, stats_dict, clients_dict
+        return SiteProcessResult(
+            devices=devices_dict,
+            stats=stats_dict,
+            clients=clients_dict,
+            source=source,
+            device_macs=device_macs,
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch device data from API."""
@@ -1361,13 +1400,22 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
                 result for result in results if not isinstance(result, BaseException)
             ]
 
+            site_sources: dict[str, str] = {}
+            site_device_macs: dict[str, dict[str, str]] = {}
+
             # Put the results into the local section maps
-            for site_id, (devices_dict, stats_dict, clients_dict), vpn in zip(
-                site_ids, site_results, vpn_results, strict=True
-            ):
+            for site_id, (
+                devices_dict,
+                stats_dict,
+                clients_dict,
+                source,
+                dev_macs,
+            ), vpn in zip(site_ids, site_results, vpn_results, strict=True):
                 sections["devices"][site_id] = devices_dict
                 sections["stats"][site_id] = stats_dict
                 sections["clients"][site_id] = clients_dict
+                site_sources[site_id] = source
+                site_device_macs[site_id] = dev_macs
                 connections = self._vpn_connections_or_previous(site_id, vpn)
                 if connections is None:
                     sections["vpn_connections"].pop(site_id, None)
@@ -1418,7 +1466,7 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
             }
 
             # Clean up stale devices (Gold requirement)
-            self._cleanup_stale_devices()
+            self._cleanup_stale_devices(site_sources, site_device_macs)
 
             _LOGGER.debug(
                 "Device coordinator: Update complete - %d sites processed",
@@ -1514,19 +1562,138 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
         self._prev_port_bytes = current
         return result
 
-    def _cleanup_stale_devices(self) -> None:
-        """Remove stale network devices from the device registry (Gold requirement)."""
-        current_network_device_ids: set[str] = set()
-        for site_id, devices in self.data.get("devices", {}).items():
-            for device_id in devices:
-                current_network_device_ids.add(f"{site_id}_{device_id}")
+    def _cleanup_stale_devices(
+        self,
+        site_sources: dict[str, str],
+        site_device_macs: dict[str, dict[str, str]],
+    ) -> None:
+        """
+        Remove stale network devices from the device registry (Gold requirement).
 
-        for device_identifier in (
-            self._previous_network_device_ids - current_network_device_ids
-        ):
-            self._remove_stale_device(device_identifier)
+        Network staleness policy:
+        - Evaluated per site against that site's previous snapshot.
+        - A site is eligible for cleanup only if:
+          1. Its source ("v1" | "legacy") matches its previous committed source
+             (prevents purges during transient v1/legacy flips or on first poll).
+          2. It did not return zero devices after a non-empty previous snapshot
+             (prevents purges during transient empty responses).
+        - Ineligible sites keep previous tracking and aliases unchanged and do not
+          advance counters.
+        - MAC guard: an identifier missing by ID is retained without advancing absence
+          counters if its normalized MAC is present in the current site snapshot under
+          any ID (prevents purges when an identifier changes representation).
+        - Truly missing devices must be absent for MAX_CONSECUTIVE_MISSING_POLLS
+          consecutive eligible polls before being detached via _remove_stale_device.
+        - Reappearance resets the device's absence counter.
+        - Aliases are updated on every committed v1 poll (merging new MAC->v1-ID
+          pairs), preserved across fallback polls and transient ineligible polls,
+          and pruned only when a device is detached as stale or when a site is pruned.
+        """
+        current_devices_by_site: dict[str, dict[str, Any]] = self.data.get(
+            "devices", {}
+        )
 
-        self._previous_network_device_ids = current_network_device_ids
+        polled_site_ids = set(site_sources.keys())
+
+        new_tracked_devices: dict[str, dict[str, str]] = {}
+        new_absence_counts: dict[str, dict[str, int]] = {}
+        new_site_sources: dict[str, str] = {}
+        new_site_aliases: dict[str, dict[str, str]] = {}
+
+        for site_id in polled_site_ids:
+            current_source = site_sources[site_id]
+            previous_source = self._site_sources.get(site_id)
+            previous_tracked = self._site_tracked_devices.get(site_id, {})
+            current_tracked = site_device_macs.get(site_id, {})
+            current_site_devs = current_devices_by_site.get(site_id, {})
+
+            # Aliases are updated on every committed v1 poll, even if the poll
+            # is ineligible for cleanup due to a source transition.
+            site_aliases = dict(self._site_aliases.get(site_id, {}))
+            if current_source == "v1":
+                site_aliases.update(
+                    {mac: dev_id for dev_id, mac in current_tracked.items()}
+                )
+
+            # 1. Eligibility check
+            is_eligible = (
+                previous_source is not None
+                and previous_source == current_source
+                and not (len(current_site_devs) == 0 and len(previous_tracked) > 0)
+            )
+
+            new_site_sources[site_id] = current_source
+
+            if not is_eligible:
+                _LOGGER.debug(
+                    "Device coordinator: Site %s is not eligible for stale "
+                    "device cleanup (source=%s, prev_source=%s, devices=%d, "
+                    "prev_tracked=%d); retaining tracking",
+                    site_id,
+                    current_source,
+                    previous_source,
+                    len(current_site_devs),
+                    len(previous_tracked),
+                )
+                if previous_source is None:
+                    new_tracked_devices[site_id] = dict(current_tracked)
+                else:
+                    new_tracked_devices[site_id] = previous_tracked
+                new_absence_counts[site_id] = dict(
+                    self._site_absence_counts.get(site_id, {})
+                )
+                new_site_aliases[site_id] = site_aliases
+                continue
+
+            # Eligible: perform stale device evaluation
+            site_counters = dict(self._site_absence_counts.get(site_id, {}))
+            current_site_macs = set(current_tracked.values())
+
+            for dev_id, dev_mac in previous_tracked.items():
+                if dev_id in current_site_devs:
+                    site_counters.pop(dev_id, None)
+                elif dev_mac in current_site_macs:
+                    _LOGGER.debug(
+                        "Device coordinator: Device %s absent by ID but MAC "
+                        "present in site %s; retaining",
+                        f"{site_id}_{dev_id}",
+                        site_id,
+                    )
+                    site_counters.pop(dev_id, None)
+                else:
+                    count = site_counters.get(dev_id, 0) + 1
+                    site_counters[dev_id] = count
+                    if count >= MAX_CONSECUTIVE_MISSING_POLLS:
+                        self._remove_stale_device(f"{site_id}_{dev_id}")
+                        site_counters.pop(dev_id, None)
+                        site_aliases.pop(dev_mac, None)
+                    else:
+                        _LOGGER.debug(
+                            "Device coordinator: Device %s absent for %d/%d polls; "
+                            "not removing yet",
+                            f"{site_id}_{dev_id}",
+                            count,
+                            MAX_CONSECUTIVE_MISSING_POLLS,
+                        )
+
+            tracked_for_site: dict[str, str] = {
+                **current_tracked,
+                **{
+                    dev_id: dev_mac
+                    for dev_id, dev_mac in previous_tracked.items()
+                    if dev_id not in current_site_devs and dev_id in site_counters
+                },
+            }
+
+            new_tracked_devices[site_id] = tracked_for_site
+            new_absence_counts[site_id] = site_counters
+            new_site_aliases[site_id] = site_aliases
+
+        # Prune all per-site state to the sites polled this refresh
+        self._site_sources = new_site_sources
+        self._site_aliases = new_site_aliases
+        self._site_tracked_devices = new_tracked_devices
+        self._site_absence_counts = new_absence_counts
 
     def get_device(self, site_id: str, device_id: str) -> dict[str, Any] | None:
         """Get device data by site ID and device ID."""

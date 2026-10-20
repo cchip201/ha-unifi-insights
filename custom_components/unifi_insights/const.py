@@ -186,6 +186,15 @@ ISP_WAN_NUMBERS: Final = (
 # Real-time updates via WebSocket when available
 SCAN_INTERVAL_PROTECT = timedelta(seconds=30)
 
+# Consecutive missing polls threshold for stale device registry removal.
+# For Network, a device is removed on the 3rd consecutive eligible poll in which
+# it is absent. Protect keeps a missing device for 3 polls and removes it on the 4th.
+# Removal cannot be undone (areas, customizations and automations keyed on the
+# device go with it), while a single absence is ambiguous.
+# Three polls is about 90 seconds.
+MAX_CONSECUTIVE_MISSING_POLLS: Final = 3
+
+
 UNIFI_API_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
 
