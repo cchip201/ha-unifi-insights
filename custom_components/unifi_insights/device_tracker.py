@@ -29,6 +29,7 @@ from .const import (
     MOBILITY_DEVICE_PREFIX,
 )
 from .coordinators import UnifiInsightsFacadeCoordinator
+from .data_transforms import section_by_site
 from .entity import (
     UnifiMobilityRouterEntity,
     async_add_mobility_router_entities,
@@ -75,9 +76,8 @@ def _partition_connected_clients(
     """Split connected clients into tracked (MAC -> site_id) and untracked MACs."""
     wanted: dict[str, str] = {}
     untracked: set[str] = set()
-    for site_id, clients in coordinator.data.get("clients", {}).items():
-        if not isinstance(clients, dict):
-            continue
+    clients_by_site = section_by_site(coordinator.data, "clients") or {}
+    for site_id, clients in clients_by_site.items():
         for client_data in clients.values():
             mac = get_field(client_data, "macAddress", "mac_address", "mac", default="")
             if not mac:
