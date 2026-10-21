@@ -3,8 +3,6 @@
 [![Marketplace and HACS](https://img.shields.io/badge/Marketplace%20%7C%20HACS-Default-orange.svg)](https://www.hacs.xyz/docs/marketplace/)
 [![GitHub Last Commit](https://img.shields.io/github/last-commit/tinkerologie/ha-unifi-insights)](https://github.com/tinkerologie/ha-unifi-insights/commits/main)
 [![GitHub Release](https://img.shields.io/github/v/release/tinkerologie/ha-unifi-insights)](https://github.com/tinkerologie/ha-unifi-insights/releases)
-[![GitHub Issues](https://img.shields.io/github/issues/tinkerologie/ha-unifi-insights)](https://github.com/tinkerologie/ha-unifi-insights/issues)
-[![Community Forum](https://img.shields.io/badge/community-forum-brightgreen.svg)](https://community.home-assistant.io/t/unifi-insights-integration)
 [![codecov](https://codecov.io/gh/tinkerologie/ha-unifi-insights/graph/badge.svg)](https://codecov.io/gh/tinkerologie/ha-unifi-insights)
 [![License](https://img.shields.io/github/license/tinkerologie/ha-unifi-insights)](./LICENSE)
 
