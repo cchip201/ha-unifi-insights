@@ -8,7 +8,6 @@
 [![Community Forum](https://img.shields.io/badge/community-forum-brightgreen.svg)](https://community.home-assistant.io/t/unifi-insights-integration)
 [![codecov](https://codecov.io/gh/tinkerologie/ha-unifi-insights/graph/badge.svg)](https://codecov.io/gh/tinkerologie/ha-unifi-insights)
 [![License](https://img.shields.io/github/license/tinkerologie/ha-unifi-insights)](./LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tinkerologie/ha-unifi-insights)
 
 Monitor and control your UniFi system from Home Assistant: UniFi Network, UniFi Protect, UniFi Access, UniFi InnerSpace, UniFi Mobility, UniFi Site Manager and UniFi Carrier Fabric, in one integration.
 
