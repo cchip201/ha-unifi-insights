@@ -9,10 +9,10 @@ function (ADR-007's `protect_events.py` seam, #340)::
 
     reconcile(state, cache, input, now) -> Step(state, cache, effects)
 
-- ``state`` is a frozen `ReconcilerState`: the event latches, per-sensor
-  WebSocket recency and preserve counters, alarm hub tamper records, siren
-  stop guards, WebSocket generation counters, and each device family's empty,
-  error and missing-poll counts.
+- ``state`` is a frozen `ReconcilerState`: the event latches, when each
+  stored event was first seen, per-sensor WebSocket recency and preserve
+  counters, alarm hub tamper records, siren stop guards, WebSocket generation
+  counters, and each device family's empty, error and missing-poll counts.
 - ``cache`` is the coordinator's ``data``. It is never changed in place
   (copy-on-write, ADR-010): a step that changes anything returns a new root
   that shares every collection and record it did not touch, and a step that
@@ -24,16 +24,12 @@ function (ADR-007's `protect_events.py` seam, #340)::
 - ``now`` is an `Instant` carrying both clocks, read once per input by the
   coordinator: monotonic time for request stamps, the tamper race and the
   siren guard lifetime; wall time for the latch timeout (its expiry is written
-  as an ISO string) and the siren stop fallback.
+  as an ISO string), the event store's retention and the siren stop fallback.
 
 Side effects come back as data (`PublishUpdate`, `RemoveDevice`, `Escalate`,
 `Log`) for the coordinator to carry out in order, so its log lines still come
 from the ``coordinators.protect`` logger. This module imports nothing from
 Home Assistant, the API library or the clock; a test enforces that.
-
-The behaviour is the coordinator's as it was before the split, quirks
-included (each is pinned by a test whose id contains ``quirk``): the event
-store keeps every event.
 """
 
 from __future__ import annotations
@@ -58,6 +54,7 @@ from custom_components.unifi_insights.const import (
     MODEL_KEY_FOB,
     MODEL_KEY_LINKSTATION,
     SCAN_INTERVAL_PROTECT,
+    TIMELINE_MAX_HOURS,
 )
 from custom_components.unifi_insights.data_transforms import get_field
 
@@ -104,6 +101,18 @@ FAMILIES: Final[tuple[Family, ...]] = (
 # real single motion or ring event, yet short enough that a stuck sensor heals
 # within minutes. It is the same for every event type.
 STALE_EVENT_TIMEOUT: Final = timedelta(minutes=5)
+
+# How long the event store keeps an event, counted from the first sweep that
+# saw it. The event timeline card, the store's only reader, shows at most the
+# last `TIMELINE_MAX_HOURS` by the event's own start; an event starts before
+# it arrives, so this keeps every event the timeline can show. The hour of
+# margin covers a console clock ahead of Home Assistant's.
+EVENT_RETENTION: Final = timedelta(hours=TIMELINE_MAX_HOURS + 1)
+
+# How often the event store is swept. A sweep walks every stored event, so it
+# runs at most this often rather than on every input; an event is kept at
+# most this much longer than `EVENT_RETENTION`.
+EVENT_SWEEP_INTERVAL: Final = timedelta(minutes=5)
 
 # How many empty (or 404) answers in a row keep a family's cached devices,
 # and how many transient errors in a row are absorbed before the poll fails.
@@ -498,6 +507,11 @@ class ReconcilerState:
     # Frame model keys already logged as unknown (bounded by the console's
     # own model keys), so each is logged once.
     unknown_model_keys: frozenset[str] = frozenset()
+    # Event type -> event id -> wall time of the first sweep that saw it.
+    # Stamped by the sweep, not per frame, so a frame copies no map of it.
+    event_seen: Mapping[str, Mapping[str, datetime]] = field(default_factory=dict)
+    # Wall time of the last event store sweep (None before the first).
+    events_swept_at: datetime | None = None
 
 
 def initial_state() -> ReconcilerState:
@@ -730,9 +744,13 @@ class _Run:
         current = self.records(collection)
         if record_id in current and current[record_id] == record:
             return
+        self.put_changed(collection, record_id, record)
+
+    def put_changed(self, collection: str, record_id: str, record: Any) -> None:
+        """Set one record the caller knows differs from the cached one."""
         root = self._own_root()
         if collection not in self._owned:
-            root[collection] = dict(current)
+            root[collection] = dict(self.records(collection))
             self._owned.add(collection)
         root[collection][record_id] = record
 
@@ -786,9 +804,10 @@ def reconcile(
     match event:
         case DeviceFrame():
             # Every device frame re-arms the poll timer, so under steady
-            # frames the poll and its sweep can wait indefinitely: the frame
-            # sweeps too. A frame that publishes shows the sweep with it.
+            # frames the poll and its sweeps can wait indefinitely: the frame
+            # sweeps too. A frame that publishes shows the sweeps with it.
             swept = _expire_stale_latches(run)
+            swept = _sweep_event_store(run) or swept
             if not _apply_device_frame(run, event) and swept:
                 run.effects.append(PublishUpdate(mark_success=False))
         case EventFrame():
@@ -796,8 +815,11 @@ def reconcile(
         case RestBatch():
             _apply_rest_batch(run, event)
         case PollStarted():
-            # The poll publishes once it has fetched, which shows the sweep.
+            # The poll publishes once it has fetched, which shows the sweeps.
+            # Sweeping the event store here too expires old events while no
+            # event frames arrive.
             _expire_stale_latches(run)
+            _sweep_event_store(run)
         case StreamReconnected():
             if _expire_stale_latches(run):
                 run.effects.append(PublishUpdate(mark_success=False))
@@ -944,17 +966,82 @@ def _apply_event_frame(run: _Run, frame: EventFrame) -> None:
         event_type,
         event_id,
     )
-    # The store keeps every event (quirk: unbounded); only the event type's
-    # own map is copied per event.
-    events = run.records("events")
-    run.replace(
-        "events",
-        _with(events, event_type, _with(events.get(event_type, {}), event_id, fields)),
-    )
+    # Sweep first, so the event this frame stores is never the one dropped.
+    _sweep_event_store(run)
+    by_id = run.records("events").get(event_type, {})
+    # A new event or a changed one copies only its type's map, which the
+    # sweep bounds, and leaves every other type's map shared. An unstored
+    # event that started more than the retention ago is a late frame the
+    # timeline can no longer show, most likely of an event the sweep already
+    # dropped: storing it would keep it another full retention. It still
+    # updates its device below.
+    if (
+        by_id[event_id] != fields
+        if event_id in by_id
+        else not _started_before_retention(fields, run.now.wall)
+    ):
+        run.put_changed("events", event_type, _with(by_id, event_id, fields))
     device_id = pick_field([fields], *_EVENT_DEVICE_KEYS)
     if device_id:
         _apply_event_to_device(run, event_type, fields, device_id)
     run.effects.append(PublishUpdate(mark_success=False))
+
+
+def _started_before_retention(fields: Mapping[str, Any], now: datetime) -> bool:
+    """
+    Return True if an event's own start is more than `EVENT_RETENTION` ago.
+
+    Reads the start as the timeline does (``start``, then ``time``, then
+    ``timestamp``). An event without a readable start is never judged old.
+    """
+    started = _normalize_epoch_seconds(
+        fields.get("start") or fields.get("time") or fields.get("timestamp")
+    )
+    return started is not None and started < (now - EVENT_RETENTION).timestamp()
+
+
+def _sweep_event_store(run: _Run) -> bool:
+    """
+    Drop the events first seen more than `EVENT_RETENTION` ago.
+
+    Runs at most every `EVENT_SWEEP_INTERVAL` (and again if the wall clock
+    went back), from event frames, device frames and the poll's start. An
+    event is stamped by the first sweep that sees it, so a frame never copies
+    the stamps; its age then runs up to one interval late, which keeps it
+    longer, never shorter. A repeated frame of a stored event keeps its
+    stamp: the timeline places an event by its start. A type whose map loses
+    nothing keeps its map, and a type that loses every event is removed. The
+    cache changes only when an event is dropped; returns True if one was, so
+    the caller knows listeners have something new to show.
+    """
+    now = run.now.wall
+    swept_at = run.state.events_swept_at
+    if swept_at is not None and swept_at <= now < swept_at + EVENT_SWEEP_INTERVAL:
+        return False
+    cutoff = now - EVENT_RETENTION
+    events = run.records("events")
+    kept: dict[str, Any] = {}
+    seen: dict[str, dict[str, datetime]] = {}
+    for event_type, by_id in events.items():
+        type_seen = run.state.event_seen.get(event_type, {})
+        stamps = {
+            event_id: stamp
+            for event_id in by_id
+            if (stamp := type_seen.get(event_id, now)) >= cutoff
+        }
+        if not stamps:
+            continue
+        seen[event_type] = stamps
+        kept[event_type] = (
+            by_id
+            if len(stamps) == len(by_id)
+            else {event_id: by_id[event_id] for event_id in stamps}
+        )
+    run.state = replace(run.state, event_seen=seen, events_swept_at=now)
+    dropped = sum(map(len, seen.values())) != sum(map(len, events.values()))
+    if dropped:
+        run.replace("events", kept)
+    return dropped
 
 
 def _apply_event_to_device(
