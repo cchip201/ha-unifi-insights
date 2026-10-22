@@ -32,10 +32,8 @@ from the ``coordinators.protect`` logger. This module imports nothing from
 Home Assistant, the API library or the clock; a test enforces that.
 
 The behaviour is the coordinator's as it was before the split, quirks
-included (each is pinned by a test whose id contains ``quirk``): the latch
-sweep runs only on polls and reconnects, a reconnect sweep notifies nobody, a
-REST rebuild can give a light a false motion end, an unknown frame still
-resets the poll timer, and the event store keeps every event.
+included (each is pinned by a test whose id contains ``quirk``): the event
+store keeps every event.
 """
 
 from __future__ import annotations
@@ -207,6 +205,19 @@ _SHALLOW_FRAME_COLLECTIONS: Final[dict[str, str]] = {
     DEVICE_TYPE_VIEWPORT: "viewports",
 }
 
+# Every model key a device frame is applied for; any other is ignored.
+_KNOWN_FRAME_MODEL_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        DEVICE_TYPE_CAMERA,
+        DEVICE_TYPE_SENSOR,
+        DEVICE_TYPE_NVR,
+        DEVICE_TYPE_SIREN,
+        MODEL_KEY_FOB,
+        MODEL_KEY_LINKSTATION,
+        *_SHALLOW_FRAME_COLLECTIONS,
+    }
+)
+
 # Latch kind -> (collection, field prefix, list field emptied on expiry).
 _LATCHES: Final[dict[LatchKind, tuple[Family, str, str | None]]] = {
     "camera_motion": ("cameras", "lastMotion", "lastSmartDetectTypes"),
@@ -214,10 +225,13 @@ _LATCHES: Final[dict[LatchKind, tuple[Family, str, str | None]]] = {
     "camera_ring": ("cameras", "lastRing", None),
 }
 
-# Latch kind -> the start field a REST camera rebuild drops.
-_CAMERA_LATCH_STARTS: Final[dict[LatchKind, str]] = {
-    "camera_motion": "lastMotionStart",
-    "camera_ring": "lastRingStart",
+# Family -> latch kind -> the start field a REST rebuild of it drops.
+_REBUILT_LATCH_STARTS: Final[dict[Family, dict[LatchKind, str]]] = {
+    "cameras": {
+        "camera_motion": "lastMotionStart",
+        "camera_ring": "lastRingStart",
+    },
+    "lights": {"light_motion": "lastMotionStart"},
 }
 
 # The keys an event may carry its device id under. The library's event model
@@ -481,6 +495,9 @@ class ReconcilerState:
     # Frames applied per family; a REST answer requested before one is older.
     ws_generation: Mapping[GuardedFamily, int]
     families: Mapping[Family, FamilyTracking]
+    # Frame model keys already logged as unknown (bounded by the console's
+    # own model keys), so each is logged once.
+    unknown_model_keys: frozenset[str] = frozenset()
 
 
 def initial_state() -> ReconcilerState:
@@ -768,16 +785,22 @@ def reconcile(
     run = _Run(state, cache, now)
     match event:
         case DeviceFrame():
-            _apply_device_frame(run, event)
+            # Every device frame re-arms the poll timer, so under steady
+            # frames the poll and its sweep can wait indefinitely: the frame
+            # sweeps too. A frame that publishes shows the sweep with it.
+            swept = _expire_stale_latches(run)
+            if not _apply_device_frame(run, event) and swept:
+                run.effects.append(PublishUpdate(mark_success=False))
         case EventFrame():
             _apply_event_frame(run, event)
         case RestBatch():
             _apply_rest_batch(run, event)
-        case PollStarted() | StreamReconnected():
-            # The sweep runs only here (quirk: under steady frames that keep
-            # postponing the poll it can starve), and a reconnect sweep
-            # notifies nobody (quirk): the next notification shows it.
+        case PollStarted():
+            # The poll publishes once it has fetched, which shows the sweep.
             _expire_stale_latches(run)
+        case StreamReconnected():
+            if _expire_stale_latches(run):
+                run.effects.append(PublishUpdate(mark_success=False))
         case PollCompleted():
             _evict_missing_devices(run)
         case SirenStopped():
@@ -792,9 +815,29 @@ def reconcile(
 # --- device frames -------------------------------------------------------------
 
 
-def _apply_device_frame(run: _Run, frame: DeviceFrame) -> None:
-    """Merge a device frame into its collection."""
+def _apply_device_frame(run: _Run, frame: DeviceFrame) -> bool:
+    """
+    Merge a device frame into its collection; return True if it published.
+
+    A frame with a model key nothing tracks changes nothing, so it publishes
+    nothing either: marking it successful would re-arm the poll timer, and a
+    console that keeps sending such frames would hold the poll off for good.
+    Its model key is logged once.
+    """
     model_key, device_id, fields = frame.model_key, frame.device_id, frame.fields
+    if model_key not in _KNOWN_FRAME_MODEL_KEYS:
+        if model_key not in run.state.unknown_model_keys:
+            run.state = replace(
+                run.state,
+                unknown_model_keys=run.state.unknown_model_keys | {model_key},
+            )
+            run.log(
+                logging.DEBUG,
+                "Protect coordinator: ignoring WebSocket device updates for "
+                "unknown model key %s",
+                model_key,
+            )
+        return False
     run.log(
         logging.DEBUG,
         "Protect coordinator: WebSocket device update for %s: %s",
@@ -840,13 +883,14 @@ def _apply_device_frame(run: _Run, frame: DeviceFrame) -> None:
                 "for unknown device %s; the next poll will pick it up",
                 device_id,
             )
-            return
+            return False
         existing = run.records(target).get(device_id, {})
         run.put(target, device_id, deep_merge(existing, fields))
-    # Every frame, an unknown model key included (quirk), marks the update
-    # successful and re-arms the poll timer, so entities stay available while
-    # frames flow and the fallback poll waits for a quiet stream.
+    # Every applied frame marks the update successful and re-arms the poll
+    # timer, so entities stay available while frames flow and the fallback
+    # poll waits for a quiet stream.
     run.effects.append(PublishUpdate(mark_success=True))
+    return True
 
 
 def _stamp_sensor_groups(run: _Run, sensor_id: str, fields: Mapping[str, Any]) -> None:
@@ -1100,8 +1144,8 @@ def _apply_rest_batch(run: _Run, batch: RestBatch) -> None:
         case _:  # pragma: no cover - exhaustive
             assert_never(outcome)
 
-    if family == "cameras":
-        _drop_rebuilt_latches(run)
+    if family in _REBUILT_LATCH_STARTS:
+        _drop_rebuilt_latches(run, family)
     elif family == "alarm_hubs":
         _overlay_tamper_records(run, request.at)
     elif family == "sirens":
@@ -1278,26 +1322,25 @@ def _update_collection(
     run.set_family(family, replace(tracking, empty_fetches=0))
 
 
-def _drop_rebuilt_latches(run: _Run) -> None:
+def _drop_rebuilt_latches(run: _Run, family: Family) -> None:
     """
-    Drop camera latches whose start field a REST rebuild removed.
+    Drop camera and light latches whose start field a REST rebuild removed.
 
-    REST camera records never carry ``lastMotionStart`` or ``lastRingStart``
-    (only an event writes them), so after a rebuild a still-armed latch would
-    point at a camera with no start, and five minutes later the sweep would
-    log a false "missed 'end' event?". A camera that vanished outright is left
-    to the sweep. Lights have no such drop (quirk: a light rebuilt by REST
-    gets a ``lastMotionEnd`` from the sweep five minutes later).
+    REST camera and light records never carry ``lastMotionStart`` or
+    ``lastRingStart`` (only an event writes them), so after a rebuild a
+    still-armed latch would point at a device with no start, and five minutes
+    later the sweep would write a false end and log a false "missed 'end'
+    event?". A device that vanished outright is left to the sweep.
     """
-    cameras = run.records("cameras")
-    for kind, start_key in _CAMERA_LATCH_STARTS.items():
+    records = run.records(family)
+    for kind, start_key in _REBUILT_LATCH_STARTS[family].items():
         latch = run.latch(kind)
         kept = {
             device_id: started
             for device_id, started in latch.items()
             if not (
-                isinstance(camera := cameras.get(device_id), dict)
-                and start_key not in camera
+                isinstance(record := records.get(device_id), dict)
+                and start_key not in record
             )
         }
         if len(kept) != len(latch):
@@ -1475,16 +1518,18 @@ def _group_state_agrees(
 # --- latches -------------------------------------------------------------------
 
 
-def _expire_stale_latches(run: _Run) -> None:
+def _expire_stale_latches(run: _Run) -> bool:
     """
     Force-expire motion, smart-detect and ring latches held open too long.
 
     A latch at least `STALE_EVENT_TIMEOUT` old is dropped; if its device is
     still cached with no end, the end is written as the current wall time
     (and a camera's smart detections are cleared). A latch whose device has
-    gone is dropped too.
+    gone is dropped too. Returns True if an end was written, so the caller
+    knows whether listeners have anything new to show.
     """
     now = run.now.wall
+    wrote_end = False
     for kind, (collection, prefix, cleared) in _LATCHES.items():
         end_key = f"{prefix}End"
         latch = run.latch(kind)
@@ -1512,10 +1557,12 @@ def _expire_stale_latches(run: _Run) -> None:
                 if cleared is not None:
                     record[cleared] = []
                 run.put(collection, device_id, record)
+                wrote_end = True
         run.set_latch(
             kind,
             {k: v for k, v in latch.items() if k not in expired},
         )
+    return wrote_end
 
 
 # --- registry clean-up ---------------------------------------------------------

@@ -18,7 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import pytest
 
@@ -1395,48 +1395,152 @@ def test_latch_of_a_vanished_device_is_dropped_silently() -> None:
     assert result.logs() == []
 
 
-def test_reconnect_sweeps_without_notifying_quirk() -> None:
-    """A reconnect expires latches but publishes nothing; the next one shows it."""
+@pytest.mark.parametrize("stream", ["devices", "events"])
+def test_reconnect_sweep_that_ends_a_latch_notifies(
+    stream: Literal["devices", "events"],
+) -> None:
+    """Listeners see the end at once, without re-arming the poll timer."""
     started = run(
         cache(cameras={"c1": _camera()}),
         [(0.0, event("motion", "e1", device="c1", start=1))],
     )
     result = run(
-        started.cache, [(TIMEOUT, StreamReconnected("events"))], state=started.state
+        started.cache, [(TIMEOUT, StreamReconnected(stream))], state=started.state
     )
-    assert result.cache["cameras"]["c1"]["lastMotionEnd"] is not None
+    assert (
+        result.cache["cameras"]["c1"]["lastMotionEnd"] == at(TIMEOUT).wall.isoformat()
+    )
+    assert result.effects(PublishUpdate) == [PublishUpdate(mark_success=False)]
+
+
+@pytest.mark.parametrize(
+    ("seed", "t"),
+    [
+        pytest.param(cache(cameras={"c1": _camera()}), TIMEOUT - 1, id="not-yet-stale"),
+        pytest.param(cache(), TIMEOUT, id="device-gone"),
+    ],
+)
+def test_reconnect_sweep_that_ends_nothing_publishes_nothing(
+    seed: dict[str, Any], t: float
+) -> None:
+    """A running latch, or one of a vanished device, shows nothing new."""
+    started = run(
+        cache(cameras={"c1": _camera()}),
+        [(0.0, event("motion", "e1", device="c1", start=1))],
+    )
+    result = run(seed, [(t, StreamReconnected("events"))], state=started.state)
+    assert result.cache is seed
     assert result.effects(PublishUpdate) == []
 
 
-def test_light_rebuild_gets_a_false_motion_end_quirk() -> None:
-    """Lights have no rebuild drop: five minutes later the sweep ends the latch."""
-    light = {"id": "c1", "name": "Porch"}
+@pytest.mark.parametrize(
+    ("rest_light", "latched", "end"),
+    [
+        pytest.param(
+            {"id": "l1", "name": "Porch"}, False, None, id="rebuilt-without-start"
+        ),
+        pytest.param(
+            {"id": "l1", "name": "Porch", "lastMotionStart": 1},
+            True,
+            at(TIMEOUT).wall.isoformat(),
+            id="rebuilt-with-start",
+        ),
+    ],
+)
+def test_light_rebuild_drops_the_latch_only_without_a_start(
+    rest_light: dict[str, Any],
+    latched: bool,  # noqa: FBT001
+    end: str | None,
+) -> None:
+    """Lights follow the camera rule: no start in REST, no latch to expire."""
     started = run(
-        cache(lights={"c1": light}),
-        [(0.0, event("motion", "e1", device="c1", start=1))],
+        cache(lights={"l1": {"id": "l1", "name": "Porch"}}),
+        [(0.0, event("motion", "e1", device="l1", start=1))],
     )
-    assert started.cache["lights"]["c1"]["lastMotionStart"] == 1
+    assert started.cache["lights"]["l1"]["lastMotionStart"] == 1
     rebuilt = run(
         started.cache,
-        [*poll("lights", Fetched({"c1": light}), 30.0), (TIMEOUT, PollStarted())],
+        poll("lights", Fetched({"l1": rest_light}), 30.0),
         state=started.state,
     )
-    assert (
-        rebuilt.cache["lights"]["c1"]["lastMotionEnd"] == at(TIMEOUT).wall.isoformat()
-    )
-    assert len(rebuilt.logs(logging.INFO)) == 1
+    assert ("l1" in rebuilt.state.latches["light_motion"]) is latched
+    swept = run(rebuilt.cache, [(TIMEOUT, PollStarted())], state=rebuilt.state)
+    assert swept.cache["lights"]["l1"].get("lastMotionEnd") == end
+    assert len(swept.logs(logging.INFO)) == int(latched)
 
 
-def test_latch_sweep_starves_without_a_poll_quirk() -> None:
-    """Frames never sweep: only a poll or a reconnect expires a latch."""
+def test_light_latch_survives_an_absorbed_error() -> None:
+    """The cached light keeps its start, so its latch stays."""
     started = run(
-        cache(cameras={"c1": _camera()}),
+        cache(lights={"l1": {"id": "l1"}}),
+        [(0.0, event("motion", "e1", device="l1", start=1))],
+    )
+    result = run(
+        started.cache,
+        poll("lights", TransientError(BoomError("x")), 1.0),
+        state=started.state,
+    )
+    assert "l1" in result.state.latches["light_motion"]
+
+
+def test_device_frame_sweeps_stale_latches_of_every_device() -> None:
+    """Steady frames that postpone the poll still end a stale latch, anywhere."""
+    started = run(
+        cache(cameras={"c1": _camera(), "c2": _camera(id="c2")}),
         [
             (0.0, event("motion", "e1", device="c1", start=1)),
-            (TIMEOUT * 3, device("camera", "c1", name="still streaming")),
+            (0.0, event("ring", "e2", device="c2", start=1)),
         ],
     )
-    assert started.cache["cameras"]["c1"]["lastMotionEnd"] is None
+    short = run(
+        started.cache,
+        [(TIMEOUT - 1, device("camera", "c2", name="still streaming"))],
+        state=started.state,
+    )
+    assert short.cache["cameras"]["c1"]["lastMotionEnd"] is None
+    assert short.effects(PublishUpdate) == [PublishUpdate(mark_success=True)]
+
+    result = run(
+        short.cache,
+        [(TIMEOUT, device("camera", "c2", name="still streaming"))],
+        state=short.state,
+    )
+    expected_end = at(TIMEOUT).wall.isoformat()
+    assert result.cache["cameras"]["c1"]["lastMotionEnd"] == expected_end
+    assert result.cache["cameras"]["c2"]["lastRingEnd"] == expected_end
+    assert result.cache["cameras"]["c2"]["name"] == "still streaming"
+    assert all(not latch for latch in result.state.latches.values())
+    # The frame's own publish shows the expiry: no second one.
+    assert result.effects(PublishUpdate) == [PublishUpdate(mark_success=True)]
+
+
+def test_device_frame_wins_over_the_sweep_end() -> None:
+    """The sweep runs first, so an end the frame carries is kept."""
+    started = run(
+        cache(cameras={"c1": _camera()}),
+        [(0.0, event("motion", "e1", device="c1", start=1))],
+    )
+    result = run(
+        started.cache,
+        [(TIMEOUT, device("camera", "c1", lastMotionEnd=42))],
+        state=started.state,
+    )
+    assert result.cache["cameras"]["c1"]["lastMotionEnd"] == 42
+
+
+def test_dropped_frame_that_sweeps_notifies_without_marking_success() -> None:
+    """A frame with no target still ends a stale latch, and listeners see it."""
+    started = run(
+        cache(cameras={"c1": _camera()}),
+        [(0.0, event("motion", "e1", device="c1", start=1))],
+    )
+    result = run(
+        started.cache,
+        [(TIMEOUT, device("linkstation", "d1", name="x"))],
+        state=started.state,
+    )
+    assert result.cache["cameras"]["c1"]["lastMotionEnd"] is not None
+    assert result.effects(PublishUpdate) == [PublishUpdate(mark_success=False)]
 
 
 def test_motion_hits_the_camera_before_a_light_with_the_same_id() -> None:
@@ -1569,12 +1673,40 @@ def test_unknown_linkstation_frame_is_dropped() -> None:
     assert "dropping WebSocket linkstation update" in result.logs()[-1]
 
 
-def test_unknown_model_key_still_marks_success_quirk() -> None:
-    """Any frame re-arms the poll timer, even one nothing applies."""
+def test_unknown_model_key_publishes_nothing_and_logs_once() -> None:
+    """A frame nothing applies leaves the poll timer alone; each key logs once."""
     seed = cache()
-    result = run(seed, [(0.0, device("bridge", "b1", name="x"))])
+    result = run(
+        seed,
+        [
+            (0.0, device("bridge", "b1", name="x")),
+            (1.0, device("bridge", "b2", name="y")),
+            (2.0, device("gateway", "g1", name="z")),
+        ],
+    )
     assert result.cache is seed
-    assert result.effects(PublishUpdate) == [PublishUpdate(mark_success=True)]
+    assert result.effects(PublishUpdate) == []
+    prefix = "Protect coordinator: ignoring WebSocket device updates for unknown"
+    assert result.logs() == [
+        f"{prefix} model key bridge",
+        f"{prefix} model key gateway",
+    ]
+    assert result.state.unknown_model_keys == {"bridge", "gateway"}
+
+
+def test_unknown_model_key_frame_that_sweeps_notifies_without_marking_success() -> None:
+    """It still ends a stale latch, which listeners see; the timer is left alone."""
+    started = run(
+        cache(cameras={"c1": _camera()}),
+        [(0.0, event("motion", "e1", device="c1", start=1))],
+    )
+    result = run(
+        started.cache,
+        [(TIMEOUT, device("bridge", "b1", name="x"))],
+        state=started.state,
+    )
+    assert result.cache["cameras"]["c1"]["lastMotionEnd"] is not None
+    assert result.effects(PublishUpdate) == [PublishUpdate(mark_success=False)]
 
 
 def test_frames_share_untouched_collections() -> None:
