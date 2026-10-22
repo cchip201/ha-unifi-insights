@@ -1,10 +1,11 @@
+# Copyright 2026 UniFi Insights contributors
 """UniFi Insights entity base class."""
 
 from __future__ import annotations
 
 import inspect
-import re
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -49,24 +50,27 @@ _MAC_TEXT = re.compile(r"^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$")
 
 def is_ephemeral_client(client_data: dict[str, Any]) -> bool:
     """
-    Return True for a client with a randomized MAC and no name (cmcore fork, backlog 529).
+    Return True for a client with a randomized MAC and no name (cmcore, backlog 529).
 
-    A randomized MAC is locally administered (bit 0x02 of the first octet): a phone's
-    per-network private address or a container's random MAC. Without a name or hostname
-    nothing identifies it, and a new one appears at every rotation or recreate - each would
-    mint a permanent Home Assistant device (19 in 24 h on one network). No per-client
-    entity is created for such a client; site and SSID client counts still include it.
-    A named client keeps its entities whatever its MAC.
+    A randomized MAC is locally administered (bit 0x02 of the first octet): a
+    phone's per-network private address or a container's random MAC. Without a
+    name or hostname nothing identifies it, and a new one appears at every
+    rotation or recreate - each would mint a permanent Home Assistant device (19
+    in 24 h on one network). No per-client entity is created for such a client;
+    site and SSID client counts still include it. A named client keeps its
+    entities whatever its MAC.
     """
-    mac = str(get_field(client_data, "macAddress", "mac_address", "mac", default="") or "")
+    raw_mac = get_field(client_data, "macAddress", "mac_address", "mac", default="")
+    mac = str(raw_mac or "")
     mac = mac.strip().lower()
     try:
         first_octet = int(re.split(r"[:-]", mac)[0][:2], 16)
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         return False
     if not first_octet & 0x02:
         return False
-    name = str(get_field(client_data, "name", "hostname", default="") or "").strip().lower()
+    raw_name = get_field(client_data, "name", "hostname", default="")
+    name = str(raw_name or "").strip().lower()
     if not name:
         return True
     if _MAC_TEXT.match(name):
@@ -149,27 +153,6 @@ def find_site_gateway_device_id(
     return None
 
 
-def site_unique_id_prefix(
-    coordinator_data: dict[str, Any] | None, site_id: str
-) -> str:
-    """
-    Return the unique-id prefix of a site-level entity: `<site>_<gateway>`.
-
-    cmcore (backlog 648, 2026-10-01): every console's default site has the same
-    id, so a site-level sensor keyed `<site>_<key>` was claimed by whichever
-    config entry registered it last - CMCore's WAN usage sensors sat on the
-    offsite console's device, moved back at a restart and away again minutes
-    later. The gateway (the console itself on a UDM) makes the id per console;
-    a site with no gateway keeps the upstream `<site>` prefix.
-    """
-    if not isinstance(coordinator_data, dict) or not isinstance(
-        coordinator_data.get("devices"), dict
-    ):
-        return site_id
-    gateway_id = find_site_gateway_device_id(coordinator_data, site_id)
-    return f"{site_id}_{gateway_id}" if gateway_id else site_id
-
-
 def build_site_device_info(
     coordinator_data: dict[str, Any], site_id: str
 ) -> dict[str, Any]:
@@ -234,6 +217,34 @@ def camera_supports_ptz(camera_data: dict[str, Any]) -> bool:
     feature_flags = get_field(camera_data, "featureFlags", "feature_flags", default={})
     if isinstance(feature_flags, dict):
         return bool(feature_flags.get("hasPtz") or feature_flags.get("has_ptz"))
+
+    return False
+
+
+def camera_supports_speaker(camera_data: Any) -> bool:
+    """Return True if a Protect camera advertises speaker support."""
+    if not isinstance(camera_data, dict):
+        return False
+
+    has_speaker = get_field(camera_data, "hasSpeaker", "has_speaker", default=False)
+    if has_speaker is True:
+        return True
+
+    feature_flags = get_field(camera_data, "featureFlags", "feature_flags", default={})
+    if isinstance(feature_flags, dict):
+        nested_speaker = get_field(
+            feature_flags, "hasSpeaker", "has_speaker", default=False
+        )
+        if nested_speaker is True:
+            return True
+        removable_speaker = get_field(
+            feature_flags,
+            "hasRemovableSpeaker",
+            "has_removable_speaker",
+            default=False,
+        )
+        if removable_speaker is True:
+            return True
 
     return False
 
@@ -319,9 +330,7 @@ class UnifiInsightsEntity(CoordinatorEntity[UnifiFacadeCoordinator]):
 
         # Get port count
         if (ports := device_data.get("port_table", [])) and isinstance(ports, list):
-            port_count = len(ports)
-            if port_count > 0:
-                hw_info.append(f"{port_count} Ports")
+            hw_info.append(f"{len(ports)} Ports")
 
         # Get radio info
         if (radio_table := device_data.get("radio_table", [])) and isinstance(
@@ -509,8 +518,9 @@ class UnifiProtectEntity(CoordinatorEntity[UnifiFacadeCoordinator]):
             }
 
             # Add network connections
-            if mac := network_device.get("macAddress"):
-                device_info["connections"] = {(CONNECTION_NETWORK_MAC, mac)}
+            device_info["connections"] = {
+                (CONNECTION_NETWORK_MAC, network_device.get("macAddress"))
+            }
 
             _LOGGER.debug(
                 "Using network info for %s %s (net %s site %s)",
@@ -616,6 +626,7 @@ __all__ = [
     "UnifiInnerSpaceEntity",
     "UnifiInsightsEntity",
     "UnifiProtectEntity",
+    "camera_supports_speaker",
     "get_field",
     "is_device_online",
 ]

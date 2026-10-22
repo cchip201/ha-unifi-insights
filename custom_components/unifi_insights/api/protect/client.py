@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from http import HTTPStatus
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
-import aiohttp
+if TYPE_CHECKING:
+    import aiohttp
 
 from ..auth import ApiKeyAuth, LocalAuth
-from ..base import BaseUniFiClient, parse_retry_after
+from ..base import BaseUniFiClient
 from ..const import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_TIMEOUT,
@@ -19,9 +19,10 @@ from ..const import (
     ConnectionType,
 )
 from ..exceptions import (
+    UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiRateLimitError,
-    UniFiTimeoutError,
+    UniFiResponseError,
 )
 from .endpoints import (
     AlarmHubsEndpoint,
@@ -30,16 +31,18 @@ from .endpoints import (
     BridgesEndpoint,
     CamerasEndpoint,
     ChimesEndpoint,
-    EventsEndpoint,
     FobsEndpoint,
     LightsEndpoint,
     LinkStationsEndpoint,
     LiveViewsEndpoint,
     NVREndpoint,
+    POSEndpoint,
     RelaysEndpoint,
     SensorsEndpoint,
     SirensEndpoint,
     SpeakersEndpoint,
+    UlpUsersEndpoint,
+    UsersEndpoint,
     ViewersEndpoint,
 )
 from .websocket import ProtectWebSocket
@@ -155,8 +158,8 @@ class UniFiProtectClient(BaseUniFiClient):
         self._lights = LightsEndpoint(self)
         self._chimes = ChimesEndpoint(self)
         self._nvr = NVREndpoint(self)
+        self._pos = POSEndpoint(self)
         self._liveviews = LiveViewsEndpoint(self)
-        self._events = EventsEndpoint(self)
         self._viewers = ViewersEndpoint(self)
         self._application = ApplicationEndpoint(self)
         self._alarm_hubs = AlarmHubsEndpoint(self)
@@ -167,6 +170,8 @@ class UniFiProtectClient(BaseUniFiClient):
         self._sirens = SirensEndpoint(self)
         self._speakers = SpeakersEndpoint(self)
         self._link_stations = LinkStationsEndpoint(self)
+        self._users = UsersEndpoint(self)
+        self._ulp_users = UlpUsersEndpoint(self)
         self._websocket = ProtectWebSocket(self)
 
     @property
@@ -240,11 +245,6 @@ class UniFiProtectClient(BaseUniFiClient):
         return self._liveviews
 
     @property
-    def events(self) -> EventsEndpoint:
-        """Access event management endpoints."""
-        return self._events
-
-    @property
     def viewers(self) -> ViewersEndpoint:
         """Access viewer management endpoints."""
         return self._viewers
@@ -295,6 +295,21 @@ class UniFiProtectClient(BaseUniFiClient):
         return self._link_stations
 
     @property
+    def pos(self) -> POSEndpoint:
+        """Access point of sale (POS) transaction ingestion endpoints."""
+        return self._pos
+
+    @property
+    def users(self) -> UsersEndpoint:
+        """Access user management endpoints."""
+        return self._users
+
+    @property
+    def ulp_users(self) -> UlpUsersEndpoint:
+        """Access UniFi Identity (ULP) user management endpoints."""
+        return self._ulp_users
+
+    @property
     def websocket(self) -> ProtectWebSocket:
         """Access WebSocket subscription manager for real-time updates."""
         return self._websocket
@@ -313,26 +328,8 @@ class UniFiProtectClient(BaseUniFiClient):
             UniFiConnectionError: If connection fails.
 
         """
-        response = await self._get(self.build_api_path("/sites"))
+        response = await self._get(self.build_api_path("/cameras"))
         return response is not None
-
-    async def get_sites(self) -> list[dict[str, Any]]:
-        """
-        Get list of available sites.
-
-        Returns:
-            List of site information dictionaries.
-
-        """
-        response = await self._get(self.build_api_path("/sites"))
-        if response is None:
-            return []
-        data = (
-            response.get("data", response) if isinstance(response, dict) else response
-        )
-        if isinstance(data, list):
-            return data
-        return []
 
     async def get_host_id(self) -> str:
         """
@@ -351,7 +348,7 @@ class UniFiProtectClient(BaseUniFiClient):
             ```python
             # Get host_id for WebSocket subscriptions
             host_id = await client.get_host_id()
-            site_id = "your-site-id"  # Or get from client.get_sites()
+            site_id = "your-site-id"  # From the config entry
 
             async with client.websocket.subscribe_events(host_id, site_id) as events:
                 async for event in events:
@@ -378,75 +375,23 @@ class UniFiProtectClient(BaseUniFiClient):
         Returns:
             Binary response data.
 
-        A 429 is waited out and retried once, like the JSON requests: see
-        `_retry_once_after_rate_limit`.
+        Preserved for backwards compatibility with Protect callers and tests.
+        Delegates to BaseUniFiClient._get_binary_with_content_type and returns
+        binary bytes only.
 
         Raises:
-            UniFiConnectionError: If connection fails, or the request is
-                still rate limited after the retry.
+            UniFiConnectionError: If connection fails or request error occurs.
             UniFiTimeoutError: If request times out.
 
         """
         try:
-            return await self._retry_once_after_rate_limit(
-                lambda: self._get_binary_once(path, params=params),
-                f"GET {path}",
-            )
-        except UniFiRateLimitError as err:
+            data, _ = await self._get_binary_with_content_type(path, params=params)
+            return data
+        except UniFiAuthenticationError as err:
+            msg = f"Failed to fetch binary data: {err.status_code} - {err.message}"
+            raise UniFiConnectionError(msg) from err
+        except (UniFiRateLimitError, UniFiResponseError) as err:
             msg = (
                 f"Failed to fetch binary data: {err.status_code} - {err.response_body}"
             )
             raise UniFiConnectionError(msg) from err
-
-    async def _get_binary_once(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-    ) -> bytes:
-        """
-        Make a single binary GET request.
-
-        Raises:
-            UniFiConnectionError: If connection fails.
-            UniFiRateLimitError: If rate limited.
-            UniFiTimeoutError: If request times out.
-
-        """
-        await self._throttle()
-        session = await self._ensure_session()
-        url = self._build_url(path)
-        headers = self._get_headers()
-        # Remove JSON content type for binary requests
-        headers.pop("Content-Type", None)
-        headers["Accept"] = "*/*"
-
-        try:
-            async with session.get(
-                url,
-                params=params,
-                headers=headers,
-            ) as response:
-                if response.status >= 400:
-                    text = await response.text()
-                    if response.status == HTTPStatus.TOO_MANY_REQUESTS:
-                        # Snapshots share the JSON calls' allowance, so the
-                        # caller's retry defers the whole client.
-                        msg = "Rate limited by API"
-                        raise UniFiRateLimitError(
-                            msg,
-                            status_code=response.status,
-                            response_body=text,
-                            retry_after=parse_retry_after(response.headers),
-                        )
-                    raise UniFiConnectionError(
-                        f"Failed to fetch binary data: {response.status} - {text}"
-                    )
-                return await response.read()
-
-        except aiohttp.ClientConnectorError as err:
-            raise UniFiConnectionError(f"Failed to connect to {url}: {err}") from err
-        except TimeoutError as err:
-            raise UniFiTimeoutError(f"Request to {url} timed out") from err
-        except aiohttp.ClientError as err:
-            raise UniFiConnectionError(f"Request to {url} failed: {err}") from err

@@ -1,10 +1,11 @@
+# Copyright 2026 UniFi Insights contributors
 """Base coordinator for UniFi Insights."""
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from http import HTTPStatus
-import logging
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -13,18 +14,17 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-from custom_components.unifi_insights.const import (
-    CONF_CONNECTION_TYPE,
-    DOMAIN,
-    poll_interval_seconds,
-)
-
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiRateLimitError,
     UniFiResponseError,
     UniFiTimeoutError,
+)
+from custom_components.unifi_insights.const import (
+    CONF_CONNECTION_TYPE,
+    DOMAIN,
+    poll_interval_seconds,
 )
 
 if TYPE_CHECKING:
@@ -64,6 +64,7 @@ class UnifiBaseCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         protect_client: UniFiProtectClient | None,
         entry: ConfigEntry,
         name: str,
+        *,
         update_interval: timedelta,
     ) -> None:
         """Initialize the base coordinator."""
@@ -168,13 +169,13 @@ class UnifiBaseCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             _LOGGER.warning("Server error during update: %s", err)
         else:
-            _LOGGER.exception("API error during update")
+            _LOGGER.error("API error during update", exc_info=err)
         msg = f"API error: {err}"
         raise UpdateFailed(msg) from err
 
     def _handle_generic_error(self, err: Exception) -> None:
         """Handle generic error."""
         self._available = False
-        _LOGGER.exception("Unexpected error updating data")
+        _LOGGER.error("Unexpected error updating data", exc_info=err)
         msg = f"Error updating data: {err}"
         raise UpdateFailed(msg) from err

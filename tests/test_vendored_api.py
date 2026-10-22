@@ -1,13 +1,17 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for the vendored UniFi API package."""
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
-from typing import Any
+from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
+from pydantic import ValidationError
 
 from custom_components.unifi_insights.api import (
     ApiKeyAuth,
@@ -17,6 +21,7 @@ from custom_components.unifi_insights.api import (
 )
 from custom_components.unifi_insights.api import base as api_base
 from custom_components.unifi_insights.api.base import (
+    BaseUniFiClient,
     RequestRateLimiter,
     parse_retry_after,
 )
@@ -27,23 +32,48 @@ from custom_components.unifi_insights.api.const import (
     PROTECT_RATE_LIMIT_WINDOW,
     RATE_LIMIT_MAX_RETRY_AFTER,
     RATE_LIMIT_WINDOW_MARGIN,
+    SENSITIVE_CREDENTIAL_KEYS,
 )
 from custom_components.unifi_insights.api.exceptions import (
+    UniFiAuthenticationError,
     UniFiConnectionError,
+    UniFiGlobalAlarmManagerError,
+    UniFiNotFoundError,
     UniFiRateLimitError,
     UniFiResponseError,
+    UniFiTimeoutError,
+    UniFiUnsupportedError,
     UniFiValidationError,
 )
 from custom_components.unifi_insights.api.network import (
     DEFAULT_SITE_REPORT_ATTRS,
+    FirewallRule,
     PolicyBasedRoute,
     SiteReportBucket,
     UniFiNetworkClient,
     VpnClient,
+    WifiNetwork,
     parse_outlet_metrics,
 )
-from custom_components.unifi_insights.api.protect import UniFiProtectClient
-from tests.fixtures.library_responses import SAMPLE_SITE_REPORT_RESPONSE
+from custom_components.unifi_insights.api.network.models.firewall import (
+    OrderedFirewallPolicyIds,
+)
+from custom_components.unifi_insights.api.protect import (
+    PosLineItem,
+    PosLocation,
+    PosTransactionRequest,
+    PosTransactionType,
+    UlpUserStatus,
+    UniFiProtectClient,
+)
+from custom_components.unifi_insights.api.protect.models import Siren
+from tests.fixtures.library_responses import (
+    SAMPLE_ALARM_HUB,
+    SAMPLE_KEYPAD_FOB,
+    SAMPLE_SIREN,
+    SAMPLE_SITE_REPORT_RESPONSE,
+    SAMPLE_THREAD_LINK_STATION,
+)
 
 
 def _network_client() -> UniFiNetworkClient:
@@ -375,25 +405,10 @@ async def test_sites_get_all_skips_malformed_items() -> None:
     assert result[0].id == "default"
 
 
-async def test_sites_get_returns_site() -> None:
-    """Sites get should return a parsed Site model."""
+def test_sites_has_no_get_method() -> None:
+    """The OpenAPI spec v10.6.106 has no GET /sites/{id} endpoint."""
     client = _network_client()
-    client._get = AsyncMock(return_value={"data": {"id": "site-1", "name": "Default"}})
-
-    result = await client.sites.get("site-1")
-
-    assert result.id == "site-1"
-    assert result.name == "Default"
-    client._get.assert_awaited_once_with(client.build_api_path("/sites/site-1"))
-
-
-async def test_sites_get_missing_raises_value_error() -> None:
-    """Sites get should raise ValueError if site is not found."""
-    client = _network_client()
-    client._get = AsyncMock(return_value=None)
-
-    with pytest.raises(ValueError, match="not found"):
-        await client.sites.get("missing-site")
+    assert not hasattr(client.sites, "get")
 
 
 async def test_get_legacy_site_devices_returns_device_list() -> None:
@@ -873,6 +888,97 @@ async def test_wifi_update_uses_put_with_existing_payload() -> None:
     assert result.enabled is True
 
 
+# The forms a successful PUT with no body reaches the fallback as: the base
+# client returns None for an empty response, and the extractor treats an
+# empty list or a null/empty "data" list as no payload.
+EMPTY_PUT_RESPONSES = [None, [], {"data": []}, {"data": None}]
+
+
+@pytest.mark.parametrize("put_response", EMPTY_PUT_RESPONSES)
+async def test_wifi_update_empty_put_response_fallback(
+    put_response: dict[str, Any] | list[Any] | None,
+) -> None:
+    """With no PUT body, the result is the sent payload with the requested id."""
+    client = _network_client()
+    client._get = AsyncMock(
+        return_value={
+            "data": {
+                "id": "wifi-1",
+                "type": "STANDARD",
+                "name": "Guest WiFi",
+                "enabled": False,
+                "metadata": {"origin": "USER_DEFINED"},
+            }
+        }
+    )
+    client._put = AsyncMock(return_value=put_response)
+    client._patch = AsyncMock()
+
+    result = await client.wifi.update("site-1", "wifi-1", enabled=True)
+
+    assert isinstance(result, WifiNetwork)
+    assert result.id == "wifi-1"
+    assert result.enabled is True
+    client._put.assert_awaited_once_with(
+        "/proxy/network/integration/v1/sites/site-1/wifi/broadcasts/wifi-1",
+        json_data={"type": "STANDARD", "name": "Guest WiFi", "enabled": True},
+    )
+    client._patch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("put_response", EMPTY_PUT_RESPONSES)
+async def test_firewall_update_rule_empty_put_response_fallback(
+    put_response: dict[str, Any] | list[Any] | None,
+) -> None:
+    """With no PUT body, the result is the sent payload with the requested id."""
+    client = _network_client()
+    path = "/proxy/network/integration/v1/sites/site-1/firewall/policies/rule-1"
+    client._get = AsyncMock(
+        return_value={
+            "data": {
+                "id": "rule-1",
+                "name": "Drop Rule",
+                "action": "drop",
+                "enabled": True,
+                "index": 3,
+                "metadata": {"origin": "USER_DEFINED"},
+            }
+        }
+    )
+    client._put = AsyncMock(return_value=put_response)
+    client._patch = AsyncMock()
+
+    result = await client.firewall.update_rule("site-1", "rule-1", enabled=False)
+
+    assert isinstance(result, FirewallRule)
+    assert result.id == "rule-1"
+    assert result.enabled is False
+    assert result.name == "Drop Rule"
+    client._get.assert_awaited_once_with(path)
+    client._put.assert_awaited_once_with(
+        path, json_data={"name": "Drop Rule", "action": "drop", "enabled": False}
+    )
+    client._patch.assert_not_awaited()
+
+
+async def test_firewall_update_rule_returns_put_response() -> None:
+    """When the PUT returns the rule, that is what update_rule returns."""
+    client = _network_client()
+    client._get = AsyncMock(
+        return_value={"id": "rule-1", "name": "Drop Rule", "enabled": True}
+    )
+    client._put = AsyncMock(
+        return_value={
+            "data": {"id": "rule-1", "name": "Drop Rule", "enabled": False, "index": 7}
+        }
+    )
+
+    result = await client.firewall.update_rule("site-1", "rule-1", enabled=False)
+
+    assert result.enabled is False
+    assert result.index == 7
+
+
 async def test_clients_get_all_paginates_automatically() -> None:
     """Test that get_all fetches all pages when total exceeds page size."""
     client = UniFiNetworkClient(
@@ -1245,12 +1351,39 @@ async def test_alarm_hubs_get_all_wrapped_and_unwrapped() -> None:
     assert len(wrapped) == 1
     assert wrapped[0].id == "hub-1"
     assert wrapped[0].is_alarm_hub is True
-    client._get.assert_awaited_once_with(client.build_api_path("/alarm-hubs"))
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/alarm-hubs"), expected_unsupported=False
+    )
 
     client._get = AsyncMock(return_value=[{"id": "hub-2", "modelKey": "linkStation"}])
     unwrapped = await client.alarm_hubs.get_all()
     assert len(unwrapped) == 1
     assert unwrapped[0].id == "hub-2"
+
+
+async def test_spec_shaped_protect_7_3_70_devices_are_not_dropped() -> None:
+    """Spec-shaped 7.3.70 fobs, link stations and alarm hubs all parse.
+
+    `get_all` skips any item that fails validation, so a model type that
+    disagrees with the spec (buttonLabels is a string, lastEvent a number)
+    silently hides every real device of that family.
+    """
+    client = _protect_client()
+
+    client._get = AsyncMock(return_value={"data": [SAMPLE_KEYPAD_FOB]})
+    fobs = await client.fobs.get_all()
+    assert [fob.id for fob in fobs] == ["fob_1"]
+    assert client.fobs.last_result_complete is True
+
+    client._get = AsyncMock(return_value=[SAMPLE_THREAD_LINK_STATION])
+    stations = await client.link_stations.get_all()
+    assert [station.id for station in stations] == ["link_station_thread"]
+    assert client.link_stations.last_result_complete is True
+
+    client._get = AsyncMock(return_value=[SAMPLE_ALARM_HUB])
+    hubs = await client.alarm_hubs.get_all()
+    assert [hub.id for hub in hubs] == ["alarm_hub_1"]
+    assert client.alarm_hubs.last_result_complete is True
 
 
 async def test_alarm_hubs_trigger_output_posts_expected_payload() -> None:
@@ -1287,6 +1420,241 @@ async def test_arm_profiles_get_all_and_enable() -> None:
     )
 
 
+_GLOBAL_ALARM_MANAGER_BODY = (
+    '{"name":"BAD_REQUEST","error":"This operation is not available when '
+    'global alarm manager is enabled"}'
+)
+
+
+@pytest.mark.parametrize("action", ["enable", "disable"])
+async def test_arm_profiles_enable_and_disable_send_no_body(action: str) -> None:
+    """The spec's enable and disable requests carry no body (204 response)."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value=None)
+
+    assert await getattr(client.arm_profiles, action)() is True
+
+    client._post.assert_awaited_once_with(
+        client.build_api_path(f"/arm-profiles/{action}"), json_data=None
+    )
+
+
+@pytest.mark.parametrize("action", ["enable", "disable"])
+async def test_arm_profiles_global_alarm_manager_400_raises_specific_error(
+    action: str,
+) -> None:
+    """Protect's "global alarm manager is enabled" 400 gets its own type.
+
+    It stays a UniFiResponseError, so existing handlers keep working, and it
+    keeps the status and the body.
+    """
+    client = _protect_client()
+    original = UniFiResponseError(
+        "API error (status 400)", 400, response_body=_GLOBAL_ALARM_MANAGER_BODY
+    )
+    client._post = AsyncMock(side_effect=original)
+
+    with pytest.raises(UniFiGlobalAlarmManagerError) as err:
+        await getattr(client.arm_profiles, action)()
+
+    assert isinstance(err.value, UniFiResponseError)
+    assert err.value.status_code == 400
+    assert err.value.response_body == _GLOBAL_ALARM_MANAGER_BODY
+    assert err.value.__cause__ is original
+
+
+@pytest.mark.parametrize("action", ["enable", "disable"])
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (400, '{"name":"BAD_REQUEST","error":"something else is wrong"}'),
+        (400, None),
+        (500, _GLOBAL_ALARM_MANAGER_BODY),
+    ],
+    ids=["other-400", "400-without-body", "500-with-the-marker"],
+)
+async def test_arm_profiles_other_errors_are_reraised_unchanged(
+    action: str, status: int, body: str | None
+) -> None:
+    """Only the 400 naming the global alarm manager is translated."""
+    client = _protect_client()
+    original = UniFiResponseError("boom", status, response_body=body)
+    client._post = AsyncMock(side_effect=original)
+
+    with pytest.raises(UniFiResponseError) as err:
+        await getattr(client.arm_profiles, action)()
+
+    assert err.value is original
+
+
+async def test_arm_profiles_get_all_gam_400_raises_specific_error() -> None:
+    """Listing the arm profiles is refused the same way while the manager is on.
+
+    That makes the read-only listing a way to tell that it is enabled.
+    """
+    client = _protect_client()
+    original = UniFiResponseError(
+        "API error (status 400)", 400, response_body=_GLOBAL_ALARM_MANAGER_BODY
+    )
+    client._get = AsyncMock(side_effect=original)
+
+    with pytest.raises(UniFiGlobalAlarmManagerError) as err:
+        await client.arm_profiles.get_all()
+
+    assert isinstance(err.value, UniFiResponseError)
+    assert err.value.status_code == 400
+    assert err.value.response_body == _GLOBAL_ALARM_MANAGER_BODY
+    assert err.value.__cause__ is original
+    client._get.assert_awaited_once_with(client.build_api_path("/arm-profiles"))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type"),
+    [
+        (
+            UniFiResponseError(
+                "x", 400, response_body='{"error":"something else is wrong"}'
+            ),
+            UniFiResponseError,
+        ),
+        (UniFiResponseError("x", 400), UniFiResponseError),
+        (
+            UniFiResponseError("x", 500, response_body=_GLOBAL_ALARM_MANAGER_BODY),
+            UniFiResponseError,
+        ),
+        (UniFiNotFoundError("Not Found", 404), UniFiNotFoundError),
+    ],
+    ids=["other-400", "400-without-body", "500-with-the-marker", "404"],
+)
+async def test_arm_profiles_get_all_other_errors_are_reraised_unchanged(
+    error: UniFiResponseError, expected_type: type[UniFiResponseError]
+) -> None:
+    """Only the 400 naming the global alarm manager is translated."""
+    client = _protect_client()
+    client._get = AsyncMock(side_effect=error)
+
+    with pytest.raises(expected_type) as err:
+        await client.arm_profiles.get_all()
+
+    assert err.value is error
+    assert type(err.value) is expected_type
+
+
+_ARM_PROFILE_CALLS = {
+    "get_all": ("_get", lambda endpoint: endpoint.get_all()),
+    "enable": ("_post", lambda endpoint: endpoint.enable()),
+    "disable": ("_post", lambda endpoint: endpoint.disable()),
+}
+
+
+@pytest.mark.parametrize("call", list(_ARM_PROFILE_CALLS))
+@pytest.mark.parametrize(
+    "body",
+    [
+        _GLOBAL_ALARM_MANAGER_BODY,
+        # The message nested deeper, as a REMOTE (cloud connector) answer may carry it.
+        (
+            '{"error":{"code":"BAD_REQUEST","details":[{"message":"Not available '
+            'when Global Alarm Manager is enabled"}]}}'
+        ),
+        (
+            '{"code":"HTTP_400","message":"Bad Request","error":{"statusCode":400,'
+            '"message":"This operation is not available when global alarm manager '
+            'is enabled"}}'
+        ),
+        # A JSON document carried as a string inside another one.
+        '{"message":"{\\"error\\":\\"global alarm manager is enabled\\"}"}',
+        '"{\\"error\\":\\"global alarm manager is enabled\\"}"',
+        # The same words written another way.
+        '{"error":"GLOBAL_ALARM_MANAGER_ENABLED"}',
+        '{"error":"global-alarm-manager is enabled"}',
+        '{"error":"global  alarm\\nmanager is enabled"}',
+        '{"error":"global\\u0020alarm\\u0020manager is enabled"}',
+        # Not JSON at all.
+        "<html><body>Global Alarm Manager is enabled</body></html>",
+    ],
+    ids=[
+        "live",
+        "nested-details",
+        "connector-style-envelope",
+        "json-in-a-string-value",
+        "json-string-document",
+        "upper-snake-case",
+        "kebab-case",
+        "extra-whitespace",
+        "unicode-escaped-spaces",
+        "html",
+    ],
+)
+async def test_arm_profiles_global_alarm_manager_is_found_anywhere_in_the_body(
+    call: str, body: str
+) -> None:
+    """The whole response text is searched, whatever its shape or wording.
+
+    A REMOTE entry goes through the cloud connector, and the client hands its
+    response text through unchanged, so the message can be nested or reworded.
+    """
+    method, invoke = _ARM_PROFILE_CALLS[call]
+    client = _protect_client()
+    setattr(
+        client,
+        method,
+        AsyncMock(side_effect=UniFiResponseError("x", 400, response_body=body)),
+    )
+
+    with pytest.raises(UniFiGlobalAlarmManagerError):
+        await invoke(client.arm_profiles)
+
+
+@pytest.mark.parametrize("call", list(_ARM_PROFILE_CALLS))
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":{"message":"The armed profile cannot be changed"}}',
+        '{"error":"global alarm"}',
+        '{"error":"alarm manager"}',
+        "[1, 2, 3]",
+        "null",
+        "not json",
+        "",
+    ],
+    ids=[
+        "other-message",
+        "half-the-phrase",
+        "other-half",
+        "json-array",
+        "json-null",
+        "not-json",
+        "empty",
+    ],
+)
+async def test_arm_profiles_other_400_bodies_are_not_the_global_alarm_manager(
+    call: str, body: str
+) -> None:
+    """A 400 that does not name the global alarm manager stays a plain error."""
+    method, invoke = _ARM_PROFILE_CALLS[call]
+    client = _protect_client()
+    original = UniFiResponseError("x", 400, response_body=body)
+    setattr(client, method, AsyncMock(side_effect=original))
+
+    with pytest.raises(UniFiResponseError) as err:
+        await invoke(client.arm_profiles)
+
+    assert err.value is original
+
+
+async def test_arm_profiles_404_is_reraised_unchanged() -> None:
+    """A missing endpoint stays a UniFiNotFoundError."""
+    client = _protect_client()
+    original = UniFiNotFoundError("Not Found", 404)
+    client._post = AsyncMock(side_effect=original)
+
+    with pytest.raises(UniFiNotFoundError) as err:
+        await client.arm_profiles.enable()
+
+    assert err.value is original
+
+
 async def test_relays_activate_output_posts_expected_path() -> None:
     """Relay activate_output should POST to the outputs activate path."""
     client = _protect_client()
@@ -1307,12 +1675,95 @@ async def test_sirens_play_and_speakers_test_sound() -> None:
     client._post = AsyncMock(return_value=None)
 
     assert await client.sirens.play("siren-1") is True
-    client._post.assert_awaited_with(client.build_api_path("/sirens/siren-1/play"))
+    client._post.assert_awaited_with(
+        client.build_api_path("/sirens/siren-1/play"), json_data=None
+    )
 
     assert await client.speakers.test_sound("spk-1") is True
     client._post.assert_awaited_with(
         client.build_api_path("/speakers/spk-1/test-sound")
     )
+
+
+async def test_sirens_play_sends_duration_body_in_seconds() -> None:
+    """The spec play body is {"duration": <seconds>}, not milliseconds."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value=None)
+
+    assert await client.sirens.play("siren-1", duration=10) is True
+
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sirens/siren-1/play"), json_data={"duration": 10}
+    )
+
+
+async def test_sirens_play_rejects_unsupported_duration() -> None:
+    """A duration the spec does not list is refused before any request."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value=None)
+
+    with pytest.raises(ValueError, match="duration must be one of"):
+        await client.sirens.play("siren-1", duration=7)
+
+    client._post.assert_not_awaited()
+
+
+async def test_sirens_play_duration_is_seconds_not_milliseconds() -> None:
+    """The play request takes seconds (spec sirenDurationSeconds), not status ms."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value=None)
+
+    with pytest.raises(ValueError, match="duration must be one of"):
+        await client.sirens.play("siren-1", duration=5000)
+
+    client._post.assert_not_awaited()
+
+
+async def test_sirens_set_volume_patches_volume() -> None:
+    """set_volume PATCHes only {"volume": n} and returns the parsed siren."""
+    client = _protect_client()
+    client._patch = AsyncMock(return_value=copy.deepcopy(SAMPLE_SIREN))
+
+    siren = await client.sirens.set_volume("siren-1", 50)
+
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/sirens/siren-1"), json_data={"volume": 50}
+    )
+    assert siren.volume == 50
+
+
+@pytest.mark.parametrize("volume", [0, 101])
+async def test_sirens_set_volume_rejects_out_of_range(volume: int) -> None:
+    """The spec range is 1..100; 0 and 101 never reach the API."""
+    client = _protect_client()
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        await client.sirens.set_volume("siren-1", volume)
+
+    client._patch.assert_not_awaited()
+
+
+async def test_sirens_stop_sends_no_body() -> None:
+    """The spec's stop request has no body, so nothing may be sent with it."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value=None)
+
+    assert await client.sirens.stop("siren-1") is True
+
+    client._post.assert_awaited_once_with(client.build_api_path("/sirens/siren-1/stop"))
+
+
+def test_siren_model_parses_live_capture() -> None:
+    """The live UP-Siren-PoE capture parses with its nested status intact."""
+    siren = Siren.model_validate(SAMPLE_SIREN)
+
+    assert isinstance(siren.siren_status, dict)
+    assert siren.siren_status["isActive"] is False
+    assert siren.volume == 50
+    dumped = siren.model_dump(by_alias=True)
+    assert dumped["sirenStatus"] == SAMPLE_SIREN["sirenStatus"]
+    assert dumped["connectionType"] == "ucp4"
 
 
 async def test_bridges_get_all_uses_base_endpoint() -> None:
@@ -1326,7 +1777,9 @@ async def test_bridges_get_all_uses_base_endpoint() -> None:
 
     assert result[0].id == "bridge-1"
     assert result[0].max_clients == 4
-    client._get.assert_awaited_once_with(client.build_api_path("/bridges"))
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/bridges"), expected_unsupported=False
+    )
 
 
 async def test_link_stations_get_returns_model() -> None:
@@ -1340,6 +1793,354 @@ async def test_link_stations_get_returns_model() -> None:
 
     assert result.id == "ls-1"
     client._get.assert_awaited_once_with(client.build_api_path("/link-stations/ls-1"))
+
+
+@pytest.mark.parametrize("site_id", [None, "synthetic-site"])
+async def test_chime_play_is_unsupported_without_any_io(site_id: str | None) -> None:
+    """The compatibility stub fails before path construction or transport."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value=None)
+    client._session = MagicMock()
+    with (
+        patch.object(client, "build_api_path") as build_path,
+        pytest.raises(UniFiUnsupportedError, match="does not support chime playback"),
+    ):
+        await client.chimes.play("chime-1", site_id=site_id)
+    build_path.assert_not_called()
+    client._post.assert_not_called()
+    assert client._session.mock_calls == []
+
+
+async def test_chimes_set_volume_sends_only_spec_fields() -> None:
+    """Volume goes in each ringSettings entry; the PATCH has no top-level volume."""
+    client = _protect_client()
+    chime = {
+        "id": "chime-1",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "cameraIds": ["doorbell-1", "doorbell-2"],
+        "ringSettings": [
+            {
+                "cameraId": "doorbell-1",
+                "repeatTimes": 2,
+                "ringtoneId": "tone-a",
+                "volume": 40,
+            },
+            {
+                "cameraId": "doorbell-2",
+                "repeatTimes": 1,
+                "ringtoneId": "tone-b",
+                "volume": 90,
+                "notInSpec": True,
+            },
+        ],
+    }
+    client._get = AsyncMock(return_value=chime)
+    client._patch = AsyncMock(return_value={**chime, "ringSettings": []})
+    calls = MagicMock()
+    calls.attach_mock(client._get, "get")
+    calls.attach_mock(client._patch, "patch")
+
+    result = await client.chimes.set_volume("chime-1", 75)
+
+    path = client.build_api_path("/chimes/chime-1")
+    assert [name for name, _, _ in calls.mock_calls] == ["get", "patch"]
+    client._get.assert_awaited_once_with(path)
+    client._patch.assert_awaited_once_with(
+        path,
+        json_data={
+            "ringSettings": [
+                {
+                    "cameraId": "doorbell-1",
+                    "repeatTimes": 2,
+                    "ringtoneId": "tone-a",
+                    "volume": 75,
+                },
+                {
+                    "cameraId": "doorbell-2",
+                    "repeatTimes": 1,
+                    "ringtoneId": "tone-b",
+                    "volume": 75,
+                },
+            ]
+        },
+    )
+    assert result.id == "chime-1"
+
+
+@pytest.mark.parametrize("ring_settings", [[], None])
+async def test_chime_set_volume_without_paired_doorbell_raises(
+    ring_settings: list[Any] | None,
+) -> None:
+    """With no ring settings there is nothing to set, so nothing is sent."""
+    client = _protect_client()
+    chime: dict[str, Any] = {"id": "chime-1", "mac": "AA:BB:CC:DD:EE:FF"}
+    if ring_settings is not None:
+        chime["ringSettings"] = ring_settings
+    client._get = AsyncMock(return_value={"data": chime})
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="no paired doorbell"):
+        await client.chimes.set_volume("chime-1", 50)
+
+    client._patch.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "ring_settings",
+    [
+        ["not-a-dict"],
+        [{"cameraId": "doorbell-1", "repeatTimes": 1, "volume": 40}],
+        {"cameraId": "doorbell-1"},
+    ],
+)
+async def test_chime_set_volume_with_incomplete_ring_settings_raises(
+    ring_settings: Any,
+) -> None:
+    """An entry without a required field fails before the PATCH, not at the API."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        return_value={
+            "id": "chime-1",
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "ringSettings": ring_settings,
+        }
+    )
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="incomplete ring settings"):
+        await client.chimes.set_volume("chime-1", 50)
+
+    client._patch.assert_not_awaited()
+
+
+async def test_chime_set_volume_get_failure_sends_nothing() -> None:
+    """A failed GET propagates, and no PATCH is sent."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        side_effect=UniFiNotFoundError("Chime not found", status_code=404)
+    )
+    client._patch = AsyncMock()
+
+    with pytest.raises(UniFiNotFoundError):
+        await client.chimes.set_volume("chime-1", 50)
+
+    client._patch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("volume", [0, 100])
+async def test_chime_set_volume_accepts_range_limits(volume: int) -> None:
+    """0 (silent) and 100 are both valid chime volumes."""
+    client = _protect_client()
+    ring = {"cameraId": "doorbell-1", "repeatTimes": 1, "ringtoneId": "tone-a"}
+    chime = {"id": "chime-1", "mac": "AA:BB:CC:DD:EE:FF", "ringSettings": [ring]}
+    client._get = AsyncMock(return_value=chime)
+    client._patch = AsyncMock(return_value=chime)
+
+    await client.chimes.set_volume("chime-1", volume)
+
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/chimes/chime-1"),
+        json_data={"ringSettings": [{**ring, "volume": volume}]},
+    )
+
+
+@pytest.mark.parametrize("volume", [-1, 101])
+async def test_chime_set_volume_rejects_out_of_range(volume: int) -> None:
+    """An out-of-range volume fails before any request."""
+    client = _protect_client()
+    client._get = AsyncMock()
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        await client.chimes.set_volume("chime-1", volume)
+
+    client._get.assert_not_awaited()
+    client._patch.assert_not_awaited()
+
+
+async def test_chime_set_repeat_times_patches_ring_settings_only() -> None:
+    """The repeat count goes in each ringSettings entry, not at the top level."""
+    client = _protect_client()
+    ring = {
+        "cameraId": "doorbell-1",
+        "repeatTimes": 1,
+        "ringtoneId": "tone-a",
+        "volume": 40,
+    }
+    chime = {"id": "chime-1", "mac": "AA:BB:CC:DD:EE:FF", "ringSettings": [ring]}
+    client._get = AsyncMock(return_value=chime)
+    client._patch = AsyncMock(return_value=chime)
+
+    await client.chimes.set_repeat_times("chime-1", 4)
+
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/chimes/chime-1"),
+        json_data={"ringSettings": [{**ring, "repeatTimes": 4}]},
+    )
+
+
+async def test_chime_set_repeat_times_needs_volume_in_each_entry() -> None:
+    """Changing the repeat count keeps volume, so an entry without one fails."""
+    client = _protect_client()
+    ring = {"cameraId": "doorbell-1", "repeatTimes": 1, "ringtoneId": "tone-a"}
+    client._get = AsyncMock(
+        return_value={"id": "chime-1", "mac": "AA:BB", "ringSettings": [ring]}
+    )
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="incomplete ring settings"):
+        await client.chimes.set_repeat_times("chime-1", 4)
+
+    client._patch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("repeat_times", [0, 11])
+async def test_chime_set_repeat_times_rejects_out_of_range(repeat_times: int) -> None:
+    """The spec range for repeatTimes is 1-10; outside it nothing is sent."""
+    client = _protect_client()
+    client._get = AsyncMock()
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        await client.chimes.set_repeat_times("chime-1", repeat_times)
+
+    client._get.assert_not_awaited()
+    client._patch.assert_not_awaited()
+
+
+async def test_chime_set_ringtone_preserves_settings_and_strips_unknown_fields() -> (
+    None
+):
+    """Ringtone PATCH contains only the four required fields for each doorbell."""
+    client = _protect_client()
+    settings = [
+        {
+            "cameraId": "doorbell-a",
+            "volume": 0,
+            "repeatTimes": 2,
+            "ringtoneId": "tone-a",
+            "unsupported": "drop",
+        },
+        {
+            "cameraId": "doorbell-b",
+            "volume": 100,
+            "repeatTimes": 10,
+            "ringtoneId": "tone-b",
+        },
+    ]
+    original = copy.deepcopy(settings)
+    chime = {"id": "chime-1", "mac": "AA:BB:CC:DD:EE:FF", "ringSettings": settings}
+    client._get = AsyncMock(return_value=chime)
+    client._patch = AsyncMock(return_value=chime)
+
+    await client.chimes.set_ringtone("chime-1", "  tone-new  ")
+
+    path = client.build_api_path("/chimes/chime-1")
+    client._get.assert_awaited_once_with(path)
+    client._patch.assert_awaited_once_with(
+        path,
+        json_data={
+            "ringSettings": [
+                {
+                    "cameraId": "doorbell-a",
+                    "volume": 0,
+                    "repeatTimes": 2,
+                    "ringtoneId": "tone-new",
+                },
+                {
+                    "cameraId": "doorbell-b",
+                    "volume": 100,
+                    "repeatTimes": 10,
+                    "ringtoneId": "tone-new",
+                },
+            ]
+        },
+    )
+    assert settings == original
+
+
+@pytest.mark.parametrize("ringtone_id", ["", "  ", None, 123, False, b"tone"])
+async def test_chime_set_ringtone_rejects_invalid_id(ringtone_id: Any) -> None:
+    """Invalid IDs are rejected before even fetching the chime."""
+    client = _protect_client()
+    client._get = AsyncMock()
+    client._patch = AsyncMock()
+    with pytest.raises(ValueError, match="Ringtone ID must be a non-empty string"):
+        await client.chimes.set_ringtone("chime-1", ringtone_id)
+    client._get.assert_not_awaited()
+    client._patch.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        [],
+        {},
+        "bad",
+        [None],
+        [{}],
+        [{"cameraId": "doorbell-a", "volume": 50}],
+        [{"repeatTimes": 2, "volume": 50}],
+        [{"cameraId": "doorbell-a", "repeatTimes": 2}],
+    ],
+)
+async def test_chime_set_ringtone_rejects_invalid_settings(settings: Any) -> None:
+    """Missing or incomplete per-doorbell data never produces a partial PATCH."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        return_value={
+            "id": "chime-1",
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "ringSettings": settings,
+        }
+    )
+    client._patch = AsyncMock()
+    with pytest.raises(
+        ValueError, match=r"no paired doorbell|incomplete ring settings"
+    ):
+        await client.chimes.set_ringtone("chime-1", "tone-new")
+    client._patch.assert_not_awaited()
+
+
+async def test_chime_set_ringtone_get_failure_sends_no_patch() -> None:
+    """A failed read cannot invent preserved settings."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        side_effect=UniFiResponseError("Unavailable", status_code=503)
+    )
+    client._patch = AsyncMock()
+    with pytest.raises(UniFiResponseError):
+        await client.chimes.set_ringtone("chime-1", "tone-new")
+    client._patch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("volume", [1, 100])
+async def test_camera_set_microphone_volume_sends_mic_volume(volume: int) -> None:
+    """The spec range for the camera PATCH micVolume is 1-100."""
+    client = _protect_client()
+    client._patch = AsyncMock(
+        return_value={"id": "cam-1", "mac": "AA:BB:CC:DD:EE:FF", "micVolume": volume}
+    )
+
+    result = await client.cameras.set_microphone_volume("cam-1", volume)
+
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/cameras/cam-1"), json_data={"micVolume": volume}
+    )
+    assert result.mic_volume == volume
+
+
+@pytest.mark.parametrize("volume", [0, 101])
+async def test_camera_set_microphone_volume_rejects_out_of_range(volume: int) -> None:
+    """0 is below the spec minimum, so it fails before any request."""
+    client = _protect_client()
+    client._patch = AsyncMock()
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        await client.cameras.set_microphone_volume("cam-1", volume)
+
+    client._patch.assert_not_awaited()
 
 
 async def test_devices_get_all_skips_malformed_items() -> None:
@@ -1381,6 +2182,65 @@ async def test_devices_get_pending_adoption_skips_malformed_items() -> None:
     assert result[0].id == "pend-1"
 
 
+async def test_device_restart_posts_documented_action() -> None:
+    """restart() must use the spec's actions endpoint, not /restart."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=None)
+
+    assert await client.devices.restart("site-1", "dev-1") is True
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/devices/dev-1/actions"),
+        json_data={"action": "RESTART"},
+    )
+
+
+async def test_device_execute_action_rejects_undocumented_action() -> None:
+    """Only actions the spec defines may be sent."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=None)
+
+    with pytest.raises(ValueError, match="RESTART"):
+        await client.devices.execute_action("site-1", "dev-1", "locate")
+    client._post.assert_not_called()
+
+
+async def test_device_power_cycle_port_posts_documented_action() -> None:
+    """power_cycle_port() must use the spec's port actions endpoint."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=None)
+
+    assert await client.devices.power_cycle_port("site-1", "dev-1", 3) is True
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/devices/dev-1/interfaces/ports/3/actions"),
+        json_data={"action": "POWER_CYCLE"},
+    )
+
+
+async def test_device_execute_port_action_pins_verb_path_body() -> None:
+    """execute_port_action must post {action: POWER_CYCLE} to the port actions path."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=None)
+
+    assert (
+        await client.devices.execute_port_action("site-1", "dev-1", 5, "POWER_CYCLE")
+        is True
+    )
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/devices/dev-1/interfaces/ports/5/actions"),
+        json_data={"action": "POWER_CYCLE"},
+    )
+
+
+async def test_device_execute_port_action_rejects_undocumented_action() -> None:
+    """Only port actions the spec defines may be sent."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=None)
+
+    with pytest.raises(ValueError, match="POWER_CYCLE"):
+        await client.devices.execute_port_action("site-1", "dev-1", 3, "RESTART")
+    client._post.assert_not_called()
+
+
 def _make_response(
     *,
     status: int = 200,
@@ -1404,6 +2264,404 @@ def _make_response(
     else:
         response.json = AsyncMock(return_value={})
     return response
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{"password": "plain"}', '{"password": "**REDACTED**"}'),
+        ('{"password": "my:secret:pw"}', '{"password": "**REDACTED**"}'),
+        ('{"token":"abc:def"}', '{"token":"**REDACTED**"}'),
+        ('{"psk" : "a:b"}', '{"psk" : "**REDACTED**"}'),
+        ('{"passphrase": "ab\\"cd:ef"}', '{"passphrase": "**REDACTED**"}'),
+        (
+            '{"apiKey": "x:y", "name": "Home:1"}',
+            '{"apiKey": "**REDACTED**", "name": "Home:1"}',
+        ),
+        ('{"name": "a:b"}', '{"name": "a:b"}'),
+    ],
+)
+def test_redact_replaces_whole_sensitive_value(text: str, expected: str) -> None:
+    """Colons or escaped quotes inside a secret must not leave part of it."""
+    assert json.loads(api_base._redact(text)) == json.loads(expected)
+
+
+async def test_handle_response_debug_body_redacts_secret_with_colons(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The DEBUG response body must not leak the start of a colon-containing secret."""
+    client = _network_client()
+    response = _make_response(
+        status=200,
+        text='{"data": [{"name": "Home", "passphrase": "LEAK-a:LEAK-b:tail"}]}',
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await client._handle_response(response)
+
+    assert "**REDACTED**" in caplog.text
+    assert "LEAK-" not in caplog.text
+    assert "tail" not in caplog.text
+
+
+NEW_CREDENTIAL_KEYS: Final[list[str]] = [
+    "x_passphrase",
+    "x_authkey",
+    "x_fingerprint",
+    "x_iapp_key",
+    "x_ssh_hostkey_fingerprint",
+    "x_vwirekey",
+    "accessToken",
+    "access_token",
+    "refreshToken",
+    "refresh_token",
+    "qr_code",
+]
+
+
+def test_new_credential_keys_guard() -> None:
+    """Guard against accidentally omitting expected credential keys from shared set."""
+    expected_new_keys = set(NEW_CREDENTIAL_KEYS)
+    assert expected_new_keys.issubset(SENSITIVE_CREDENTIAL_KEYS)
+    assert {k.lower() for k in expected_new_keys}.issubset(api_base._SENSITIVE_KEYS)
+
+
+@pytest.mark.parametrize("key", NEW_CREDENTIAL_KEYS)
+def test_redact_new_credential_keys_in_nested_json(key: str) -> None:
+    """New credential keys in nested JSON are redacted while other keys stay visible."""
+    dummy_val = "dummy-credential-12345"
+    payload = {"data": [{"name": "Home", key: dummy_val}]}
+    redacted = api_base._redact(json.dumps(payload))
+    assert dummy_val not in redacted
+    assert "**REDACTED**" in redacted
+    data = json.loads(redacted)
+    assert data["data"][0]["name"] == "Home"
+    assert data["data"][0][key] == "**REDACTED**"
+
+
+@pytest.mark.parametrize(
+    ("key", "val"),
+    [
+        ("x_passphrase", 987654321),
+        ("accessToken", {"nested_token": "dummy_nested_data"}),
+    ],
+)
+def test_redact_new_credential_non_string_json_values(key: str, val: Any) -> None:
+    """Numeric and object JSON credential values are replaced with **REDACTED**."""
+    payload = {"data": [{"name": "Home", key: val}]}
+    redacted = api_base._redact(json.dumps(payload))
+    assert str(val) not in redacted
+    assert "**REDACTED**" in redacted
+    data = json.loads(redacted)
+    assert data["data"][0]["name"] == "Home"
+    assert data["data"][0][key] == "**REDACTED**"
+
+
+@pytest.mark.parametrize("key", NEW_CREDENTIAL_KEYS)
+@pytest.mark.parametrize("casing", ["exact", "upper", "mixed"])
+def test_redact_fallback_regex_html_and_truncated(key: str, casing: str) -> None:
+    """Non-JSON fallback redacts secrets with exact, upper, and mixed casing."""
+    cased_key = (
+        key.upper()
+        if casing == "upper"
+        else (key.swapcase() if casing == "mixed" else key)
+    )
+    dummy_val = "fallback-dummy-value"
+    # HTML wrapper case
+    html_text = (
+        f"<html><head><title>Login</title></head>"
+        f'<body>"{cased_key}": "{dummy_val}"</body></html>'
+    )
+    redacted_html = api_base._redact(html_text)
+    assert dummy_val not in redacted_html
+    assert "**REDACTED**" in redacted_html
+    assert f'"{cased_key}": "**REDACTED**"' in redacted_html
+
+    # Truncated non-JSON excerpt case (broken JSON syntax)
+    truncated_text = f'{{"data": [{{"name": "Home", "{cased_key}": "{dummy_val}"'
+    redacted_truncated = api_base._redact(truncated_text)
+    assert dummy_val not in redacted_truncated
+    assert "**REDACTED**" in redacted_truncated
+    assert f'"{cased_key}": "**REDACTED**"' in redacted_truncated
+
+    # Truncated non-JSON excerpt case without closing quote on value
+    unterminated_text = f'{{"data": [{{"name": "Home", "{cased_key}": "{dummy_val}'
+    redacted_unterminated = api_base._redact(unterminated_text)
+    assert dummy_val not in redacted_unterminated
+    assert "**REDACTED**" in redacted_unterminated
+    assert f'"{cased_key}": "**REDACTED**"' in redacted_unterminated
+    assert '"name": "Home"' in redacted_unterminated
+
+
+@pytest.mark.parametrize("key", sorted(api_base._SENSITIVE_KEYS))
+def test_redact_sync_both_json_and_fallback_for_all_transport_keys(key: str) -> None:
+    """Every combined transport key must be redacted on both JSON and fallback paths."""
+    dummy_val = "sync-dummy-payload"
+    # JSON path
+    json_text = json.dumps({key: dummy_val, "item_name": "Device"})
+    json_redacted = api_base._redact(json_text)
+    assert dummy_val not in json_redacted
+    assert "**REDACTED**" in json_redacted
+    parsed = json.loads(json_redacted)
+    assert parsed[key] == "**REDACTED**"
+    assert parsed["item_name"] == "Device"
+
+    # Non-JSON fallback regex path
+    fallback_text = f'<html>"{key}": "{dummy_val}"</html>'
+    fallback_redacted = api_base._redact(fallback_text)
+    assert dummy_val not in fallback_redacted
+    assert "**REDACTED**" in fallback_redacted
+    assert f'"{key}": "**REDACTED**"' in fallback_redacted
+
+
+@pytest.mark.parametrize("ident_key", ["ip", "host", "ssid", "id", "name"])
+def test_redact_transport_scope_keeps_identifiers_visible(ident_key: str) -> None:
+    """Network and entity identifiers must remain visible in transport logs."""
+    ident_val = f"sample-{ident_key}-value"
+    # JSON path
+    payload = {ident_key: ident_val, "status": "active"}
+    json_text = json.dumps(payload)
+    assert api_base._redact(json_text) == json_text
+
+    # Fallback non-JSON path
+    non_json_text = f'<html>"{ident_key}": "{ident_val}"</html>'
+    assert api_base._redact(non_json_text) == non_json_text
+
+
+@pytest.mark.parametrize("key", ["x_passphrase", "password", "token"])
+def test_redact_fallback_unterminated_and_edge_cases(key: str) -> None:
+    """Non-JSON fallback redacts secrets with unclosed, escaped, and trailing inputs."""
+    # 1. Trailing dangling backslash
+    payload_dangling = (
+        f'<html><div id="device-header">Device</div>"{key}": "secret-val\\'
+    )
+    redacted_dangling = api_base._redact(payload_dangling)
+    assert "secret-val" not in redacted_dangling
+    assert "**REDACTED**" in redacted_dangling
+    assert 'id="device-header"' in redacted_dangling
+
+    # 2. Escaped quotes in unterminated secret
+    payload_escaped = (
+        f'<html><div id="device-header">Device</div>"{key}": "sec\\"ret-part'
+    )
+    redacted_escaped = api_base._redact(payload_escaped)
+    assert "sec\\" not in redacted_escaped
+    assert "ret-part" not in redacted_escaped
+    assert "**REDACTED**" in redacted_escaped
+    assert 'id="device-header"' in redacted_escaped
+
+    # 3. Literal newline in unterminated secret
+    payload_nl = f'<html><div id="device-header">Device</div>"{key}": "secret\nnewline'
+    redacted_nl = api_base._redact(payload_nl)
+    assert "secret" not in redacted_nl
+    assert "newline" not in redacted_nl
+    assert "**REDACTED**" in redacted_nl
+    assert 'id="device-header"' in redacted_nl
+
+    # 4. Escaped newline in unterminated secret
+    payload_esc_nl = (
+        f'<html><div id="device-header">Device</div>"{key}": "secret\\\nnewline'
+    )
+    redacted_esc_nl = api_base._redact(payload_esc_nl)
+    assert "secret" not in redacted_esc_nl
+    assert "newline" not in redacted_esc_nl
+    assert "**REDACTED**" in redacted_esc_nl
+    assert 'id="device-header"' in redacted_esc_nl
+
+    # 5. Mixed-case and nested prefix
+    swap_key = key.swapcase()
+    payload_nested = (
+        f'{{"settings": {{"nested_prefix": "keep", "{swap_key}": "secret-swap'
+    )
+    redacted_nested = api_base._redact(payload_nested)
+    assert "secret-swap" not in redacted_nested
+    assert "**REDACTED**" in redacted_nested
+    assert '"nested_prefix": "keep"' in redacted_nested
+
+    # 6. Proper closed value followed by normal fields
+    payload_closed = (
+        f'{{"{key}": "secret-closed\\"quote", "device_name": "UDM-Pro", "port": 443}}'
+    )
+    wrapped_closed = f"<html><body>{payload_closed}</body></html>"
+    redacted_closed = api_base._redact(wrapped_closed)
+    assert "secret-closed" not in redacted_closed
+    assert "**REDACTED**" in redacted_closed
+    assert '"device_name": "UDM-Pro"' in redacted_closed
+    assert '"port": 443' in redacted_closed
+
+
+@pytest.mark.parametrize(
+    "key",
+    sorted(api_base._SENSITIVE_KEYS),
+)
+@pytest.mark.parametrize(
+    "val_repr",
+    [
+        "1234",
+        "-1234",
+        "-12.34",
+        "1.2e3",
+        "true",
+        "false",
+        "null",
+        "[1234, 5678]",
+        '{"nested": 1234}',
+        "unquoted_token",
+    ],
+)
+@pytest.mark.parametrize("casing", ["exact", "upper", "mixed"])
+def test_redact_fallback_non_string_all_transport_keys(
+    key: str,
+    val_repr: str,
+    casing: str,
+) -> None:
+    """Non-JSON fallback fails closed on non-string credential values."""
+    cased_key = (
+        key.upper()
+        if casing == "upper"
+        else (key.title() if casing == "mixed" else key)
+    )
+    raw_payload = f'<html>"{cased_key}": {val_repr}</html>'
+    redacted = api_base._redact(raw_payload)
+    assert redacted == api_base._REDACTED_MALFORMED_BODY
+    assert val_repr not in redacted
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"data": [{"pin": ',
+        '{"data": [{"pin":',
+        '{"data": [{"x_passphrase": 987654321',
+        '{"data": [{"pin_code": [123, 456',
+        '<html>"password": "quoted-secret", "pin": 1234</html>',
+        '<html>"pin": "**REDACTED**"1234</html>',
+        '<html>"pin": "unclosed, "password": "secret"</html>',
+        "<html>'pin': 1234</html>",
+        r"<html>\"pin\": 1234</html>",
+        r'<html>"\\u0070in": 1234</html>',
+        r'<html>"\u0070in": 1234</html>',
+        r'<html>"\\u0050IN": 1234</html>',
+        r"<html>\"\\u0070in\": 1234</html>",
+    ],
+)
+def test_redact_fallback_adversarial_malformed_credentials_fail_closed(
+    payload: str,
+) -> None:
+    """Malformed, escaped, and collision payloads fail closed."""
+    redacted = api_base._redact(payload)
+    assert redacted == api_base._REDACTED_MALFORMED_BODY
+    assert "1234" not in redacted
+    assert "quoted-secret" not in redacted
+    assert "987654321" not in redacted
+
+
+def test_redact_fallback_normal_html_preserved() -> None:
+    """Non-credential text like HTTP status codes remain visible."""
+    html = "<!doctype html><html><body>Status code: 500</body></html>"
+    assert api_base._redact(html) == html
+
+
+def test_redact_json_non_string_values_handled() -> None:
+    """Valid JSON with non-string credentials redacts in place."""
+    payload = {"pin": 1234, "token": True, "secret": None, "port": 443}
+    redacted = json.loads(api_base._redact(json.dumps(payload)))
+    for sensitive_key in ("pin", "token", "secret"):
+        assert redacted[sensitive_key] == "**REDACTED**"
+    assert redacted["port"] == 443
+
+
+async def test_handle_response_malformed_numeric_pin_omitted_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Numeric PIN in malformed response is omitted across all log sinks."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    raw_body = '<html>"pin": 1234</html>'
+    path = "/proxy/network/integration/v1/sites"
+
+    # 1. Default WARNING and DEBUG path
+    response = _make_response(
+        status=200,
+        text=raw_body,
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        method="GET",
+        path=path,
+    )
+    with caplog.at_level(logging.DEBUG), pytest.raises(UniFiResponseError) as exc_info:
+        await client._handle_response(response)
+
+    assert exc_info.value.status_code == 200
+    assert exc_info.value.response_body == raw_body
+    assert "1234" not in caplog.text
+    assert api_base._REDACTED_MALFORMED_BODY in caplog.text
+
+    caplog.clear()
+
+    # 2. expected_unsupported=True path (DEBUG only)
+    response_unsupported = _make_response(
+        status=200,
+        text=raw_body,
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        method="GET",
+        path=path,
+    )
+    with caplog.at_level(logging.DEBUG), pytest.raises(UniFiResponseError) as exc_info2:
+        await client._handle_response(
+            response_unsupported,
+            expected_unsupported=True,
+            request_path=path,
+        )
+
+    assert exc_info2.value.status_code == 200
+    assert exc_info2.value.response_body == raw_body
+    assert "1234" not in caplog.text
+    assert api_base._REDACTED_MALFORMED_BODY in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    caplog.clear()
+
+    # 3. log_body=False path
+    response_no_body = _make_response(
+        status=200,
+        text=raw_body,
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        method="GET",
+        path=path,
+    )
+    with caplog.at_level(logging.DEBUG), pytest.raises(UniFiResponseError) as exc_info3:
+        await client._handle_response(
+            response_no_body,
+            log_body=False,
+        )
+
+    assert exc_info3.value.status_code == 200
+    assert exc_info3.value.response_body == raw_body
+    assert "1234" not in caplog.text
+    assert "<body omitted," in caplog.text
+    assert api_base._REDACTED_MALFORMED_BODY not in caplog.text
+
+
+def test_adversarial_backslash_and_no_match_payloads() -> None:
+    """Preserve safe payloads and omit credentials after long backslash runs."""
+    # Backslash run with no match
+    for size in (2000, 4000, 8000):
+        payload = "\\" * size + '{"normal": "data"}'
+        redacted = api_base._redact(payload)
+        assert redacted == payload
+
+    # Backslash run followed by numeric PIN credential
+    for size in (2000, 4000, 8000):
+        payload = "\\" * size + '{"pin": 1234}'
+        redacted = api_base._redact(payload)
+        assert redacted == api_base._REDACTED_MALFORMED_BODY
+
+    # Unmatched closing quotes and trailing whitespace
+    payload_unmatched = '{"pin": 1234' + " " * 1000
+    assert api_base._redact(payload_unmatched) == api_base._REDACTED_MALFORMED_BODY
 
 
 async def test_handle_response_2xx_non_json_raises() -> None:
@@ -1503,6 +2761,55 @@ async def test_handle_response_non_json_warning_omits_query_string(
     assert "SUPER-SECRET" not in message
     assert "apiKey" not in message
     assert path in message
+
+
+async def test_handle_response_unterminated_credential_redacted_in_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unterminated credentials in malformed responses are redacted in logs."""
+    client = UniFiNetworkClient(
+        auth=ApiKeyAuth(api_key="test-key"),
+        base_url="https://192.168.1.1",
+        connection_type=ConnectionType.LOCAL,
+    )
+    dummy_val = "fallback-unterminated-payload"
+    path = "/proxy/network/v2/api/site/default/trafficroutes"
+    response_body = f'{{"x_passphrase": "{dummy_val}'
+    response = _make_response(
+        status=200,
+        text=response_body,
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        method="GET",
+        path=path,
+    )
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(UniFiResponseError) as exc_info:
+        await client._handle_response(response)
+
+    assert exc_info.value.status_code == 200
+    assert exc_info.value.response_body == response_body
+
+    # Check DEBUG sink
+    debug_records = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    ]
+    debug_body_msg = next(
+        msg for msg in debug_records if "Response status: 200, body:" in msg
+    )
+    assert dummy_val not in debug_body_msg
+    assert '"x_passphrase": "**REDACTED**"' in debug_body_msg
+
+    # Check WARNING sink (architecture analysis non-JSON 2xx warning path)
+    warning_records = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    warning_body_msg = next(
+        msg for msg in warning_records if "Response is not JSON" in msg
+    )
+    assert dummy_val not in warning_body_msg
+    assert '"x_passphrase": "**REDACTED**"' in warning_body_msg
+    assert "GET" in warning_body_msg
+    assert path in warning_body_msg
 
 
 async def test_handle_response_expected_unsupported_logs_debug_without_warning(
@@ -1648,6 +2955,54 @@ async def test_probe_listing_expected_unsupported_log_level(
     assert exc.value.status_code == 200
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     if case == "opted-in":
+        assert warnings == []
+    else:
+        assert warnings == [f"Response is not JSON for GET {path}: {_UNIFI_OS_HTML}"]
+
+
+@pytest.mark.parametrize(
+    ("family", "resource"),
+    [
+        ("fobs", "fobs"),
+        ("link_stations", "link-stations"),
+        ("alarm_hubs", "alarm-hubs"),
+    ],
+)
+@pytest.mark.parametrize("opted_in", [True, False])
+async def test_security_family_listing_expected_unsupported_log_level(
+    caplog: pytest.LogCaptureFixture,
+    family: str,
+    resource: str,
+    *,
+    opted_in: bool,
+) -> None:
+    """The Protect 7.3.70 family listings can opt into DEBUG for an HTML page.
+
+    The coordinator opts in until a family first answers, so an older Protect
+    that serves its web page instead of a 404 does not warn every poll.
+    """
+    client = _protect_client()
+    path = f"/proxy/protect/integration/v1/{resource}"
+    response = _make_response(
+        status=200,
+        text=_UNIFI_OS_HTML,
+        json_side_effect=aiohttp.ContentTypeError(MagicMock(), MagicMock()),
+        path=path,
+    )
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=response)
+    context.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.request = MagicMock(return_value=context)
+    client._ensure_session = AsyncMock(return_value=session)
+    client._throttle = AsyncMock()
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(UniFiResponseError) as exc:
+        await getattr(client, family).get_all(expected_unsupported=opted_in)
+
+    assert exc.value.status_code == 200
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    if opted_in:
         assert warnings == []
     else:
         assert warnings == [f"Response is not JSON for GET {path}: {_UNIFI_OS_HTML}"]
@@ -2214,9 +3569,7 @@ async def test_cameras_get_all_reports_complete_once_items_parse_again() -> None
     assert client.cameras.last_result_complete is True
 
 
-async def test_protect_device_endpoint_get_all_reports_incomplete_when_item_skipped() -> (
-    None
-):
+async def test_protect_device_get_all_reports_skipped_items() -> None:
     """The shared Protect endpoint base should flag incomplete results too."""
     client = _protect_client()
     client._get = AsyncMock(
@@ -2234,9 +3587,7 @@ async def test_protect_device_endpoint_get_all_reports_incomplete_when_item_skip
     assert client.alarm_hubs.last_result_complete is False
 
 
-async def test_cameras_get_all_reports_complete_for_response_with_nothing_to_parse() -> (
-    None
-):
+async def test_cameras_get_all_reports_complete_for_empty_response() -> None:
     """Camera get_all should not let an empty response inherit a stale verdict.
 
     The flag distinguishes "no cameras there" from "every camera failed to
@@ -2365,6 +3716,7 @@ def _response_context(
     response = MagicMock()
     response.status = status
     response.headers = headers
+    response.content_type = headers.get("Content-Type")
     response.text = AsyncMock(
         return_value="Too many requests" if status == 429 else "response body"
     )
@@ -2572,6 +3924,83 @@ async def test_binary_request_is_throttled(fake_clock: _FakeClock) -> None:
 
     assert await client._get_binary("/cameras/abc/snapshot") == b"jpeg"
     assert fake_clock.sleeps == [pytest.approx(1.0)]
+
+
+async def test_protect_client_get_binary_auth_error_raises_connection_error() -> None:
+    """UniFiProtectClient._get_binary wraps auth error in UniFiConnectionError."""
+    client = _protect_client()
+    client._session = _binary_session(401, {})
+    with pytest.raises(UniFiConnectionError) as exc:
+        await client._get_binary("/cameras/abc/snapshot")
+    assert isinstance(exc.value.__cause__, UniFiAuthenticationError)
+    assert "401" in str(exc.value)
+
+    client._session = _binary_session(403, {})
+    with pytest.raises(UniFiConnectionError) as exc403:
+        await client._get_binary("/cameras/abc/snapshot")
+    assert isinstance(exc403.value.__cause__, UniFiAuthenticationError)
+    assert "403" in str(exc403.value)
+
+
+async def test_base_client_get_binary_success() -> None:
+    """The base binary GET returns the data and the content type."""
+    client = _protect_client()
+    session = _binary_session(200, {"Content-Type": "image/png"})
+    client._session = session
+
+    data, content_type = await BaseUniFiClient._get_binary_with_content_type(
+        client, "/test/path"
+    )
+    assert data == b"jpeg"
+    assert content_type == "image/png"
+
+
+async def test_base_client_get_binary_404_raises_not_found() -> None:
+    """The base binary GET raises UniFiNotFoundError on 404."""
+    client = _protect_client()
+    client._session = _binary_session(404, {})
+    with pytest.raises(UniFiNotFoundError) as exc:
+        await BaseUniFiClient._get_binary_with_content_type(client, "/missing")
+    assert exc.value.status_code == 404
+
+
+async def test_base_client_get_binary_auth_errors() -> None:
+    """The base binary GET raises UniFiAuthenticationError on 401/403."""
+    client = _protect_client()
+    client._session = _binary_session(401, {})
+    with pytest.raises(UniFiAuthenticationError) as exc:
+        await BaseUniFiClient._get_binary_with_content_type(client, "/unauthorized")
+    assert exc.value.status_code == 401
+
+    client._session = _binary_session(403, {})
+    with pytest.raises(UniFiAuthenticationError) as exc2:
+        await BaseUniFiClient._get_binary_with_content_type(client, "/forbidden")
+    assert exc2.value.status_code == 403
+
+
+async def test_base_client_get_binary_500_raises_response_error() -> None:
+    """The base binary GET raises UniFiResponseError on 500."""
+    client = _protect_client()
+    client._session = _binary_session(500, {})
+    with pytest.raises(UniFiResponseError) as exc:
+        await BaseUniFiClient._get_binary_with_content_type(client, "/server-error")
+    assert exc.value.status_code == 500
+
+
+async def test_base_client_get_binary_network_errors() -> None:
+    """The base binary GET converts network and timeout errors."""
+    client = _protect_client()
+    session = MagicMock()
+    session.closed = False
+
+    session.get = MagicMock(side_effect=TimeoutError("timeout"))
+    client._session = session
+    with pytest.raises(UniFiTimeoutError):
+        await BaseUniFiClient._get_binary_with_content_type(client, "/timeout")
+
+    session.get = MagicMock(side_effect=aiohttp.ClientError("network failure"))
+    with pytest.raises(UniFiConnectionError):
+        await BaseUniFiClient._get_binary_with_content_type(client, "/net-err")
 
 
 class TestUniFiInnerSpaceClient:
@@ -2804,8 +4233,10 @@ async def test_site_report_bucket_and_endpoint_local_and_remote() -> None:
         "POST",
         "/proxy/network/api/s/default/stat/report/daily.site",
         json_data={"start": 1, "end": 2},
+        body_factory=None,
         params=None,
         expected_unsupported=True,
+        log_body=True,
     )
 
     # meta.rc == "error" raises UniFiResponseError
@@ -2828,4 +4259,1054 @@ async def test_site_report_bucket_and_endpoint_local_and_remote() -> None:
             "monthly",
             start_ms=1000,
             end_ms=2000,
+        )
+
+
+def test_devices_has_no_locate_method() -> None:
+    """The OpenAPI spec v10.6.106 has no /locate endpoint."""
+    client = _network_client()
+    assert not hasattr(client.devices, "locate")
+
+
+async def test_devices_adopt_posts_to_spec_endpoint() -> None:
+    """adopt() must post to /sites/{siteId}/devices with macAddress
+    and ignoreDeviceLimit.
+    """
+    client = _network_client()
+    client._post = AsyncMock(return_value={"data": {"macAddress": "00:11:22:33:44:55"}})
+
+    assert await client.devices.adopt("site-1", "00:11:22:33:44:55") is True
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/devices"),
+        json_data={"macAddress": "00:11:22:33:44:55", "ignoreDeviceLimit": False},
+    )
+
+    client._post.reset_mock()
+    assert (
+        await client.devices.adopt(
+            "site-1", "00:11:22:33:44:55", ignore_device_limit=True
+        )
+        is True
+    )
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/devices"),
+        json_data={"macAddress": "00:11:22:33:44:55", "ignoreDeviceLimit": True},
+    )
+
+
+async def test_traffic_get_dpi_categories_unscoped_and_paged() -> None:
+    """get_dpi_categories() is unscoped (/v1/dpi/categories) and accepts paging."""
+    client = _network_client()
+    client._get = AsyncMock(return_value={"data": [{"id": 3, "name": "Streaming"}]})
+
+    result = await client.traffic.get_dpi_categories(
+        offset=10, limit=50, filter_str="name.eq('Streaming')"
+    )
+    assert len(result) == 1
+    assert result[0].id == 3
+    assert result[0].name == "Streaming"
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/dpi/categories"),
+        params={"offset": 10, "limit": 50, "filter": "name.eq('Streaming')"},
+    )
+
+
+async def test_traffic_get_dpi_applications_unscoped_and_paged() -> None:
+    """get_dpi_applications() is unscoped (/v1/dpi/applications) and accepts paging."""
+    client = _network_client()
+    client._get = AsyncMock(return_value={"data": [{"id": 786435, "name": "YouTube"}]})
+
+    result = await client.traffic.get_dpi_applications(offset=0, limit=25)
+    assert len(result) == 1
+    assert result[0].id == 786435
+    assert result[0].name == "YouTube"
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/dpi/applications"),
+        params={"offset": 0, "limit": 25},
+    )
+
+
+async def test_traffic_get_countries_unscoped_and_paged() -> None:
+    """get_countries() is unscoped (/v1/countries) and accepts paging."""
+    client = _network_client()
+    client._get = AsyncMock(
+        return_value={"data": [{"code": "US", "name": "United States"}]}
+    )
+
+    result = await client.traffic.get_countries()
+    assert len(result) == 1
+    assert result[0].code == "US"
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/countries"),
+        params=None,
+    )
+
+
+async def test_firewall_get_policy_ordering() -> None:
+    """get_policy_ordering() queries ordering endpoint with zone ids."""
+    client = _network_client()
+    client._get = AsyncMock(
+        return_value={
+            "data": {
+                "orderedFirewallPolicyIds": {
+                    "beforeSystemDefined": ["p-before"],
+                    "afterSystemDefined": ["p-after"],
+                }
+            }
+        }
+    )
+
+    ordering = await client.firewall.get_policy_ordering(
+        "site-1",
+        source_firewall_zone_id="zone-src",
+        destination_firewall_zone_id="zone-dst",
+    )
+    assert ordering.ordered_firewall_policy_ids.before_system_defined == ["p-before"]
+    assert ordering.ordered_firewall_policy_ids.after_system_defined == ["p-after"]
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/firewall/policies/ordering"),
+        params={
+            "sourceFirewallZoneId": "zone-src",
+            "destinationFirewallZoneId": "zone-dst",
+        },
+    )
+
+
+async def test_firewall_update_policy_ordering() -> None:
+    """update_policy_ordering() puts ordered IDs to ordering endpoint."""
+    client = _network_client()
+    client._put = AsyncMock(
+        return_value={
+            "data": {
+                "orderedFirewallPolicyIds": {
+                    "beforeSystemDefined": ["p1"],
+                    "afterSystemDefined": ["p2"],
+                }
+            }
+        }
+    )
+
+    ordering = await client.firewall.update_policy_ordering(
+        "site-1",
+        source_firewall_zone_id="zone-src",
+        destination_firewall_zone_id="zone-dst",
+        ordered_firewall_policy_ids={
+            "beforeSystemDefined": ["p1"],
+            "afterSystemDefined": ["p2"],
+        },
+    )
+    assert ordering.ordered_firewall_policy_ids.before_system_defined == ["p1"]
+    assert ordering.ordered_firewall_policy_ids.after_system_defined == ["p2"]
+    client._put.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/firewall/policies/ordering"),
+        json_data={
+            "orderedFirewallPolicyIds": {
+                "beforeSystemDefined": ["p1"],
+                "afterSystemDefined": ["p2"],
+            }
+        },
+        params={
+            "sourceFirewallZoneId": "zone-src",
+            "destinationFirewallZoneId": "zone-dst",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "ordered",
+    [
+        {"before_system_defined": ["p1"], "after_system_defined": ["p2"]},
+        {
+            "orderedFirewallPolicyIds": {
+                "beforeSystemDefined": ["p1"],
+                "afterSystemDefined": ["p2"],
+            }
+        },
+        {"beforeSystemDefined": ["p1"], "afterSystemDefined": ["p2"], "x": 1},
+        "model",
+    ],
+    ids=["snake_case", "wrapped", "extra_key", "model"],
+)
+async def test_firewall_update_policy_ordering_sends_only_spec_keys(
+    ordered: object,
+) -> None:
+    """Every accepted input form is validated and sent with the spec's keys."""
+    if ordered == "model":
+        ordered = OrderedFirewallPolicyIds.model_validate(
+            {"before_system_defined": ["p1"], "after_system_defined": ["p2"]}
+        )
+    client = _network_client()
+    client._put = AsyncMock(return_value={"data": {"orderedFirewallPolicyIds": {}}})
+
+    await client.firewall.update_policy_ordering(
+        "site-1",
+        source_firewall_zone_id="zone-src",
+        destination_firewall_zone_id="zone-dst",
+        ordered_firewall_policy_ids=ordered,  # type: ignore[arg-type]
+    )
+
+    assert client._put.await_args.kwargs["json_data"] == {
+        "orderedFirewallPolicyIds": {
+            "beforeSystemDefined": ["p1"],
+            "afterSystemDefined": ["p2"],
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "ordered",
+    [
+        {"beforeSystemDefined": ["p1"]},
+        {"after_system_defined": ["p2"]},
+        {"orderedFirewallPolicyIds": {"beforeSystemDefined": ["p1"]}},
+    ],
+    ids=["before_only", "after_only_snake_case", "wrapped_before_only"],
+)
+async def test_firewall_update_policy_ordering_rejects_partial_dict(
+    ordered: dict[str, Any],
+) -> None:
+    """A dict missing one list is rejected instead of PUTting it as empty."""
+    client = _network_client()
+    client._put = AsyncMock()
+
+    with pytest.raises(ValueError, match="afterSystemDefined"):
+        await client.firewall.update_policy_ordering(
+            "site-1",
+            source_firewall_zone_id="zone-src",
+            destination_firewall_zone_id="zone-dst",
+            ordered_firewall_policy_ids=ordered,
+        )
+
+    client._put.assert_not_awaited()
+
+
+async def test_resources_get_vpn_tunnels_path() -> None:
+    """get_vpn_tunnels() uses the spec path /vpn/site-to-site-tunnels."""
+    client = _network_client()
+    client._get = AsyncMock(
+        return_value={
+            "data": [
+                {
+                    "id": "tun-1",
+                    "name": "Site A",
+                    "type": "IPSEC",
+                    "metadata": {"origin": "USER_DEFINED"},
+                }
+            ]
+        }
+    )
+
+    tunnels = await client.resources.get_vpn_tunnels("site-1", offset=0, limit=25)
+    assert len(tunnels) == 1
+    assert tunnels[0].id == "tun-1"
+    assert tunnels[0].name == "Site A"
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/vpn/site-to-site-tunnels"),
+        params={"offset": 0, "limit": 25},
+    )
+
+
+async def test_networks_update_uses_put() -> None:
+    """networks.update() uses PUT for full object replacement."""
+    client = _network_client()
+    client._put = AsyncMock(
+        return_value={
+            "data": {
+                "id": "net-1",
+                "name": "Updated Network",
+                "enabled": True,
+                "management": "GATEWAY",
+                "vlanId": 10,
+            }
+        }
+    )
+
+    result = await client.networks.update(
+        "site-1",
+        "net-1",
+        name="Updated Network",
+        enabled=True,
+        management="GATEWAY",
+        vlanId=10,
+    )
+    assert result.id == "net-1"
+    assert result.name == "Updated Network"
+    client._put.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/networks/net-1"),
+        json_data={
+            "name": "Updated Network",
+            "enabled": True,
+            "management": "GATEWAY",
+            "vlanId": 10,
+        },
+    )
+
+
+async def test_firewall_patch_rule() -> None:
+    """firewall.patch_rule() patches only loggingEnabled, per the spec."""
+    client = _network_client()
+    client._patch = AsyncMock(
+        return_value={
+            "data": {
+                "id": "rule-1",
+                "name": "Drop Bad Traffic",
+                "action": "DROP",
+                "loggingEnabled": True,
+            }
+        }
+    )
+
+    result = await client.firewall.patch_rule("site-1", "rule-1", logging_enabled=True)
+    assert result.id == "rule-1"
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/firewall/policies/rule-1"),
+        json_data={"loggingEnabled": True},
+    )
+    # Unknown keyword is passed through a typed bag so the static signature stays
+    # honest; the runtime call still has to bind it and fails with TypeError.
+    unexpected: dict[str, Any] = {"name": "Renamed"}
+    with pytest.raises(TypeError):
+        await client.firewall.patch_rule(
+            "site-1", "rule-1", logging_enabled=True, **unexpected
+        )
+    client._patch.assert_awaited_once()
+
+
+async def test_vouchers_delete_by_filter() -> None:
+    """delete_by_filter() deletes vouchers matching a filter expression."""
+    client = _network_client()
+    client._delete = AsyncMock(return_value={"vouchersDeleted": 4})
+
+    deleted = await client.vouchers.delete_by_filter("site-1", "note.eq('Guest')")
+    assert deleted == 4
+    client._delete.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/hotspot/vouchers"),
+        params={"filter": "note.eq('Guest')"},
+        log_body=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param({"vouchers": [{"id": "v-1", "code": "12345-67890"}]}, id="spec"),
+        pytest.param(
+            {"data": {"vouchers": [{"id": "v-1", "code": "12345-67890"}]}},
+            id="data-wrapped",
+        ),
+    ],
+)
+async def test_vouchers_create_reads_the_spec_creation_result(
+    response: dict[str, Any],
+) -> None:
+    """create() unwraps the spec's {"vouchers": [...]} creation result."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=response)
+
+    vouchers = await client.vouchers.create(
+        "site-1", name="Home Assistant", time_limit_minutes=480
+    )
+
+    assert [v.id for v in vouchers] == ["v-1"]
+
+
+async def test_vouchers_create_pins_required_name_and_duration() -> None:
+    """create() pins that name and timeLimitMinutes are sent in the body."""
+    client = _network_client()
+    client._post = AsyncMock(
+        return_value={
+            "data": [
+                {
+                    "id": "v-1",
+                    "code": "12345-67890",
+                    "name": "Guest Voucher",
+                    "timeLimitMinutes": 120,
+                }
+            ]
+        }
+    )
+
+    vouchers = await client.vouchers.create(
+        "site-1",
+        name="Guest Voucher",
+        time_limit_minutes=120,
+    )
+    assert len(vouchers) == 1
+    assert vouchers[0].id == "v-1"
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/sites/site-1/hotspot/vouchers"),
+        json_data={
+            "count": 1,
+            "name": "Guest Voucher",
+            "timeLimitMinutes": 120,
+        },
+        log_body=False,
+    )
+
+
+async def test_protect_users_get_all_and_get() -> None:
+    """Users endpoint should query /users and parse User models."""
+    client = _protect_client()
+    user_payload = {
+        "id": "user-1",
+        "name": "Jane Doe",
+        "firstName": "Jane",
+        "lastName": "Doe",
+        "email": "jane@example.com",
+        "ucoreUserId": "ucore-1",
+        "modelKey": "user",
+    }
+    client._get = AsyncMock(return_value=[user_payload])
+
+    users = await client.users.get_all()
+    assert len(users) == 1
+    assert users[0].id == "user-1"
+    assert users[0].name == "Jane Doe"
+    assert users[0].first_name == "Jane"
+    assert users[0].last_name == "Doe"
+    assert users[0].email == "jane@example.com"
+    assert users[0].ucore_user_id == "ucore-1"
+    assert users[0].display_name == "Jane Doe"
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/users"), expected_unsupported=False
+    )
+
+    # get single user
+    client._get = AsyncMock(return_value={"data": user_payload})
+    user = await client.users.get("user-1")
+    assert user.id == "user-1"
+    client._get.assert_awaited_once_with(client.build_api_path("/users/user-1"))
+
+    # get single user not found
+    client._get = AsyncMock(return_value=None)
+    with pytest.raises(ValueError, match="User user-1 not found"):
+        await client.users.get("user-1")
+
+
+async def test_protect_users_get_all_skips_malformed_and_handles_none() -> None:
+    """Users endpoint should skip malformed items and handle empty response."""
+    client = _protect_client()
+    client._get = AsyncMock(return_value=None)
+    assert await client.users.get_all() == []
+
+    client._get = AsyncMock(return_value="not a list")
+    assert await client.users.get_all() == []
+
+    client._get = AsyncMock(
+        return_value=[
+            {"id": "user-1", "name": "Valid User"},
+            {"id": "bad-user"},  # missing required name
+        ]
+    )
+    users = await client.users.get_all()
+    assert len(users) == 1
+    assert users[0].id == "user-1"
+    assert client.users.last_result_complete is False
+
+
+async def test_protect_ulp_users_get_all_and_get() -> None:
+    """ULP users endpoint should query /ulp-users and parse UlpUser models."""
+    client = _protect_client()
+    ulp_payload = {
+        "id": "ulp-1",
+        "firstName": "John",
+        "lastName": "Smith",
+        "fullName": "John Smith",
+        "email": "john@example.com",
+        "status": "ACTIVE",
+        "modelKey": "ulpUser",
+    }
+    client._get = AsyncMock(return_value=[ulp_payload])
+
+    ulp_users = await client.ulp_users.get_all()
+    assert len(ulp_users) == 1
+    assert ulp_users[0].id == "ulp-1"
+    assert ulp_users[0].first_name == "John"
+    assert ulp_users[0].last_name == "Smith"
+    assert ulp_users[0].full_name == "John Smith"
+    assert ulp_users[0].email == "john@example.com"
+    assert ulp_users[0].status == UlpUserStatus.ACTIVE
+    assert ulp_users[0].display_name == "John Smith"
+    client._get.assert_awaited_once_with(
+        client.build_api_path("/ulp-users"), expected_unsupported=False
+    )
+
+    # get single ULP user (wrapped in data)
+    client._get = AsyncMock(return_value={"data": ulp_payload})
+    ulp_user = await client.ulp_users.get("ulp-1")
+    assert ulp_user.id == "ulp-1"
+    assert ulp_user.status == "ACTIVE"
+    client._get.assert_awaited_once_with(client.build_api_path("/ulp-users/ulp-1"))
+
+    # get single ULP user not found
+    client._get = AsyncMock(return_value=None)
+    with pytest.raises(ValueError, match="ULP user ulp-1 not found"):
+        await client.ulp_users.get("ulp-1")
+
+
+async def test_protect_ulp_users_deactivated_and_malformed() -> None:
+    """ULP users should handle DEACTIVATED status, empty email, and malformed items."""
+    client = _protect_client()
+    ulp_deactivated = {
+        "id": "ulp-2",
+        "firstName": "Old",
+        "lastName": "User",
+        "fullName": "Old User",
+        "status": "DEACTIVATED",
+    }
+    client._get = AsyncMock(return_value=[ulp_deactivated, {"id": "bad"}])
+
+    users = await client.ulp_users.get_all()
+    assert len(users) == 1
+    assert users[0].status == UlpUserStatus.DEACTIVATED
+    assert users[0].email == ""
+    assert client.ulp_users.last_result_complete is False
+
+
+async def test_protect_pos_ingest_transaction() -> None:
+    """POS endpoint should POST to /pos/cameras/{id}/transactions and parse response."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value={"created": True, "eventId": "evt-pos-123"})
+
+    request = PosTransactionRequest.model_validate(
+        {
+            "type": PosTransactionType.SALE,
+            "external_id": "tx-987",
+            "amount": 19.99,
+            "currency": "USD",
+            "line_items": [PosLineItem(title="Coffee", quantity=2)],
+            "location": PosLocation(id="reg-1", name="Main Register"),
+            "payment_types": ["credit_card"],
+            "timestamp": 1700000000000,
+        }
+    )
+
+    response = await client.pos.ingest_transaction("cam-1", request)
+    assert response.created is True
+    assert response.event_id == "evt-pos-123"
+
+    client._post.assert_awaited_once_with(
+        client.build_api_path("/pos/cameras/cam-1/transactions"),
+        json_data={
+            "type": "sale",
+            "externalId": "tx-987",
+            "amount": 19.99,
+            "currency": "USD",
+            "lineItems": [{"title": "Coffee", "quantity": 2}],
+            "location": {"id": "reg-1", "name": "Main Register"},
+            "paymentTypes": ["credit_card"],
+            "timestamp": 1700000000000,
+        },
+    )
+
+
+async def test_protect_pos_ingest_transaction_dict_and_duplicate() -> None:
+    """POS endpoint should accept dict payload and handle idempotency response."""
+    client = _protect_client()
+    # Duplicate transaction returns created=False with existing eventId
+    client._post = AsyncMock(
+        return_value={"data": {"created": False, "eventId": "evt-existing-1"}}
+    )
+
+    payload = {
+        "type": "refund",
+        "externalId": "tx-dup-1",
+        "amount": 5.0,
+    }
+    response = await client.pos.ingest_transaction("cam-2", payload)
+    assert response.created is False
+    assert response.event_id == "evt-existing-1"
+
+    # Error handling
+    client._post = AsyncMock(return_value=None)
+    with pytest.raises(
+        ValueError, match="Failed to ingest POS transaction for camera cam-2"
+    ):
+        await client.pos.ingest_transaction("cam-2", payload)
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   ", None, 123])
+async def test_protect_users_get_invalid_id_raises(invalid_id: Any) -> None:
+    """Users get should reject invalid or blank user ID without calling _get."""
+    client = _protect_client()
+    client._get = AsyncMock()
+    with pytest.raises(ValueError, match="User ID must be a non-empty string"):
+        await client.users.get(invalid_id)
+    client._get.assert_not_called()
+
+
+async def test_protect_users_get_list_response_raises() -> None:
+    """Users get should raise ValueError if response is a list."""
+    client = _protect_client()
+    user_payload = {"id": "user-1", "name": "Jane"}
+    client._get = AsyncMock(return_value=[user_payload])
+    with pytest.raises(ValueError, match="User user-1 not found"):
+        await client.users.get("user-1")
+
+    client._get = AsyncMock(return_value={"data": [user_payload]})
+    with pytest.raises(ValueError, match="User user-1 not found"):
+        await client.users.get("user-1")
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   ", None, 123])
+async def test_protect_ulp_users_get_invalid_id_raises(invalid_id: Any) -> None:
+    """ULP users get should reject invalid or blank user ID without calling _get."""
+    client = _protect_client()
+    client._get = AsyncMock()
+    with pytest.raises(ValueError, match="ULP user ID must be a non-empty string"):
+        await client.ulp_users.get(invalid_id)
+    client._get.assert_not_called()
+
+
+async def test_protect_ulp_users_get_list_response_raises() -> None:
+    """ULP users get should raise ValueError if response is a list."""
+    client = _protect_client()
+    ulp_payload = {"id": "ulp-1", "fullName": "John"}
+    client._get = AsyncMock(return_value=[ulp_payload])
+    with pytest.raises(ValueError, match="ULP user ulp-1 not found"):
+        await client.ulp_users.get("ulp-1")
+
+    client._get = AsyncMock(return_value={"data": [ulp_payload]})
+    with pytest.raises(ValueError, match="ULP user ulp-1 not found"):
+        await client.ulp_users.get("ulp-1")
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   ", None, 123])
+async def test_protect_pos_ingest_transaction_invalid_camera_id_raises(
+    invalid_id: Any,
+) -> None:
+    """POS ingest should reject invalid or blank camera ID without calling _post."""
+    client = _protect_client()
+    client._post = AsyncMock()
+    with pytest.raises(ValueError, match="Camera ID must be a non-empty string"):
+        await client.pos.ingest_transaction(
+            invalid_id, {"type": "sale", "externalId": "1", "amount": 1.0}
+        )
+    client._post.assert_not_called()
+
+
+async def test_protect_validate_connection() -> None:
+    """Validate connection should query /cameras and return boolean."""
+    client = _protect_client()
+    client._get = AsyncMock(return_value=[])
+    assert await client.validate_connection() is True
+    client._get.assert_awaited_once_with(client.build_api_path("/cameras"))
+
+    client._get = AsyncMock(return_value=None)
+    assert await client.validate_connection() is False
+    client._get.assert_awaited_once_with(client.build_api_path("/cameras"))
+
+
+async def test_protect_pos_ingest_transaction_payload_variants_and_invalid_type() -> (
+    None
+):
+    """POS ingest should produce identical payloads for snake, camel, and model."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value={"created": True, "eventId": "evt-1"})
+
+    model_req = PosTransactionRequest.model_validate(
+        {
+            "type": PosTransactionType.SALE,
+            "external_id": "tx-100",
+            "amount": 42.50,
+            "currency": "USD",
+            "line_items": [PosLineItem(title="Widget", quantity=3)],
+            "location": PosLocation(id="reg-2", name="Counter"),
+            "payment_types": ["cash"],
+            "timestamp": 1700000001000,
+        }
+    )
+
+    snake_dict = {
+        "type": "sale",
+        "external_id": "tx-100",
+        "amount": 42.50,
+        "currency": "USD",
+        "line_items": [{"title": "Widget", "quantity": 3}],
+        "location": {"id": "reg-2", "name": "Counter"},
+        "payment_types": ["cash"],
+        "timestamp": 1700000001000,
+    }
+
+    camel_dict = {
+        "type": "sale",
+        "externalId": "tx-100",
+        "amount": 42.50,
+        "currency": "USD",
+        "lineItems": [{"title": "Widget", "quantity": 3}],
+        "location": {"id": "reg-2", "name": "Counter"},
+        "paymentTypes": ["cash"],
+        "timestamp": 1700000001000,
+    }
+
+    expected_payload = {
+        "type": "sale",
+        "externalId": "tx-100",
+        "amount": 42.50,
+        "currency": "USD",
+        "lineItems": [{"title": "Widget", "quantity": 3}],
+        "location": {"id": "reg-2", "name": "Counter"},
+        "paymentTypes": ["cash"],
+        "timestamp": 1700000001000,
+    }
+
+    # Model request
+    await client.pos.ingest_transaction("cam-1", model_req)
+    assert client._post.call_args[1]["json_data"] == expected_payload
+
+    # Snake-case dict
+    await client.pos.ingest_transaction("cam-1", snake_dict)
+    assert client._post.call_args[1]["json_data"] == expected_payload
+
+    # Camel-case dict
+    await client.pos.ingest_transaction("cam-1", camel_dict)
+    assert client._post.call_args[1]["json_data"] == expected_payload
+
+    # Invalid type raises TypeError without calling _post
+    client._post.reset_mock()
+    with pytest.raises(
+        TypeError,
+        match="Transaction must be a PosTransactionRequest or dict, got str",
+    ):
+        await client.pos.ingest_transaction(
+            "cam-1",
+            "invalid_string_payload",  # type: ignore[arg-type]
+        )
+    client._post.assert_not_called()
+
+
+async def test_protect_users_malformed_item_log_omits_personal_data(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed user must be logged by id only, never with email or names."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        return_value=[
+            {
+                "id": "bad-user",
+                "email": "leak.email@example.com",
+                "firstName": "LeakFirst",
+                "lastName": "LeakLast",
+            }
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        assert await client.users.get_all() == []
+
+    assert "bad-user" in caplog.text
+    assert "leak.email@example.com" not in caplog.text
+    assert "LeakFirst" not in caplog.text
+    assert "LeakLast" not in caplog.text
+
+
+async def test_protect_ulp_users_malformed_item_log_omits_personal_data(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed ULP user must be logged by id only, never with email or names."""
+    client = _protect_client()
+    client._get = AsyncMock(
+        return_value=[
+            {
+                "id": "bad-ulp",
+                "email": "leak.email@example.com",
+                "firstName": "LeakFirst",
+                "lastName": "LeakLast",
+                "fullName": "LeakFirst LeakLast",
+            }
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        assert await client.ulp_users.get_all() == []
+
+    assert "bad-ulp" in caplog.text
+    assert "leak.email@example.com" not in caplog.text
+    assert "LeakFirst" not in caplog.text
+    assert "LeakLast" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "sale", "externalId": "tx-1", "amount": 1.0, "cashier": "bob"},
+        {
+            "type": "sale",
+            "externalId": "tx-1",
+            "amount": 1.0,
+            "lineItems": [{"title": "A", "quantity": 1, "sku": "X"}],
+        },
+        {
+            "type": "sale",
+            "externalId": "tx-1",
+            "amount": 1.0,
+            "location": {"id": "reg-1", "register": 3},
+        },
+    ],
+    ids=["request", "line-item", "location"],
+)
+async def test_protect_pos_ingest_transaction_rejects_unknown_keys(
+    payload: dict[str, Any],
+) -> None:
+    """Unknown keys must fail validation locally, before any request is sent."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value={"created": True, "eventId": "evt-1"})
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        await client.pos.ingest_transaction("cam-1", payload)
+    client._post.assert_not_called()
+
+
+async def test_cameras_set_video_mode_patch_body() -> None:
+    """Test set_video_mode sends spec-compliant videoMode PATCH body."""
+    client = _protect_client()
+    client._patch = AsyncMock(return_value={"id": "cam1", "mac": "00:11:22:33:44:55"})
+    await client.cameras.set_video_mode("cam1", "highFps")
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/cameras/cam1"),
+        json_data={"videoMode": "highFps"},
+    )
+
+
+async def test_lights_turn_on_patch_body() -> None:
+    """Test lights.turn_on sends spec-compliant lightModeSettings PATCH body."""
+    client = _protect_client()
+    client._patch = AsyncMock(return_value={"id": "light1", "mac": "00:11:22:33:44:66"})
+    await client.lights.turn_on("light1")
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/lights/light1"),
+        json_data={"lightModeSettings": {"mode": "always"}},
+    )
+
+
+async def test_lights_turn_off_patch_body() -> None:
+    """Test lights.turn_off sends spec-compliant lightModeSettings PATCH body."""
+    client = _protect_client()
+    client._patch = AsyncMock(return_value={"id": "light1", "mac": "00:11:22:33:44:66"})
+    await client.lights.turn_off("light1")
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/lights/light1"),
+        json_data={"lightModeSettings": {"mode": "off"}},
+    )
+
+
+async def test_lights_set_mode_patch_body() -> None:
+    """Test lights.set_mode sends spec-compliant lightModeSettings PATCH body."""
+    client = _protect_client()
+    client._patch = AsyncMock(return_value={"id": "light1", "mac": "00:11:22:33:44:66"})
+    await client.lights.set_mode("light1", "motion")
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/lights/light1"),
+        json_data={"lightModeSettings": {"mode": "motion"}},
+    )
+
+
+async def test_lights_set_brightness_patch_body() -> None:
+    """Test lights.set_brightness sends spec lightDeviceSettings PATCH body."""
+    client = _protect_client()
+    client._patch = AsyncMock(return_value={"id": "light1", "mac": "00:11:22:33:44:66"})
+
+    with pytest.raises(ValueError, match="led_level must be between 1 and 6"):
+        await client.lights.set_brightness("light1", 0)
+    client._patch.assert_not_called()
+
+    with pytest.raises(ValueError, match="led_level must be between 1 and 6"):
+        await client.lights.set_brightness("light1", 7)
+    client._patch.assert_not_called()
+
+    await client.lights.set_brightness("light1", 1)
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/lights/light1"),
+        json_data={"lightDeviceSettings": {"ledLevel": 1}},
+    )
+
+    client._patch.reset_mock()
+    await client.lights.set_brightness("light1", 6)
+    client._patch.assert_awaited_once_with(
+        client.build_api_path("/lights/light1"),
+        json_data={"lightDeviceSettings": {"ledLevel": 6}},
+    )
+
+
+def test_base_client_defer_after_rate_limit_without_limiter() -> None:
+    """When rate limiter is not configured, defer_after_rate_limit is a no-op."""
+    client = _network_client()
+    assert client._rate_limiter is None
+    assert client._defer_after_rate_limit(5.0) is None
+    assert client._rate_limiter is None
+
+
+async def test_network_client_get_application_info_invalid_response_raises() -> None:
+    """get_application_info raises ValueError when response is not a dict."""
+    client = _network_client()
+    client._get = AsyncMock(return_value=["not-a-dict"])
+    with pytest.raises(ValueError, match="Unable to retrieve application info"):
+        await client.get_application_info()
+
+
+async def test_clients_get_historical_legacy_empty_when_data_not_list() -> None:
+    """get_historical_legacy returns empty list when response data is not a list."""
+    client = _network_client()
+    client._get = AsyncMock(return_value={"meta": {"rc": "ok"}, "data": None})
+    result = await client.clients.get_historical_legacy("default")
+    assert result == []
+
+
+async def test_clients_cmd_stamgr_non_dict_response() -> None:
+    """Classic stamgr commands succeed when response is not a dict."""
+    client = _network_client()
+    client._post = AsyncMock(return_value=None)
+    assert await client.clients.block("default", "aa:bb:cc:dd:ee:ff") is True
+
+
+async def test_devices_get_legacy_device_stats_non_dict_returns_empty() -> None:
+    """get_legacy_device_stats returns empty dict when response is not a dict."""
+    client = _network_client()
+    client._get = AsyncMock(return_value=None)
+    assert (
+        await client.devices.get_legacy_device_stats("default", "aa:bb:cc:dd:ee:ff")
+        == {}
+    )
+
+
+async def test_devices_get_port_metrics_non_numeric_poe() -> None:
+    """Non-numeric PoE power is omitted from poe_ports mapping."""
+    client = _network_client()
+    client.devices.get_legacy_device_stats = AsyncMock(
+        return_value={
+            "port_table": [
+                {
+                    "port_idx": 1,
+                    "port_poe": True,
+                    "poe_power": "invalid",
+                    "rx_bytes": 100,
+                    "tx_bytes": 200,
+                }
+            ]
+        }
+    )
+    metrics = await client.devices.get_port_metrics("default", "aa:bb:cc:dd:ee:ff")
+    assert 1 not in metrics.poe_ports
+
+
+async def test_firewall_get_policy_ordering_invalid_data_raises() -> None:
+    """get_policy_ordering raises ValueError when returned data is not a dict."""
+    client = _network_client()
+    client._get = AsyncMock(return_value={"data": "invalid"})
+    with pytest.raises(ValueError, match="Failed to get firewall policy ordering"):
+        await client.firewall.get_policy_ordering(
+            "site1",
+            source_firewall_zone_id="sz1",
+            destination_firewall_zone_id="dz1",
+        )
+
+
+async def test_firewall_update_policy_ordering_invalid_data_raises() -> None:
+    """update_policy_ordering raises ValueError when returned data is not a dict."""
+    client = _network_client()
+    client._put = AsyncMock(return_value={"data": "invalid"})
+    with pytest.raises(ValueError, match="Failed to update firewall policy ordering"):
+        await client.firewall.update_policy_ordering(
+            "site1",
+            source_firewall_zone_id="sz1",
+            destination_firewall_zone_id="dz1",
+            ordered_firewall_policy_ids={
+                "beforeSystemDefined": [],
+                "afterSystemDefined": [],
+            },
+        )
+
+
+async def test_lags_get_mc_lag_domain_non_dict_raises() -> None:
+    """get_mc_lag_domain raises ValueError when response is not a dict."""
+    client = _network_client()
+    client._get = AsyncMock(return_value=None)
+    with pytest.raises(ValueError, match=r"MC-LAG domain lag1 not found"):
+        await client.lags.get_mc_lag_domain("site1", "lag1")
+
+
+async def test_reports_get_site_report_non_dict_non_list_returns_empty() -> None:
+    """get_site_report returns empty list when response is neither dict nor list."""
+    client = _network_client()
+    client._post = AsyncMock(return_value="unexpected-response")
+    assert (
+        await client.reports.get_site_report(
+            "default", "hourly", start_ms=1000, end_ms=2000
+        )
+        == []
+    )
+
+
+async def test_stacks_get_switch_stack_non_dict_raises() -> None:
+    """stacks.get raises ValueError when response is not a dict."""
+    client = _network_client()
+    client._get = AsyncMock(return_value=None)
+    with pytest.raises(ValueError, match=r"Switch stack stack1 not found"):
+        await client.stacks.get("site1", "stack1")
+
+
+async def test_vouchers_get_non_dict_raises() -> None:
+    """vouchers.get raises ValueError when response is not a dict."""
+    client = _network_client()
+    client._get = AsyncMock(return_value=None)
+    with pytest.raises(ValueError, match=r"Voucher v1 not found"):
+        await client.vouchers.get("site1", "v1")
+
+
+async def test_vpn_clients_list_site_to_site_vpns_non_list_returns_empty() -> None:
+    """list_site_to_site_vpns returns empty list when response is not a list."""
+    client = _network_client()
+    client._get = AsyncMock(return_value="unexpected-response")
+    assert await client.vpn_clients.list_site_to_site_vpns("default") == []
+
+
+async def test_vpn_clients_get_vpn_client_item_loop_and_fallback_loop() -> None:
+    """get_vpn_client loops over non-matching items and fallback clients."""
+    client = _network_client()
+    client._get = AsyncMock(
+        return_value=[
+            {"_id": "other1", "purpose": "other"},
+            {"_id": "other2", "purpose": "vpn-client"},
+            {
+                "_id": "vpn1",
+                "id": "vpn1",
+                "name": "Target VPN",
+                "purpose": "vpn-client",
+            },
+        ]
+    )
+    result = await client.vpn_clients.get_vpn_client("default", "vpn1")
+    assert result.id == "vpn1"
+
+    client._get = AsyncMock(return_value=[])
+    dummy_client = VpnClient.model_validate(
+        {"id": "different", "name": "Diff", "purpose": "vpn-client"}
+    )
+    client.vpn_clients.list_vpn_clients = AsyncMock(return_value=[dummy_client])
+    with pytest.raises(ValueError, match=r"VPN Client missing not found"):
+        await client.vpn_clients.get_vpn_client("default", "missing")
+
+
+async def test_wifi_create_invalid_result_raises() -> None:
+    """wifi.create raises ValueError when response data is not a dict."""
+    client = _network_client()
+    client._post = AsyncMock(return_value={"data": "invalid"})
+    wifi_key = "test-passphrase"
+    with pytest.raises(ValueError, match="Failed to create WiFi network"):
+        await client.wifi.create(
+            "site1",
+            name="Guest",
+            ssid="Guest",
+            passphrase=wifi_key,
+        )
+    client._post.assert_awaited_once()
+
+
+async def test_protect_pos_ingest_transaction_invalid_data_raises() -> None:
+    """pos.ingest_transaction raises ValueError when response data is not a dict."""
+    client = _protect_client()
+    client._post = AsyncMock(return_value={"data": "invalid"})
+    with pytest.raises(
+        ValueError, match=r"Failed to ingest POS transaction for camera cam1"
+    ):
+        await client.pos.ingest_transaction(
+            "cam1", {"type": "sale", "externalId": "1", "amount": 1.0}
         )

@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Support for UniFi Insights device tracker."""
 
 from __future__ import annotations
@@ -8,7 +9,8 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.components.device_tracker.const import SourceType
 from homeassistant.core import callback
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -19,10 +21,13 @@ from .const import (
     DEFAULT_TRACK_CLIENTS,
     DOMAIN,
     MANUFACTURER,
+    MOBILITY_DEVICE_PREFIX,
 )
 from .coordinators import UnifiFacadeCoordinator
-from .entity import get_client_type as _get_client_type, get_field, is_ephemeral_client
+from .entity import get_client_type as _get_client_type
+from .entity import get_field, is_ephemeral_client
 from .helpers import async_get_device_entry
+from .mobility_entity import async_setup_mobility_trackers
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -69,8 +74,9 @@ def _partition_connected_clients(
             if not mac:
                 continue
             if is_ephemeral_client(client_data):
-                # cmcore fork (backlog 529): no new tracker for a randomized, unnamed
-                # client, and not "untracked" either - that set removes registry entries.
+                # cmcore fork (backlog 529): no new tracker for a randomized,
+                # unnamed client, and not "untracked" either - that set removes
+                # registry entries.
                 continue
             if _client_should_be_tracked(
                 client_data, track_wifi=track_wifi, track_wired=track_wired
@@ -97,11 +103,15 @@ def _connected_clients_to_track(
 def _client_tracker_entries(
     registry: er.EntityRegistry, entry_id: str
 ) -> list[er.RegistryEntry]:
-    """Return this platform's device_tracker entries for a config entry."""
+    """Return this platform's client tracker entries for a config entry."""
+    # Mobility router GPS trackers share the platform but are not clients:
+    # client-tracking options must never remove them.
     return [
         reg_entry
         for reg_entry in er.async_entries_for_config_entry(registry, entry_id)
-        if reg_entry.domain == "device_tracker" and reg_entry.platform == DOMAIN
+        if reg_entry.domain == "device_tracker"
+        and reg_entry.platform == DOMAIN
+        and not reg_entry.unique_id.startswith(MOBILITY_DEVICE_PREFIX)
     ]
 
 
@@ -216,6 +226,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up device tracker for UniFi Insights integration."""
     coordinator = entry.runtime_data.coordinator
+
+    # Router trackers do not depend on the client-tracking options below.
+    if mobility_coordinator := entry.runtime_data.mobility_coordinator:
+        async_setup_mobility_trackers(
+            hass, entry, mobility_coordinator, async_add_entities
+        )
 
     # Check which client types to track (support both old and new options).
     # Migrate from the old single option if the new options are not set.
@@ -400,9 +416,7 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
             # cmcore: offline at setup, but the registry entry already sits under an
             # AP or switch - stay there rather than minting a standalone client
             # device (see _uplink_identifiers). The next connection regroups it.
-            self._device_info = DeviceInfo(
-                identifiers=set(previous_device_identifiers)
-            )
+            self._device_info = DeviceInfo(identifiers=set(previous_device_identifiers))
             self._attr_name = display_name
         else:
             # Fallback: a standalone device representing the client itself.

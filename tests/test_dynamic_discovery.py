@@ -1,9 +1,10 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for dynamic entity discovery across UniFi Insights platforms."""
 
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -27,6 +28,9 @@ from custom_components.unifi_insights.image import (
 )
 from custom_components.unifi_insights.light import (
     async_setup_entry as async_setup_light,
+)
+from custom_components.unifi_insights.media_player import (
+    async_setup_entry as async_setup_media_player,
 )
 from custom_components.unifi_insights.number import (
     async_setup_entry as async_setup_number,
@@ -89,11 +93,17 @@ def mock_config_entry(mock_coordinator: MagicMock) -> MagicMock:
     """Create a mock config entry."""
     entry = MagicMock()
     entry.entry_id = "test_entry_id"
-    entry.runtime_data = MagicMock()
-    entry.runtime_data.coordinator = mock_coordinator
-    entry.runtime_data.device_coordinator = MagicMock()
+    entry.data = {"console_id": "console"}
     entry.options = {CONF_CLIENT_CONTROL: True}
     entry.async_on_unload = MagicMock()
+    entry.async_create_background_task.side_effect = lambda hass, target, name: (
+        hass.async_create_background_task(target, name)
+    )
+    mock_coordinator.async_get_wake_history = AsyncMock(return_value={})
+    entry.runtime_data = MagicMock()
+    entry.runtime_data.mobility_coordinator = None
+    entry.runtime_data.coordinator = mock_coordinator
+    entry.runtime_data.device_coordinator = MagicMock()
     return entry
 
 
@@ -212,6 +222,7 @@ class TestDynamicProtectDeviceDiscovery:
             ("event", async_setup_event),
             ("button", async_setup_button),
             ("switch", async_setup_switch),
+            ("media_player", async_setup_media_player),
         ]
 
         callbacks = {}
@@ -248,6 +259,19 @@ class TestDynamicProtectDeviceDiscovery:
             "ptz": {"presets": [{"id": 1, "name": "Entrance"}]},
             "isMicEnabled": True,
             "isLedEnabled": True,
+        }
+        # Speaker-less camera to prove negative capability gating
+        mock_coordinator.data["protect"]["cameras"]["cam_2"] = {
+            "id": "cam_2",
+            "name": "Backyard Camera",
+            "state": "CONNECTED",
+            "type": "camera",
+            "modelKey": "camera",
+            "hasSpeaker": False,
+            "featureFlags": {
+                "hasSpeaker": False,
+                "hasRemovableSpeaker": False,
+            },
         }
         mock_coordinator.data["protect"]["lights"]["light_1"] = {
             "id": "light_1",
@@ -297,6 +321,12 @@ class TestDynamicProtectDeviceDiscovery:
             assert len(entities) > 0, (
                 f"Platform {name} added empty entity list on Protect update"
             )
+
+        # Specifically assert media_player discovered speaker camera cam_1 and not cam_2
+        media_player_entities = add_mocks["media_player"].call_args[0][0]
+        discovered_camera_ids = {e._device_id for e in media_player_entities}
+        assert "cam_1" in discovered_camera_ids
+        assert "cam_2" not in discovered_camera_ids
 
         # Subsequent updates must not add duplicate entities
         post_counts = {k: m.call_count for k, m in add_mocks.items()}
@@ -353,6 +383,51 @@ class TestDynamicOptionsAndCapabilities:
         assert (
             switch_add.call_args[0][0][0].unique_id == "site1_client_mac_1_block_switch"
         )
+
+    @pytest.mark.asyncio
+    async def test_client_control_toggle_adds_wake_button_for_wired_client(
+        self, hass: Any, mock_coordinator: MagicMock, mock_config_entry: MagicMock
+    ) -> None:
+        """Enabling client control discovers Wake button for wired clients."""
+        mock_coordinator.async_get_wake_history = AsyncMock(return_value={})
+        mock_config_entry.options = {CONF_CLIENT_CONTROL: False}
+
+        mock_coordinator.data["clients"]["site1"]["wired_pc"] = {
+            "id": "wired_pc",
+            "type": "WIRED",
+            "macAddress": "00:11:22:33:44:55",
+            "name": "Workstation",
+        }
+
+        button_add = MagicMock()
+        await async_setup_button(hass, mock_config_entry, button_add)
+        button_listener = mock_coordinator.async_add_listener.call_args[0][0]
+
+        # While client_control is False, no client buttons added
+        assert button_add.call_count == 0 or len(button_add.call_args[0][0]) == 0
+
+        # Enable client_control and trigger listener
+        mock_config_entry.options = {CONF_CLIENT_CONTROL: True}
+        button_listener()
+
+        assert button_add.call_count == 1
+        added = button_add.call_args[0][0]
+        wake_buttons = [
+            e
+            for e in added
+            if getattr(e, "unique_id", None) == "unifi_insights_00:11:22:33:44:55_wake"
+        ]
+        reconnect_buttons = [
+            e
+            for e in added
+            if getattr(e, "unique_id", None) == "site1_wired_pc_reconnect"
+        ]
+        assert len(wake_buttons) == 1
+        assert len(reconnect_buttons) == 1
+
+        # Second listener run adds nothing
+        button_listener()
+        assert button_add.call_count == 1
 
     @pytest.mark.asyncio
     async def test_dynamic_wifi_qr_and_sensor(
@@ -589,6 +664,7 @@ class TestDynamicDiscoveryResilience:
         [
             ("camera", async_setup_camera),
             ("light", async_setup_light),
+            ("media_player", async_setup_media_player),
             ("number", async_setup_number),
         ],
     )
@@ -747,12 +823,12 @@ class TestDiscoveryRegressions:
         initial_site_ids = {
             e.unique_id
             for e in initial_entities
-            if getattr(e, "unique_id", "").startswith("site1_site_")
+            if getattr(e, "unique_id", "").startswith("console_site1_site_")
         }
         assert initial_site_ids == {
-            "site1_site_total_clients",
-            "site1_site_wired_clients",
-            "site1_site_wireless_clients",
+            "console_site1_site_total_clients",
+            "console_site1_site_wired_clients",
+            "console_site1_site_wireless_clients",
         }
         assert not [
             e
@@ -776,14 +852,14 @@ class TestDiscoveryRegressions:
         discovered = add_entities.call_args[0][0]
         discovered_ids = {e.unique_id for e in discovered}
         assert discovered_ids == {
-            "site1_internet_download_1h",
-            "site1_internet_upload_1h",
-            "site1_internet_download_1d",
-            "site1_internet_upload_1d",
-            "site1_internet_download_1w",
-            "site1_internet_upload_1w",
-            "site1_internet_download_1m",
-            "site1_internet_upload_1m",
+            "console_site1_internet_download_1h",
+            "console_site1_internet_upload_1h",
+            "console_site1_internet_download_1d",
+            "console_site1_internet_upload_1d",
+            "console_site1_internet_download_1w",
+            "console_site1_internet_upload_1w",
+            "console_site1_internet_download_1m",
+            "console_site1_internet_upload_1m",
         }
 
         # Subsequent listener call does not duplicate sensors

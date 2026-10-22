@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Device coordinator for UniFi Insights - handles fast-changing device data."""
 
 from __future__ import annotations
@@ -24,7 +25,10 @@ from custom_components.unifi_insights.api.network.models import (
     parse_outlet_metrics,
 )
 from custom_components.unifi_insights.const import DOMAIN
-from custom_components.unifi_insights.data_transforms import normalize_legacy_wans
+from custom_components.unifi_insights.data_transforms import (
+    normalize_legacy_storage,
+    normalize_legacy_wans,
+)
 from custom_components.unifi_insights.helpers import async_get_device_entry
 
 from .base import UnifiBaseCoordinator, entry_poll_interval
@@ -166,7 +170,6 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
             "devices": {},
             "clients": {},
             "stats": {},
-            "vouchers": {},
             "vpn_connections": {},
             "last_update": None,
         }
@@ -554,6 +557,25 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         if wans:
             device_dict["wans"] = wans
 
+    @classmethod
+    def _merge_legacy_storage_data(
+        cls,
+        device_dict: dict[str, Any],
+        legacy_devices_by_mac: dict[str, dict[str, Any]],
+    ) -> None:
+        """Merge the console's per-mount storage from legacy data (no extra request)."""
+        mac_address = cls._normalize_mac(
+            device_dict.get("macAddress") or device_dict.get("mac")
+        )
+        if mac_address is None:
+            return
+        legacy_device = legacy_devices_by_mac.get(mac_address)
+        if legacy_device is None:
+            return
+        mounts = normalize_legacy_storage(legacy_device)
+        if mounts:
+            device_dict["storage_mounts"] = mounts
+
     def _vpn_connections_or_previous(
         self, site_id: str, connections: dict[str, dict[str, Any]] | None
     ) -> dict[str, dict[str, Any]] | None:
@@ -577,10 +599,10 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
     def _reuse_previous_wans(self, site_id: str, devices: list[dict[str, Any]]) -> None:
         """
-        Carry each device's last WAN links over a failed legacy fetch.
+        Carry each device's last WAN and storage data over a failed legacy fetch.
 
-        WAN links only come from the legacy device call, so one failed call
-        would otherwise flip every WAN Connection sensor on -> unknown -> on.
+        WAN links and storage mounts both only come from the legacy device call,
+        so one failed call would otherwise drop them until the next poll.
         Like VPN connections, the reuse is bounded so a call that keeps
         failing cannot hold a stale state forever.
         """
@@ -591,9 +613,12 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         previous_devices = self.data["devices"].get(site_id, {})
         for device in devices:
             previous = previous_devices.get(device.get("id", ""))
-            wans = previous.get("wans") if isinstance(previous, dict) else None
-            if isinstance(wans, list):
-                device["wans"] = wans
+            if not isinstance(previous, dict):
+                continue
+            for field in ("wans", "storage_mounts"):
+                value = previous.get(field)
+                if isinstance(value, list):
+                    device[field] = value
 
     async def _fetch_vpn_connections(
         self, site_id: str, legacy_site_name: str | None
@@ -683,8 +708,15 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
         clients: list[dict[str, Any]],
         legacy_site_name: str | None = None,
         legacy_device: dict[str, Any] | None = None,
+        *,
+        clients_by_uplink: dict[str, list[dict[str, Any]]] | None = None,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-        """Process a single device and its stats."""
+        """
+        Process a single device and its stats.
+
+        If clients_by_uplink is provided, clients for this device are looked up
+        directly; otherwise falls back to scanning the clients list.
+        """
         device_id: str = device_dict.get("id", "")
         device_name = device_dict.get("name", device_id)
 
@@ -709,15 +741,13 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 site_name = legacy_site_name or site_id
                 if not legacy_site_name:
                     try:
-                        get_site = getattr(self.config_coordinator, "get_site", None)
-                        if callable(get_site):
-                            site_obj = get_site(site_id)
-                            if isinstance(site_obj, dict):
-                                site_name = (
-                                    site_obj.get("internalReference")
-                                    or site_obj.get("internal_reference")
-                                    or site_name
-                                )
+                        site_obj = self.config_coordinator.get_site(site_id)
+                        if isinstance(site_obj, dict):
+                            site_name = (
+                                site_obj.get("internalReference")
+                                or site_obj.get("internal_reference")
+                                or site_name
+                            )
                     except Exception as err:
                         _LOGGER.debug(
                             "Device coordinator: Unable to resolve internal "
@@ -775,13 +805,16 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
 
             # Add client data to stats
             if stats:
-                # Use camelCase uplinkDeviceId as returned by model_dump(by_alias=True)
-                stats["clients"] = [
-                    c
-                    for c in clients
-                    if (c.get("uplinkDeviceId") or c.get("uplink_device_id"))
-                    == device_id
-                ]
+                if clients_by_uplink is not None:
+                    stats["clients"] = clients_by_uplink.get(device_id, [])
+                else:
+                    # Use camelCase uplinkDeviceId as returned with aliases
+                    stats["clients"] = [
+                        c
+                        for c in clients
+                        if (c.get("uplinkDeviceId") or c.get("uplink_device_id"))
+                        == device_id
+                    ]
                 stats["id"] = device_id
 
             self._stats_failures.pop(device_id, None)
@@ -971,9 +1004,10 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                     # When legacy is primary, _legacy_device_to_v1_dict()
                     # already embeds the topology block directly.
                     self._merge_legacy_uplink_data(device, legacy_devices_by_mac)
-                # The legacy-to-v1 mapping does not carry WAN links, so they
+                # The legacy-to-v1 mapping does not carry WAN links and storage, so they
                 # are merged whichever source is primary.
                 self._merge_legacy_wan_data(device, legacy_devices_by_mac)
+                self._merge_legacy_storage_data(device, legacy_devices_by_mac)
 
         if legacy_failed:
             self._reuse_previous_wans(site_id, devices)
@@ -996,6 +1030,13 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 list(sample_device.keys()),
             )
 
+        # Group clients by uplink device in a single pass
+        clients_by_uplink: dict[str, list[dict[str, Any]]] = {}
+        for client in clients:
+            uplink_id = client.get("uplinkDeviceId") or client.get("uplink_device_id")
+            if isinstance(uplink_id, str) and uplink_id:
+                clients_by_uplink.setdefault(uplink_id, []).append(client)
+
         # Process devices in parallel (get stats)
         tasks = [
             self._process_device(
@@ -1004,6 +1045,7 @@ class UnifiDeviceCoordinator(UnifiBaseCoordinator):
                 clients,
                 legacy_site_name=legacy_site_name,
                 legacy_device=self._legacy_device_for(device, legacy_devices_by_mac),
+                clients_by_uplink=clients_by_uplink,
             )
             for device in devices
         ]

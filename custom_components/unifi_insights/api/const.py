@@ -7,6 +7,33 @@ from typing import Final
 
 __version__: Final[str] = "1.2.0+vendored"
 
+# Credential keys redacted in transport response logs and Home Assistant diagnostics.
+# Identifiers, privacy keys, and integration-specific webhook/HA constants are excluded
+# and managed separately by consumers.
+SENSITIVE_CREDENTIAL_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "token",
+        "accessToken",
+        "access_token",
+        "refreshToken",
+        "refresh_token",
+        "password",
+        "psk",
+        "passphrase",
+        "qr_code",
+        "secret",
+        "voucher",
+        "fingerprint",
+        "api_key",
+        "x_passphrase",
+        "x_authkey",
+        "x_fingerprint",
+        "x_iapp_key",
+        "x_ssh_hostkey_fingerprint",
+        "x_vwirekey",
+    }
+)
+
 
 class ConnectionType(str, Enum):
     """
@@ -29,11 +56,14 @@ class ConnectionType(str, Enum):
 NETWORK_API_BASE_URL: Final[str] = "https://api.ui.com"
 PROTECT_API_BASE_URL: Final[str] = "https://api.ui.com"
 INNERSPACE_API_BASE_URL: Final[str] = "https://api.ui.com"
+CARRIER_FABRIC_API_BASE_URL: Final[str] = "https://api.ui.com"
+CARRIER_FABRIC_BASE_URL: Final[str] = CARRIER_FABRIC_API_BASE_URL
 
 # API Versions
 NETWORK_API_VERSION: Final[str] = "v1"
 PROTECT_API_VERSION: Final[str] = "v1"
 INNERSPACE_API_VERSION: Final[str] = "v1"
+CARRIER_FABRIC_API_VERSION: Final[str] = "v1"
 
 # Network Integration API path prefix (used for both local and remote)
 NETWORK_INTEGRATION_PATH: Final[str] = "/proxy/network/integration/v1"
@@ -46,9 +76,17 @@ NETWORK_LEGACY_V2_PATH: Final[str] = "/proxy/network/v2/api"
 
 # Network legacy v2 endpoints
 ENDPOINT_TRAFFIC_ROUTES: Final[str] = "trafficroutes"
+# Traffic rules (app, domain, IP and internet blocking); separate from trafficroutes.
+ENDPOINT_TRAFFIC_RULES: Final[str] = "trafficrules"
+# Custom NAT rules (v2 only; reference-derived, no GET-by-id).
+ENDPOINT_NAT_RULES: Final[str] = "nat"
 
 # Network legacy REST endpoints
 ENDPOINT_NETWORKCONF: Final[str] = "rest/networkconf"
+# Port forwarding rules (classic API only; v2 "portforwards" is 404 on Network 11).
+ENDPOINT_PORT_FORWARD: Final[str] = "rest/portforward"
+# Static routes (classic API only; v2 "static-route" is 404 on Network 11).
+ENDPOINT_STATIC_ROUTES: Final[str] = "rest/routing"
 # Live state of VPN clients and site-to-site tunnels (v2, per connection).
 ENDPOINT_VPN_CONNECTIONS: Final[str] = "vpn/connections"
 
@@ -57,6 +95,14 @@ PROTECT_INTEGRATION_PATH: Final[str] = "/proxy/protect/integration/v1"
 
 # InnerSpace Integration API path prefix (used for both local and remote)
 INNERSPACE_INTEGRATION_PATH: Final[str] = "/proxy/innerspace/integration/v1"
+
+# Carrier Fabric API path prefix
+CARRIER_FABRIC_PATH: Final[str] = "/v1/carrier"
+
+# Carrier Fabric pagination
+CARRIER_FABRIC_DEFAULT_PAGE_SIZE: Final[int] = 50
+CARRIER_FABRIC_MAX_PAGE_SIZE: Final[int] = 500
+CARRIER_FABRIC_MAX_PAGES: Final[int] = 200
 
 # Default timeouts (in seconds)
 DEFAULT_TIMEOUT: Final[int] = 30
@@ -72,6 +118,10 @@ DEFAULT_RATE_LIMIT_RETRY_AFTER: Final[int] = 60
 # and its requests do not draw from the Protect allowance.
 PROTECT_RATE_LIMIT_REQUESTS: Final[int] = 10
 PROTECT_RATE_LIMIT_WINDOW: Final[float] = 1.0
+# The cloud Mobility API allows 100 requests per minute per API key, shared by
+# every Mobility endpoint, and answers a 429 `rate_limit` beyond that.
+MOBILITY_RATE_LIMIT_REQUESTS: Final[int] = 100
+MOBILITY_RATE_LIMIT_WINDOW: Final[float] = 60.0
 # Added to the window on the client side so request-arrival jitter cannot
 # land an 11th request inside one of the server's fixed windows.
 RATE_LIMIT_WINDOW_MARGIN: Final[float] = 0.1

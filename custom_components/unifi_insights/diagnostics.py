@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Diagnostics support for UniFi Insights."""
 
 from __future__ import annotations
@@ -12,39 +13,49 @@ from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 
 from .api import __version__ as api_version
-from .const import CONF_CONSOLE_ID, ISP_WAN_NUMBERS, SITE_MANAGER_COLLECTIONS
+from .api.const import SENSITIVE_CREDENTIAL_KEYS
+from .carrier_fabric_data import CarrierFabricData
+from .const import (
+    CONF_ACCESS_WEBHOOK_ENDPOINT_ID,
+    CONF_ACCESS_WEBHOOK_ID,
+    CONF_ACCESS_WEBHOOK_SECRET,
+    CONF_CONNECTION_TYPE,
+    CONF_CONSOLE_ID,
+    CONNECTION_TYPE_REMOTE,
+    ISP_WAN_NUMBERS,
+    MOBILITY_MODELS,
+    MOBILITY_ROUTER_STATES,
+    MOBILITY_WORKSPACE_STATUSES,
+    SITE_MANAGER_COLLECTIONS,
+)
+from .coordinators.carrier_fabric import (
+    SERVICE_PLAN_ALLOWLIST,
+    SUBSCRIBER_ALLOWLIST,
+)
 from .innerspace_transforms import build_innerspace_diagnostics_summary
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from homeassistant.core import HomeAssistant
 
     from . import UnifiInsightsConfigEntry
+    from .carrier_fabric_data import CarrierFabricConfigEntry
+    from .coordinators.access import UnifiInsightsAccessCoordinator
+    from .coordinators.mobility import UnifiInsightsMobilityCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 _MAX_HOST_SITE_COUNTS = 20
 _MAX_ISP_SAMPLES = 8
 TO_REDACT = {
-    # Credentials and secrets
+    # Credentials and secrets (shared with API transport logging, plus
+    # HA-layer constants)
+    *SENSITIVE_CREDENTIAL_KEYS,
     CONF_API_KEY,
-    "token",
-    "accessToken",
-    "access_token",
-    "refreshToken",
-    "refresh_token",
-    "password",
-    "psk",
-    "passphrase",
-    "qr_code",
-    "secret",
-    "voucher",
-    "fingerprint",
-    # Classic-API secrets that ride along with legacy device and WiFi payloads
-    "x_passphrase",
-    "x_authkey",
-    "x_fingerprint",
-    "x_iapp_key",
-    "x_ssh_hostkey_fingerprint",
-    "x_vwirekey",
+    # Access webhook state: the receiver ID, endpoint ID and signing secret
+    CONF_ACCESS_WEBHOOK_ID,
+    CONF_ACCESS_WEBHOOK_ENDPOINT_ID,
+    CONF_ACCESS_WEBHOOK_SECRET,
     # Network identifiers
     CONF_HOST,
     "ip",
@@ -94,6 +105,13 @@ TO_REDACT = {
     # Smart detections that name a person or their vehicle
     "licensePlate",
     "license_plate",
+    # Protect alarm hub tamper events name the user involved
+    "userName",
+    "_lastTamperUser",
+    # Thread network identity (the network key itself is never exposed)
+    "networkName",
+    "panId",
+    "extendedPanId",
 }
 
 # Labels that name a person rather than a piece of hardware. These are only
@@ -116,6 +134,58 @@ CLIENT_TO_REDACT = TO_REDACT | PERSONAL_NAMES
 
 # WiFi records: the SSID is also carried in the record's "name" field.
 WIFI_TO_REDACT = TO_REDACT | {"name"}
+
+# Hotspot vouchers: voucher codes are guest credentials; the note ("name" or
+# "note") can name a guest.
+VOUCHER_TO_REDACT = TO_REDACT | {"code", "name", "note"}
+
+# Port forwards: the forward target, the allowed source and the WAN-side
+# destination locate hosts inside and outside the network.
+PORT_FORWARD_TO_REDACT = TO_REDACT | {
+    "fwd",
+    "src",
+    "destination_ip",
+    "destination_ips",
+}
+# Traffic rules: the blocked or allowed domains and address ranges
+# ("ip_addresses" is already in TO_REDACT; client MACs are anonymised below).
+TRAFFIC_RULE_TO_REDACT = TO_REDACT | {"domains", "ip_ranges"}
+# NAT rules: the translated address ("ip_address") is already in TO_REDACT; the
+# source and destination filters carry their match address under "address".
+NAT_RULE_TO_REDACT = TO_REDACT | {"address"}
+# Static routes: the destination network and the next hop map the routed LAN.
+# ("gateway_device" is a MAC and is anonymised below.)
+STATIC_ROUTE_TO_REDACT = TO_REDACT | {"static-route_network", "static-route_nexthop"}
+# Firewall policies (official API): the source and destination filters hold the
+# matched addresses, domains and MACs in nested objects with generic keys
+# ("items", "value", "start", "stop"), so the filter objects go as a whole.
+FIREWALL_RULE_TO_REDACT = TO_REDACT | {
+    "ipAddressFilter",
+    "domainFilter",
+    "macAddressFilter",
+    "ipv6IidFilter",
+}
+# Policy-based routes: the routed domains, ranges and next hop ("ipAddresses"
+# is already in TO_REDACT; client MACs are anonymised below).
+POLICY_BASED_ROUTE_TO_REDACT = TO_REDACT | {
+    "domains",
+    "ipRanges",
+    "ip_ranges",
+    "ips",
+    "nextHop",
+    "next_hop",
+}
+
+# Redaction key set of each rule section of the coordinator data. The redacted
+# rule export does not use these: it keeps an allow-list (RULE_EXPORT_SAFE_KEYS).
+RULE_SECTION_TO_REDACT: dict[str, set[str]] = {
+    "firewall_rules": FIREWALL_RULE_TO_REDACT,
+    "policy_based_routes": POLICY_BASED_ROUTE_TO_REDACT,
+    "port_forwards": PORT_FORWARD_TO_REDACT,
+    "traffic_rules": TRAFFIC_RULE_TO_REDACT,
+    "nat_rules": NAT_RULE_TO_REDACT,
+    "static_routes": STATIC_ROUTE_TO_REDACT,
+}
 
 # Keys whose value is a MAC address even when it arrives unpunctuated. Values
 # are replaced with a per-report placeholder rather than dropped; see
@@ -142,6 +212,7 @@ MAC_KEYS = frozenset(
         "wan_mac",
         "lanMac",
         "lan_mac",
+        "client_mac",
     }
 )
 
@@ -242,6 +313,9 @@ def _redact_coordinator_data(data: Any) -> Any:
     for section, to_redact in (
         ("clients", CLIENT_TO_REDACT),
         ("wifi", WIFI_TO_REDACT),
+        ("vouchers", VOUCHER_TO_REDACT),
+        ("latest_vouchers", VOUCHER_TO_REDACT),
+        *RULE_SECTION_TO_REDACT.items(),
     ):
         records = data.get(section)
         if isinstance(records, Mapping):
@@ -263,6 +337,199 @@ def _redact_coordinator_data(data: Any) -> Any:
                     )
 
     return redacted
+
+
+# The redacted rule export keeps only what is listed here and replaces the
+# rest, so a key nobody has heard of cannot leak. Per rule type, the top-level
+# keys that are kept; the keys are the console's own spellings, as
+# ``model_dump(by_alias=True)`` emits them, and both spellings are listed where
+# a model can emit either. A kept key's value must still pass
+# _safe_export_value. Names, descriptions, addresses, domains, interfaces and
+# network, client, group and zone references are deliberately not here.
+RULE_EXPORT_SAFE_KEYS: dict[str, frozenset[str]] = {
+    # Firewall policies (official API): identity, state, action, order, logging,
+    # IP protocol scope and connection state. Source and destination filters
+    # hold addresses, domains and zone references and are never kept.
+    "firewall_rule": frozenset(
+        {
+            "id",
+            "enabled",
+            "action",
+            "index",
+            "logging",
+            "loggingEnabled",
+            "protocol",
+            "ipProtocolScope",
+            "connectionStateFilter",
+        }
+    ),
+    # Policy-based routes: identity, state, kill switch and matching target.
+    "policy_based_route": frozenset(
+        {
+            "_id",
+            "enabled",
+            "killSwitch",
+            "kill_switch",
+            "killSwitchEnabled",
+            "kill_switch_enabled",
+            "matchingTarget",
+            "matching_target",
+        }
+    ),
+    # Port forwards: identity, state and the port and protocol settings.
+    "port_forward": frozenset(
+        {
+            "_id",
+            "enabled",
+            "proto",
+            "dst_port",
+            "fwd_port",
+            "log",
+            "src_limiting_enabled",
+            "pfwd_interface",
+        }
+    ),
+    # Traffic rules: identity, state, action and matching target.
+    "traffic_rule": frozenset({"_id", "enabled", "action", "matching_target"}),
+    # NAT rules: identity, state, type, protocol and order.
+    "nat_rule": frozenset(
+        {
+            "_id",
+            "enabled",
+            "type",
+            "protocol",
+            "ip_version",
+            "logging",
+            "rule_index",
+            "exclude",
+            "is_predefined",
+            "setting_preference",
+            "port",
+        }
+    ),
+    # Static routes: identity, state, route type, distance and gateway type.
+    "static_route": frozenset(
+        {
+            "_id",
+            "enabled",
+            "type",
+            "static-route_type",
+            "static-route_distance",
+            "gateway_type",
+        }
+    ),
+}
+
+# A string value that is kept: letters, digits, "_", "," and "-" only. An
+# address, a CIDR, a domain, a URL and free text all contain something else.
+_SAFE_EXPORT_STRING = re.compile(r"[A-Za-z0-9_,-]{0,64}")
+# A mapping key that is kept; a mapping with any other key is replaced whole.
+_SAFE_EXPORT_KEY = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _safe_export_value(value: Any) -> Any:
+    """
+    Return a value of a kept export key, or REDACTED when it is not safe.
+
+    Numbers, booleans and None are kept; so are short strings made of letters,
+    digits, "_", "," and "-". Lists and mappings are checked item by item, and
+    a mapping with any other kind of key is replaced as a whole.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if _SAFE_EXPORT_STRING.fullmatch(value) else REDACTED
+    if isinstance(value, list):
+        return [_safe_export_value(item) for item in value]
+    if isinstance(value, Mapping):
+        if not all(
+            isinstance(key, str) and _SAFE_EXPORT_KEY.fullmatch(key) for key in value
+        ):
+            return REDACTED
+        return {key: _safe_export_value(item) for key, item in value.items()}
+    return REDACTED
+
+
+def _redact_export_rule(rule_type: str, record: Any) -> Any:
+    """Keep the allow-listed keys of one exported rule and replace the rest."""
+    if not isinstance(record, Mapping):
+        return REDACTED
+    # A key that is not an ordinary field name (an address, a host name, a
+    # number) is data, not a field: the whole record goes, key names included.
+    if not all(
+        isinstance(key, str) and _SAFE_EXPORT_KEY.fullmatch(key) for key in record
+    ):
+        return REDACTED
+    safe_keys = RULE_EXPORT_SAFE_KEYS.get(rule_type, frozenset())
+    return {
+        key: _safe_export_value(value) if key in safe_keys else REDACTED
+        for key, value in record.items()
+    }
+
+
+def _redact_export_family(rule_type: str, exported: Any) -> Any:
+    """Redact one rule family of one site; its status and count stay."""
+    if not isinstance(exported, Mapping):
+        return REDACTED
+    family: dict[str, Any] = dict.fromkeys(exported, REDACTED)
+    for key in ("status", "count"):
+        if key in exported:
+            family[key] = _safe_export_value(exported[key])
+    rules = exported.get("rules")
+    if isinstance(rules, list):
+        family["rules"] = [_redact_export_rule(rule_type, rule) for rule in rules]
+    return family
+
+
+def _redact_export_site(site: Any) -> Any:
+    """Redact one exported site: its name goes, its rule families are checked."""
+    if not isinstance(site, Mapping):
+        return REDACTED
+    redacted: dict[str, Any] = dict.fromkeys(site, REDACTED)
+    rule_types = site.get("rule_types")
+    if isinstance(rule_types, Mapping):
+        redacted["rule_types"] = {
+            rule_type: _redact_export_family(rule_type, exported)
+            for rule_type, exported in rule_types.items()
+        }
+    return redacted
+
+
+def redact_network_rule_export(document: dict[str, Any]) -> dict[str, Any]:
+    """
+    Return a redacted copy of a rule export that is safe by construction.
+
+    Only allow-listed rule keys keep their value (and only when it passes
+    ``_safe_export_value``); every other value, and every key this function
+    does not know, is replaced by REDACTED. Site ids become ``site-1``,
+    ``site-2``, ... in the sorted order of the original ids, site names and the
+    console's values are replaced, and every MAC address that still got through
+    is anonymised. The input is not changed.
+    """
+    redacted: dict[str, Any] = dict.fromkeys(document, REDACTED)
+    for key in ("format_version", "generated_at"):
+        if key in document:
+            redacted[key] = document[key]
+    redacted["redacted"] = True
+    console = document.get("console")
+    if "console" in document:
+        redacted["console"] = (
+            dict.fromkeys(console, REDACTED)
+            if isinstance(console, Mapping)
+            else REDACTED
+        )
+    sites = document.get("sites")
+    if isinstance(sites, Mapping):
+        labels = {
+            site_id: f"site-{number}"
+            for number, site_id in enumerate(sorted(sites, key=str), start=1)
+        }
+        redacted["sites"] = {
+            labels[site_id]: _redact_export_site(site)
+            for site_id, site in sites.items()
+        }
+    result: dict[str, Any] = _anonymize_macs(redacted, {})
+    return result
 
 
 def _site_manager_summary(
@@ -354,12 +621,169 @@ def _site_manager_summary(
     }
 
 
+# Subscriber name and number identify a customer; they are the only allowlisted
+# Carrier Fabric fields that are personal data.
+CARRIER_REDACT_KEYS = frozenset({"name", "subscriberNumber"})
+
+
+def _count_known(values: Iterable[Any], known: tuple[str, ...]) -> dict[str, int]:
+    """Count enum values, folding anything unpublished into "other"."""
+    counts: dict[str, int] = {}
+    for value in values:
+        bucket = value if value in known else "other"
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def _mobility_summary(coordinator: UnifiInsightsMobilityCoordinator) -> dict[str, Any]:
+    """
+    Describe Mobility health with counts only.
+
+    Workspace and router names, ids, MACs, IP addresses, the carrier, Wi-Fi
+    and VPN names and GPS positions all identify the account or its owner,
+    so none of the snapshot's values leave except published enum values.
+    """
+    snapshot = coordinator.data
+    workspaces = snapshot["workspaces"].values()
+    devices = snapshot["devices"].values()
+    interval = coordinator.update_interval
+    return {
+        "owner": True,
+        "access": snapshot["access"],
+        "last_update_success": coordinator.last_update_success,
+        "last_error_type": coordinator.last_error_type,
+        "update_interval_seconds": (
+            int(interval.total_seconds()) if interval is not None else None
+        ),
+        "updated_at": snapshot["updated_at"],
+        "workspaces": {
+            "total": len(workspaces),
+            "by_status": _count_known(
+                (workspace.get("status") for workspace in workspaces),
+                MOBILITY_WORKSPACE_STATUSES,
+            ),
+        },
+        "devices": {
+            "total": len(devices),
+            "by_state": _count_known(
+                (device.get("state") for device in devices), MOBILITY_ROUTER_STATES
+            ),
+            "by_model": _count_known(
+                (device.get("model") for device in devices), MOBILITY_MODELS
+            ),
+            "with_location": sum(
+                1 for device in devices if isinstance(device.get("location"), dict)
+            ),
+            "detail_unavailable": sum(
+                1 for device in devices if not device.get("detail_available")
+            ),
+        },
+    }
+
+
+# Access collections carry user and actor identifiers, PIN material and IDs
+# that link a door to a hub. Names stay, because they make a report readable.
+ACCESS_TO_REDACT = TO_REDACT | {
+    "id",
+    "location_id",
+    "user_id",
+    "actor",
+    "actor_id",
+    "user_email",
+    "first_name",
+    "last_name",
+    "full_name",
+    "alias",
+    "employee_number",
+    "access_policy_ids",
+    "access_policies",
+    "pin",
+    "pin_code",
+    "pin_codes",
+    "signature",
+    "authentication_value",
+    "token",
+}
+
+
+def _access_diagnostics(coordinator: UnifiInsightsAccessCoordinator) -> dict[str, Any]:
+    """Summarize Access auth state, feature capability and redacted snapshot."""
+    data = coordinator.data or {}
+    snapshot = {
+        "doors": [dict(door) for door in data.get("doors", {}).values()],
+        "devices": [dict(device) for device in data.get("devices", {}).values()],
+        "emergency": data.get("emergency"),
+    }
+    return {
+        "auth_failed": coordinator.auth_failed,
+        "webhook_active": coordinator.webhook_active,
+        "features": {
+            feature: coordinator.feature_available(feature)
+            for feature in ("doors", "devices", "emergency")
+        },
+        "snapshot": async_redact_data(snapshot, ACCESS_TO_REDACT),
+    }
+
+
 async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, entry: UnifiInsightsConfigEntry
+    hass: HomeAssistant, entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
     _ = hass
     _LOGGER.debug("Gathering diagnostics data for UniFi Insights")
+
+    if isinstance(entry.runtime_data, CarrierFabricData):
+        carrier_data = entry.runtime_data
+        carrier_coordinator = carrier_data.coordinator
+        coord_data = carrier_coordinator.data
+
+        summary = (
+            coord_data.get("summary", {})
+            if isinstance(coord_data.get("summary"), dict)
+            else {}
+        )
+
+        last_exc = getattr(carrier_coordinator, "last_exception", None)
+        last_exc_type = last_exc.__class__.__name__ if last_exc is not None else None
+
+        # Only allowlisted keys are exported: a field the API adds later never
+        # reaches a diagnostics file until it has been reviewed for privacy.
+        exported_plans: dict[str, Any] = {
+            plan_id: {
+                key: value
+                for key, value in plan_data.items()
+                if key in SERVICE_PLAN_ALLOWLIST
+            }
+            for plan_id, plan_data in coord_data.get("service_plans", {}).items()
+        }
+        exported_subs: dict[str, Any] = {
+            sub_id: async_redact_data(
+                {
+                    key: value
+                    for key, value in sub_data.items()
+                    if key in SUBSCRIBER_ALLOWLIST
+                },
+                CARRIER_REDACT_KEYS,
+            )
+            for sub_id, sub_data in coord_data.get("subscribers", {}).items()
+        }
+
+        return {
+            "entry": async_redact_data(entry.as_dict(), TO_REDACT),
+            "coordinator": {
+                "last_update_success": getattr(
+                    carrier_coordinator, "last_update_success", True
+                ),
+                "last_exception_type": last_exc_type,
+            },
+            "summary": summary,
+            "data": {
+                "org_id": coord_data.get("org_id"),
+                "summary": summary,
+                "service_plans": exported_plans,
+                "subscribers": exported_subs,
+            },
+        }
 
     data = entry.runtime_data
     coordinator = data.coordinator
@@ -413,6 +837,14 @@ async def async_get_config_entry_diagnostics(
             data.site_manager_coordinator.data,
             entry.data.get(CONF_CONSOLE_ID, ""),
         )
+    if data.mobility_coordinator:
+        diagnostics_data["mobility"] = _mobility_summary(data.mobility_coordinator)
+    elif entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_REMOTE:
+        # Another remote entry with the same cloud key polls Mobility.
+        diagnostics_data["mobility"] = {"owner": False}
+    access_coordinator = getattr(data, "access_coordinator", None)
+    if access_coordinator is not None:
+        diagnostics_data["access"] = _access_diagnostics(access_coordinator)
 
     # Last pass over the assembled payload: no MAC address leaves this
     # integration, whatever key the controller sent it under.

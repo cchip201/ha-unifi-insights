@@ -15,6 +15,10 @@ from custom_components.unifi_insights.api.base import _retry_after_seconds
 from custom_components.unifi_insights.api.const import DEFAULT_RATE_LIMIT_RETRY_AFTER
 from custom_components.unifi_insights.api.exceptions import UniFiResponseError
 from custom_components.unifi_insights.api.site_manager import UniFiSiteManagerClient
+from custom_components.unifi_insights.api.site_manager.client import (
+    _MAX_ITEMS,
+    _MAX_PAGES,
+)
 
 
 class _Response:
@@ -184,3 +188,357 @@ async def test_site_manager_response_bodies_are_not_logged(
 
     assert "private-host-id" not in caplog.text
     assert "[Site Manager response omitted]" in caplog.text
+
+
+async def test_get_host_pins_verb_path_and_unwraps_data() -> None:
+    """get_host requests GET /v1/hosts/{id} and unwraps the data object."""
+    session = _Session(
+        [
+            {
+                "data": {
+                    "id": "host-123",
+                    "hardwareId": "hw-1",
+                    "type": "console",
+                    "ipAddress": "192.168.1.1",
+                },
+                "httpStatusCode": 200,
+                "traceId": "trace-123",
+            },
+            {"data": "not-a-dict"},
+        ]
+    )
+    client = _client(session)
+
+    host = await client.get_host("host-123")
+
+    assert host == {
+        "id": "host-123",
+        "hardwareId": "hw-1",
+        "type": "console",
+        "ipAddress": "192.168.1.1",
+    }
+    assert session.requests[0]["method"] == "GET"
+    assert session.requests[0]["url"] == "https://api.ui.com/v1/hosts/host-123"
+    assert session.requests[0]["params"] is None
+    assert session.requests[0]["headers"]["X-API-Key"] == "test-key"
+
+    with pytest.raises(UniFiResponseError) as error:
+        await client.get_host("host-123")
+    assert "malformed data" in error.value.args[0]
+
+    session_envelope = _Session([["not-a-dict"]])
+    client_envelope = _client(session_envelope)
+    with pytest.raises(UniFiResponseError) as error:
+        await client_envelope.get_host("host-123")
+    assert "malformed response envelope" in error.value.args[0]
+
+
+async def test_get_isp_metrics_options_and_query_parameters() -> None:
+    """get_isp_metrics supports metric_type, duration, and timestamps."""
+    session = _Session(
+        [
+            {"data": [{"hostId": "host-1", "metricType": "1h", "periods": []}]},
+            {"data": [{"hostId": "host-2", "metricType": "5m", "periods": []}]},
+            {"data": [{"hostId": "host-3", "metricType": "5m", "periods": []}]},
+            {"data": [{"hostId": "host-4", "metricType": "5m", "periods": []}]},
+        ]
+    )
+    client = _client(session)
+    dt1 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    dt2 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    # 1. begin_timestamp and end_timestamp with 1h metric_type
+    res1 = await client.get_isp_metrics(
+        begin_timestamp=dt1, end_timestamp=dt2, metric_type="1h"
+    )
+    assert res1 == [{"hostId": "host-1", "metricType": "1h", "periods": []}]
+    assert session.requests[0]["method"] == "GET"
+    assert session.requests[0]["url"] == "https://api.ui.com/v1/isp-metrics/1h"
+    assert session.requests[0]["params"] == {
+        "beginTimestamp": "2026-01-01T00:00:00Z",
+        "endTimestamp": "2026-01-01T12:00:00Z",
+    }
+
+    # 2. duration with default metric_type (5m)
+    res2 = await client.get_isp_metrics(duration="24h")
+    assert res2 == [{"hostId": "host-2", "metricType": "5m", "periods": []}]
+    assert session.requests[1]["method"] == "GET"
+    assert session.requests[1]["url"] == "https://api.ui.com/v1/isp-metrics/5m"
+    assert session.requests[1]["params"] == {"duration": "24h"}
+
+    # 3. positional begin_timestamp and end_timestamp
+    res3 = await client.get_isp_metrics(dt1, dt2)
+    assert res3 == [{"hostId": "host-3", "metricType": "5m", "periods": []}]
+    assert session.requests[2]["method"] == "GET"
+    assert session.requests[2]["url"] == "https://api.ui.com/v1/isp-metrics/5m"
+    assert session.requests[2]["params"] == {
+        "beginTimestamp": "2026-01-01T00:00:00Z",
+        "endTimestamp": "2026-01-01T12:00:00Z",
+    }
+
+    # 4. keyword begin_timestamp and end_timestamp with default metric_type
+    res4 = await client.get_isp_metrics(begin_timestamp=dt1, end_timestamp=dt2)
+    assert res4 == [{"hostId": "host-4", "metricType": "5m", "periods": []}]
+    assert session.requests[3]["method"] == "GET"
+    assert session.requests[3]["url"] == "https://api.ui.com/v1/isp-metrics/5m"
+    assert session.requests[3]["params"] == {
+        "beginTimestamp": "2026-01-01T00:00:00Z",
+        "endTimestamp": "2026-01-01T12:00:00Z",
+    }
+
+
+async def test_query_isp_metrics_pins_verb_path_body_and_unwraps_data() -> None:
+    """query_isp_metrics issues POST /v1/isp-metrics/{type}/query with sites body."""
+    sites = [
+        {
+            "hostId": "host-1",
+            "siteId": "site-1",
+            "beginTimestamp": "2026-01-01T00:00:00Z",
+            "endTimestamp": "2026-01-01T01:00:00Z",
+        }
+    ]
+    session = _Session(
+        [
+            {
+                "data": {
+                    "metrics": [
+                        {
+                            "hostId": "host-1",
+                            "siteId": "site-1",
+                            "metricType": "5m",
+                            "periods": [],
+                        }
+                    ],
+                    "status": "OK",
+                    "message": None,
+                },
+                "httpStatusCode": 200,
+                "traceId": "trace-query-1",
+            },
+            {"data": "invalid-data-string"},
+        ]
+    )
+    client = _client(session)
+
+    res = await client.query_isp_metrics("5m", sites)
+
+    assert res == {
+        "metrics": [
+            {
+                "hostId": "host-1",
+                "siteId": "site-1",
+                "metricType": "5m",
+                "periods": [],
+            }
+        ],
+        "status": "OK",
+        "message": None,
+    }
+    assert session.requests[0]["method"] == "POST"
+    assert session.requests[0]["url"] == "https://api.ui.com/v1/isp-metrics/5m/query"
+    assert session.requests[0]["json"] == {"sites": sites}
+    assert session.requests[0]["headers"]["X-API-Key"] == "test-key"
+
+    with pytest.raises(UniFiResponseError) as error:
+        await client.query_isp_metrics("5m", sites)
+    assert "malformed data" in error.value.args[0]
+
+
+async def test_get_sd_wan_config_pins_verb_path_and_unwraps_data() -> None:
+    """get_sd_wan_config requests GET /v1/sd-wan-configs/{id}."""
+    session = _Session(
+        [
+            {
+                "data": {
+                    "id": "cfg-456",
+                    "name": "Mesh VPN",
+                    "type": "mesh",
+                    "hubs": [],
+                    "spokes": [],
+                },
+                "httpStatusCode": 200,
+                "traceId": "trace-sdwan-1",
+            },
+            {"data": None},
+        ]
+    )
+    client = _client(session)
+
+    config = await client.get_sd_wan_config("cfg-456")
+
+    assert config == {
+        "id": "cfg-456",
+        "name": "Mesh VPN",
+        "type": "mesh",
+        "hubs": [],
+        "spokes": [],
+    }
+    assert session.requests[0]["method"] == "GET"
+    assert session.requests[0]["url"] == "https://api.ui.com/v1/sd-wan-configs/cfg-456"
+    assert session.requests[0]["params"] is None
+    assert session.requests[0]["headers"]["X-API-Key"] == "test-key"
+
+    with pytest.raises(UniFiResponseError) as error:
+        await client.get_sd_wan_config("cfg-456")
+    assert "malformed data" in error.value.args[0]
+
+
+async def test_get_sd_wan_config_status_pins_verb_path_and_unwraps_data() -> None:
+    """get_sd_wan_config_status requests GET /v1/sd-wan-configs/{id}/status."""
+    session = _Session(
+        [
+            {
+                "data": {
+                    "id": "cfg-456",
+                    "generateStatus": "success",
+                    "hubs": [],
+                    "spokes": [],
+                },
+                "httpStatusCode": 200,
+                "traceId": "trace-sdwan-status-1",
+            },
+            {"data": "bad-data"},
+        ]
+    )
+    client = _client(session)
+
+    status = await client.get_sd_wan_config_status("cfg-456")
+
+    assert status == {
+        "id": "cfg-456",
+        "generateStatus": "success",
+        "hubs": [],
+        "spokes": [],
+    }
+    assert session.requests[0]["method"] == "GET"
+    assert (
+        session.requests[0]["url"]
+        == "https://api.ui.com/v1/sd-wan-configs/cfg-456/status"
+    )
+    assert session.requests[0]["params"] is None
+    assert session.requests[0]["headers"]["X-API-Key"] == "test-key"
+
+    with pytest.raises(UniFiResponseError) as error:
+        await client.get_sd_wan_config_status("cfg-456")
+    assert "malformed data" in error.value.args[0]
+
+
+async def test_validate_connection_and_list_sites() -> None:
+    """validate_connection checks credentials and list_sites paginates /v1/sites."""
+    session = _Session(
+        [
+            {"data": [{"id": "host-1", "type": "console"}]},
+            {"data": [{"id": "site-1", "name": "Main Site"}]},
+        ]
+    )
+    client = _client(session)
+
+    assert await client.validate_connection() is True
+    assert session.requests[0]["method"] == "GET"
+    assert session.requests[0]["url"] == "https://api.ui.com/v1/hosts"
+
+    sites = await client.list_sites()
+    assert sites == [{"id": "site-1", "name": "Main Site"}]
+    assert session.requests[1]["method"] == "GET"
+    assert session.requests[1]["url"] == "https://api.ui.com/v1/sites"
+
+
+async def test_list_devices_anonymous_groups() -> None:
+    """Device groups without a hostId are collected into anonymous_groups."""
+    session = _Session(
+        [
+            {
+                "data": [
+                    {
+                        "hostId": "",
+                        "devices": [{"id": "anon-dev-1", "name": "Standalone"}],
+                    },
+                    {
+                        "hostId": None,
+                        "devices": [{"id": "anon-dev-2", "name": "Unmanaged"}],
+                    },
+                ]
+            }
+        ]
+    )
+    client = _client(session)
+
+    devices = await client.list_devices()
+    assert devices == [
+        {"hostId": "", "devices": [{"id": "anon-dev-1", "name": "Standalone"}]},
+        {"hostId": None, "devices": [{"id": "anon-dev-2", "name": "Unmanaged"}]},
+    ]
+
+
+async def test_list_paginated_item_and_page_limits() -> None:
+    """_list_paginated enforces item limit, empty page check, and page limit."""
+    # 1. Exceeded item limit
+    session_items = _Session(
+        [
+            {
+                "data": [{"id": f"item-{i}"} for i in range(_MAX_ITEMS)],
+                "nextToken": "tok-1",
+            },
+            {"data": [{"id": "item-over-limit"}], "nextToken": "tok-2"},
+        ]
+    )
+    client_items = _client(session_items)
+    with pytest.raises(UniFiResponseError) as error:
+        await client_items.list_sites()
+    assert "exceeded the item limit" in error.value.args[0]
+    assert len(session_items.requests) == 2
+
+    # 2. Empty page with nextToken
+    session_empty = _Session(
+        [
+            {"data": [], "nextToken": "tok-empty"},
+        ]
+    )
+    client_empty = _client(session_empty)
+    with pytest.raises(UniFiResponseError) as error:
+        await client_empty.list_sites()
+    assert "returned an empty page with nextToken" in error.value.args[0]
+
+    # 3. Exceeded page limit (100 pages)
+    session_pages = _Session(
+        [
+            {"data": [{"id": f"site-{i}"}], "nextToken": f"tok-{i}"}
+            for i in range(_MAX_PAGES + 1)
+        ]
+    )
+    client_pages = _client(session_pages)
+    with pytest.raises(UniFiResponseError) as error:
+        await client_pages.list_sites()
+    assert "exceeded the page limit" in error.value.args[0]
+    assert len(session_pages.requests) == _MAX_PAGES
+
+
+async def test_iso_timestamp_requires_timezone_offset() -> None:
+    """get_isp_metrics rejects timestamps without a timezone offset."""
+    session = _Session([])
+    client = _client(session)
+    naive_dt = datetime.now(tz=UTC).replace(tzinfo=None)
+
+    with pytest.raises(ValueError, match="Timestamps must include a UTC offset"):
+        await client.get_isp_metrics(begin_timestamp=naive_dt)
+
+
+async def test_envelope_and_next_token_error_handling() -> None:
+    """Response envelope and nextToken validations reject invalid payloads."""
+    client = _client(_Session([]))
+
+    with pytest.raises(UniFiResponseError) as error:
+        client._extract_data(["not-a-dict"], "/v1/test")
+    assert "malformed response envelope" in error.value.args[0]
+
+    with pytest.raises(UniFiResponseError) as error:
+        client._extract_next_token(["not-a-dict"], "/v1/test")
+    assert "malformed response envelope" in error.value.args[0]
+
+    with pytest.raises(UniFiResponseError) as error:
+        client._extract_next_token({"nextToken": 12345}, "/v1/test")
+    assert "invalid nextToken" in error.value.args[0]
+
+    with pytest.raises(UniFiResponseError) as error:
+        client._extract_next_token({"nextToken": ""}, "/v1/test")
+    assert "invalid nextToken" in error.value.args[0]

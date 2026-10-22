@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -12,7 +13,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Self, TypeVar
 
 import aiohttp
 from yarl import URL
@@ -28,6 +29,7 @@ from .const import (
     HEADER_USER_AGENT,
     RATE_LIMIT_MAX_RETRY_AFTER,
     RATE_LIMIT_WINDOW_MARGIN,
+    SENSITIVE_CREDENTIAL_KEYS,
     USER_AGENT,
 )
 from .exceptions import (
@@ -42,23 +44,81 @@ from .exceptions import (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
+    from .access.auth import AccessTokenAuth
+
 _LOGGER = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_SENSITIVE_KEYS_RE = re.compile(
-    r'"(?:password|psk|passphrase|token|apiKey|api_key|secret|credential|'
-    r'x-api-key|authorization|code|voucher|fingerprint)"\s*:\s*"[^"]*"',
+_TRANSPORT_ONLY_SENSITIVE_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "apikey",
+        "credential",
+        "x-api-key",
+        "authorization",
+        "code",
+        "pin",
+        "pin_code",
+        "pin_codes",
+    }
+)
+
+_SENSITIVE_KEYS: Final[frozenset[str]] = frozenset(
+    {k.lower() for k in SENSITIVE_CREDENTIAL_KEYS} | _TRANSPORT_ONLY_SENSITIVE_KEYS
+)
+
+_REDACTED_MALFORMED_BODY: Final[str] = "<malformed body redacted>"
+
+# Group 1 keeps the key and separator. The value pattern consumes escaped
+# quotes, so a secret containing a colon or an escaped quote is replaced whole.
+_SENSITIVE_KEYS_PATTERN: Final[str] = "|".join(
+    re.escape(k) for k in sorted(_SENSITIVE_KEYS, key=lambda k: (-len(k), k))
+)
+_SENSITIVE_KEYS_RE: Final[re.Pattern[str]] = re.compile(
+    rf'("(?:{_SENSITIVE_KEYS_PATTERN})"\s*:\s*)'
+    r'"(?:[^"\\]|\\[\s\S])*(?:"(?=\s*(?:[,}\]]|<|$))|\\?$)',
+    re.IGNORECASE,
+)
+# Start at a quote to avoid rescanning unmatched backslash runs.
+_UNSAFE_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf'["\'](?:{_SENSITIVE_KEYS_PATTERN})(?:\\*["\'])\s*:',
+    re.IGNORECASE,
+)
+# Decode each backslash run once when checking escaped credential keys.
+_UNICODE_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<!\\)\\+u([0-9a-fA-F]{4})",
     re.IGNORECASE,
 )
 
 
+def _redact_json(value: Any) -> Any:
+    """Redact credential keys recursively regardless of their JSON value type."""
+    if isinstance(value, dict):
+        return {
+            key: "**REDACTED**"
+            if key.lower() in _SENSITIVE_KEYS
+            else _redact_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value]
+    return value
+
+
 def _redact(text: str) -> str:
-    """Replace sensitive JSON field values with a redaction placeholder."""
-    return _SENSITIVE_KEYS_RE.sub(
-        lambda m: m.group(0).rsplit(":", 1)[0] + ': "**REDACTED**"',
-        text,
-    )
+    """Redact parsed JSON credentials, or fail closed on unsafe non-JSON text."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        # Keep removed fragments apart while checking for unsafe key prefixes.
+        remainder = _UNICODE_ESCAPE_RE.sub(
+            lambda match: chr(int(match.group(1), 16)),
+            _SENSITIVE_KEYS_RE.sub("\x00", text),
+        )
+        if _UNSAFE_SENSITIVE_KEY_RE.search(remainder):
+            return _REDACTED_MALFORMED_BODY
+        return _SENSITIVE_KEYS_RE.sub(r'\1"**REDACTED**"', text)
+    return json.dumps(_redact_json(value))
 
 
 def _retry_after_seconds(value: str | None) -> int:
@@ -70,7 +130,7 @@ def _retry_after_seconds(value: str | None) -> int:
     except ValueError:
         try:
             deadline = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return DEFAULT_RATE_LIMIT_RETRY_AFTER
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=UTC)
@@ -142,7 +202,7 @@ class BaseUniFiClient(ABC):
 
     def __init__(
         self,
-        auth: ApiKeyAuth | LocalAuth,
+        auth: ApiKeyAuth | LocalAuth | AccessTokenAuth,
         base_url: str,
         *,
         session: aiohttp.ClientSession | None = None,
@@ -216,6 +276,15 @@ class BaseUniFiClient(ABC):
         if isinstance(self._auth, LocalAuth):
             return self._auth.verify_ssl
         return True
+
+    def _ssl_for_request(self) -> bool | None:
+        """
+        Return a per-request TLS verification override, or None for the session's.
+
+        A session shared with Home Assistant keeps its own connector, so a client
+        that verifies differently passes its setting on every request.
+        """
+        return None
 
     def _get_headers(self) -> dict[str, str]:
         """
@@ -310,8 +379,10 @@ class BaseUniFiClient(ABC):
         *,
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
+        body_factory: Callable[[], aiohttp.FormData] | None = None,
         headers: dict[str, str] | None = None,
         expected_unsupported: bool = False,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Make an HTTP request, retrying once after a short-lived 429.
@@ -329,8 +400,10 @@ class BaseUniFiClient(ABC):
                 path,
                 params=params,
                 json_data=json_data,
+                body_factory=body_factory,
                 headers=headers,
                 expected_unsupported=expected_unsupported,
+                log_body=log_body,
             ),
             f"{method} {path}",
         )
@@ -342,8 +415,10 @@ class BaseUniFiClient(ABC):
         *,
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
+        body_factory: Callable[[], aiohttp.FormData] | None = None,
         headers: dict[str, str] | None = None,
         expected_unsupported: bool = False,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Make a single HTTP request to the API.
@@ -353,9 +428,11 @@ class BaseUniFiClient(ABC):
             path: API path.
             params: Query parameters.
             json_data: JSON body data.
+            body_factory: Build a fresh multipart body for this attempt (omits all Content-Type headers).
             headers: Additional headers.
             expected_unsupported: Whether a non-JSON 2xx response is an
                 expected unsupported-endpoint signal.
+            log_body: Whether redacted response body excerpts may be logged.
 
         Returns:
             Response data as dict, list, or None.
@@ -376,6 +453,15 @@ class BaseUniFiClient(ABC):
         request_headers = self._get_headers()
         if headers:
             request_headers.update(headers)
+        if body_factory is not None:
+            # Omit all Content-Type headers in any casing, letting aiohttp supply
+            # the multipart boundary while retaining authentication and other
+            # caller header overrides.
+            request_headers = {
+                key: value
+                for key, value in request_headers.items()
+                if key.lower() != HEADER_CONTENT_TYPE.lower()
+            }
 
         _LOGGER.debug(
             "Making %s request to %s",
@@ -383,18 +469,30 @@ class BaseUniFiClient(ABC):
             url,
         )
 
+        request_options: dict[str, Any] = {}
+        ssl = self._ssl_for_request()
+        if ssl is not None:
+            request_options["ssl"] = ssl
+
         try:
+            request_body: dict[str, Any] = (
+                {"data": body_factory()}
+                if body_factory is not None
+                else {"json": json_data}
+            )
             async with session.request(
                 method,
                 url,
                 params=params,
-                json=json_data,
+                **request_body,
                 headers=request_headers,
+                **request_options,
             ) as response:
                 return await self._handle_response(
                     response,
                     expected_unsupported=expected_unsupported,
                     request_path=path,
+                    log_body=log_body,
                 )
 
         except aiohttp.ClientConnectorError as err:
@@ -417,6 +515,7 @@ class BaseUniFiClient(ABC):
         *,
         expected_unsupported: bool = False,
         request_path: str | None = None,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Handle API response.
@@ -426,6 +525,7 @@ class BaseUniFiClient(ABC):
             expected_unsupported: Log unredirected non-JSON 2xx responses at
                 DEBUG as expected unsupported-endpoint signals.
             request_path: Original request path before any redirect.
+            log_body: Whether redacted response body excerpts may be logged.
 
         Returns:
             Response data.
@@ -441,7 +541,12 @@ class BaseUniFiClient(ABC):
         response_text = await response.text()
 
         if _LOGGER.isEnabledFor(logging.DEBUG):
-            redacted_body = self._response_log_text(response_text, limit=500)
+            # Retain the override used by clients that omit response bodies.
+            redacted_body = (
+                self._response_log_text(response_text, limit=500)
+                if log_body
+                else f"<body omitted, {len(response_text.encode('utf-8'))} bytes>"
+            )
             _LOGGER.debug(
                 "Response status: %s, body: %s",
                 status,
@@ -497,7 +602,11 @@ class BaseUniFiClient(ABC):
             # True and entities kept serving stale cached data indefinitely
             # instead of surfacing as unavailable and letting the
             # coordinator's normal retry/backoff take over.
-            redacted_response = self._response_log_text(response_text, limit=200)
+            redacted_response = (
+                self._response_log_text(response_text, limit=200)
+                if log_body
+                else f"<body omitted, {len(response_text.encode('utf-8'))} bytes>"
+            )
             expected_path = (
                 self._build_url(request_path).path
                 if request_path is not None
@@ -541,6 +650,7 @@ class BaseUniFiClient(ABC):
         *,
         params: dict[str, Any] | None = None,
         expected_unsupported: bool = False,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Make a GET request.
@@ -550,6 +660,7 @@ class BaseUniFiClient(ABC):
             params: Query parameters.
             expected_unsupported: Whether a non-JSON 2xx response is an
                 expected unsupported-endpoint signal.
+            log_body: Whether redacted response body excerpts may be logged.
 
         Returns:
             Response data.
@@ -560,6 +671,7 @@ class BaseUniFiClient(ABC):
             path,
             params=params,
             expected_unsupported=expected_unsupported,
+            log_body=log_body,
         )
 
     async def _post(
@@ -567,8 +679,10 @@ class BaseUniFiClient(ABC):
         path: str,
         *,
         json_data: dict[str, Any] | None = None,
+        body_factory: Callable[[], aiohttp.FormData] | None = None,
         params: dict[str, Any] | None = None,
         expected_unsupported: bool = False,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Make a POST request.
@@ -576,9 +690,11 @@ class BaseUniFiClient(ABC):
         Args:
             path: API path.
             json_data: JSON body data.
+            body_factory: Build a fresh multipart body for each attempt (omits all Content-Type headers).
             params: Query parameters.
             expected_unsupported: Whether a non-JSON 2xx response is an
                 expected unsupported-endpoint signal.
+            log_body: Whether redacted response body excerpts may be logged.
 
         Returns:
             Response data.
@@ -588,8 +704,10 @@ class BaseUniFiClient(ABC):
             "POST",
             path,
             json_data=json_data,
+            body_factory=body_factory,
             params=params,
             expected_unsupported=expected_unsupported,
+            log_body=log_body,
         )
 
     async def _put(
@@ -598,6 +716,7 @@ class BaseUniFiClient(ABC):
         *,
         json_data: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Make a PUT request.
@@ -606,12 +725,15 @@ class BaseUniFiClient(ABC):
             path: API path.
             json_data: JSON body data.
             params: Query parameters.
+            log_body: Whether redacted response body excerpts may be logged.
 
         Returns:
             Response data.
 
         """
-        return await self._request("PUT", path, json_data=json_data, params=params)
+        return await self._request(
+            "PUT", path, json_data=json_data, params=params, log_body=log_body
+        )
 
     async def _patch(
         self,
@@ -637,6 +759,7 @@ class BaseUniFiClient(ABC):
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        log_body: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
         """
         Make a DELETE request.
@@ -644,12 +767,130 @@ class BaseUniFiClient(ABC):
         Args:
             path: API path.
             params: Query parameters.
+            log_body: Whether redacted response body excerpts may be logged.
 
         Returns:
             Response data.
 
         """
-        return await self._request("DELETE", path, params=params)
+        return await self._request("DELETE", path, params=params, log_body=log_body)
+
+    async def _get_binary_with_content_type(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[bytes, str]:
+        """
+        Make a GET request that returns binary data and its content type.
+
+        Args:
+            path: API path.
+            params: Query parameters.
+
+        Returns:
+            Tuple of (binary_content, content_type).
+
+        A 429 is waited out and retried once, like the JSON requests: see
+        `_retry_once_after_rate_limit`.
+
+        Raises:
+            UniFiAuthenticationError: If authentication fails.
+            UniFiConnectionError: If connection fails.
+            UniFiNotFoundError: If resource not found.
+            UniFiRateLimitError: If rate limited.
+            UniFiResponseError: If API returns an error.
+            UniFiTimeoutError: If request times out.
+
+        """
+        return await self._retry_once_after_rate_limit(
+            lambda: self._get_binary_once(path, params=params),
+            f"GET {path}",
+        )
+
+    async def _get_binary_once(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[bytes, str]:
+        """
+        Make a single binary GET request.
+
+        Raises:
+            UniFiAuthenticationError: If authentication fails.
+            UniFiConnectionError: If connection fails.
+            UniFiNotFoundError: If resource not found.
+            UniFiRateLimitError: If rate limited.
+            UniFiResponseError: If API returns an error.
+            UniFiTimeoutError: If request times out.
+
+        """
+        await self._throttle()
+        session = await self._ensure_session()
+        url = self._build_url(path)
+        headers = self._get_headers()
+        # Remove JSON content type for binary requests
+        headers.pop(HEADER_CONTENT_TYPE, None)
+        headers[HEADER_ACCEPT] = "*/*"
+
+        _LOGGER.debug(
+            "Making binary GET request to %s",
+            url,
+        )
+
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=headers,
+            ) as response:
+                status = response.status
+                if status >= HTTPStatus.BAD_REQUEST:
+                    text = await response.text()
+                    if status == HTTPStatus.UNAUTHORIZED:
+                        msg = "Authentication failed. Check your API key."
+                        raise UniFiAuthenticationError(msg, status_code=status)
+                    if status == HTTPStatus.FORBIDDEN:
+                        msg = "Access forbidden. Check your API key permissions."
+                        raise UniFiAuthenticationError(msg, status_code=status)
+                    if status == HTTPStatus.NOT_FOUND:
+                        msg = "Resource not found"
+                        raise UniFiNotFoundError(
+                            msg,
+                            status_code=status,
+                            response_body=text,
+                        )
+                    if status == HTTPStatus.TOO_MANY_REQUESTS:
+                        msg = "Rate limited by API"
+                        raise UniFiRateLimitError(
+                            msg,
+                            status_code=status,
+                            response_body=text,
+                            retry_after=parse_retry_after(response.headers),
+                        )
+                    msg = f"API error (status {status})"
+                    raise UniFiResponseError(
+                        msg,
+                        status_code=status,
+                        response_body=text,
+                    )
+
+                data = await response.read()
+                content_type = response.content_type or response.headers.get(
+                    HEADER_CONTENT_TYPE, "application/octet-stream"
+                )
+                return data, content_type
+
+        except aiohttp.ClientConnectorError as err:
+            msg = f"Failed to connect to {url}: {err}"
+            raise UniFiConnectionError(msg) from err
+        except TimeoutError as err:
+            msg = f"Request to {url} timed out"
+            raise UniFiTimeoutError(msg) from err
+        except aiohttp.ClientError as err:
+            msg = f"Request to {url} failed: {err}"
+            raise UniFiConnectionError(msg) from err
 
     @abstractmethod
     async def validate_connection(self) -> bool:

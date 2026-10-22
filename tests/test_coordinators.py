@@ -1,11 +1,13 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for multi-coordinator architecture (Platinum compliance)."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -13,7 +15,9 @@ import aiohttp
 import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from pydantic import ValidationError
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.unifi_insights.api import (
@@ -21,9 +25,11 @@ from custom_components.unifi_insights.api import (
     ConnectionType,
     UniFiAuthenticationError,
     UniFiConnectionError,
+    UniFiGlobalAlarmManagerError,
     UniFiNotFoundError,
     UniFiRateLimitError,
     UniFiResponseError,
+    UniFiRuleNotEditableError,
     UniFiTimeoutError,
 )
 from custom_components.unifi_insights.api.innerspace import (
@@ -35,10 +41,31 @@ from custom_components.unifi_insights.api.innerspace import (
     InnerSpaceSwitch,
     UniFiInnerSpaceClient,
 )
+from custom_components.unifi_insights.api.network.endpoints.vouchers import (
+    VouchersEndpoint,
+)
 from custom_components.unifi_insights.api.network.models import (
     LegacyPortMetrics,
     PortBytesMetrics,
     SiteReportBucket,
+)
+from custom_components.unifi_insights.api.protect import UniFiProtectClient
+from custom_components.unifi_insights.api.protect.endpoints.chimes import ChimesEndpoint
+from custom_components.unifi_insights.api.protect.models import (
+    Camera,
+    Chime,
+    Fob,
+    Light,
+    LinkStation,
+    LiveView,
+    Sensor,
+    Siren,
+    TalkbackSession,
+    Viewer,
+)
+from custom_components.unifi_insights.api.protect.talkback import (
+    TalkbackSchemeError,
+    TalkbackStreamError,
 )
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
@@ -65,8 +92,11 @@ from custom_components.unifi_insights.coordinators.config_sections import (
     async_fetch_site_routes,
     async_fetch_site_wifi_and_links,
     enrich_wifi,
+    is_predefined_nat_rule,
     map_legacy_site_names,
     resolve_report_site_name,
+    rule_display_name,
+    verified_legacy_site_name,
     wifi_qr_payload,
 )
 from custom_components.unifi_insights.coordinators.device import (
@@ -80,11 +110,21 @@ from custom_components.unifi_insights.coordinators.internet_activity import (
 from custom_components.unifi_insights.coordinators.protect import (
     MAX_CONSECUTIVE_EMPTY_FETCHES,
     MAX_CONSECUTIVE_MISSING_POLLS,
+    SIREN_STOP_GUARD_TTL,
     STALE_EVENT_TIMEOUT,
+    UNSUPPORTED_RESOURCE_RETRY,
     UnifiProtectCoordinator,
 )
 from custom_components.unifi_insights.entity import is_device_online
+from custom_components.unifi_insights.helpers import async_get_device_entry
 from tests.conftest import mock_device_lookup_method, set_mock_device_lookup
+from tests.fixtures.library_responses import (
+    SAMPLE_ALARM_HUB,
+    SAMPLE_ALARM_HUB_TAMPER_EVENT,
+    SAMPLE_KEYPAD_FOB,
+    SAMPLE_SIREN,
+    SAMPLE_THREAD_LINK_STATION,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -143,6 +183,26 @@ def _create_mock_network_client() -> MagicMock:
         ]
     )
 
+    # Port forwards namespace
+    client.port_forwards = MagicMock()
+    client.port_forwards.list_port_forwards = AsyncMock(return_value=[])
+    client.port_forwards.update_port_forward = AsyncMock()
+
+    # Traffic rules namespace
+    client.traffic_rules = MagicMock()
+    client.traffic_rules.list_traffic_rules = AsyncMock(return_value=[])
+    client.traffic_rules.update_traffic_rule = AsyncMock()
+
+    # NAT rules namespace
+    client.nat_rules = MagicMock()
+    client.nat_rules.list_nat_rules = AsyncMock(return_value=[])
+    client.nat_rules.update_nat_rule = AsyncMock()
+
+    # Static routes namespace
+    client.static_routes = MagicMock()
+    client.static_routes.list_static_routes = AsyncMock(return_value=[])
+    client.static_routes.update_static_route = AsyncMock()
+
     # WiFi namespace
     client.wifi = MagicMock()
     client.wifi.get_all = AsyncMock(
@@ -152,6 +212,10 @@ def _create_mock_network_client() -> MagicMock:
             ),
         ]
     )
+
+    # Vouchers namespace
+    client.vouchers = MagicMock()
+    client.vouchers.get_all_pages = AsyncMock(return_value=[])
 
     # Firewall namespace
     client.firewall = MagicMock()
@@ -322,6 +386,12 @@ def _create_mock_protect_client() -> MagicMock:
         ]
     )
 
+    # Protect 7.3.70 security device families
+    for family in ("fobs", "link_stations", "alarm_hubs", "sirens"):
+        endpoint = MagicMock()
+        endpoint.get_all = AsyncMock(return_value=[])
+        endpoint.last_result_complete = True
+        setattr(client, family, endpoint)
     # WebSocket support
     client.get_host_id = AsyncMock(return_value="nvr1")
     client.websocket = MagicMock()
@@ -498,6 +568,38 @@ class TestUnifiBaseCoordinator:
 # ============================================================================
 # UnifiConfigCoordinator Tests
 # ============================================================================
+
+
+_RULE_SECTION_PARAMS = [
+    pytest.param(
+        "port_forwards",
+        "port_forwards",
+        "list_port_forwards",
+        "port_forwards_available",
+        id="port_forward",
+    ),
+    pytest.param(
+        "traffic_rules",
+        "traffic_rules",
+        "list_traffic_rules",
+        "traffic_rules_available",
+        id="traffic_rule",
+    ),
+    pytest.param(
+        "nat_rules",
+        "nat_rules",
+        "list_nat_rules",
+        "nat_rules_available",
+        id="nat_rule",
+    ),
+    pytest.param(
+        "static_routes",
+        "static_routes",
+        "list_static_routes",
+        "static_routes_available",
+        id="static_route",
+    ),
+]
 
 
 class TestUnifiConfigCoordinator:
@@ -1312,6 +1414,407 @@ class TestUnifiConfigCoordinator:
         result = await coordinator._async_update_data()
 
         assert result["client_links"] == {}
+
+    def test_initialization_has_rule_sections(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Test coordinator initialization includes rule section dictionaries."""
+        assert "port_forwards" in coordinator.data
+        assert "traffic_rules" in coordinator.data
+        assert coordinator.data["port_forwards"] == {}
+        assert coordinator.data["traffic_rules"] == {}
+
+    def test_initialization_has_nat_and_static_route_sections(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Test coordinator initialization includes NAT and static route sections."""
+        assert "nat_rules" in coordinator.data
+        assert "static_routes" in coordinator.data
+        assert coordinator.data["nat_rules"] == {}
+        assert coordinator.data["static_routes"] == {}
+
+    @pytest.mark.parametrize(
+        ("site_data", "expected"),
+        [
+            ({"internalReference": " branch "}, "branch"),
+            ({"internalReference": ""}, None),
+            ({"internalReference": "   "}, None),
+            ({"name": "default"}, None),
+            ({"internalReference": 123}, None),
+            ("not-a-dict", None),
+            (None, None),
+        ],
+    )
+    def test_verified_legacy_site_name(
+        self, site_data: Any, expected: str | None
+    ) -> None:
+        """Test verified_legacy_site_name extracts valid non-blank internalReference."""
+        assert verified_legacy_site_name(site_data) == expected
+
+    @pytest.mark.parametrize(
+        ("rule_data", "name_field", "expected"),
+        [
+            ({"name": "  Plex  "}, "name", "Plex"),
+            ({"description": " Kids bedtime "}, "description", "Kids bedtime"),
+            ({"name": "   "}, "name", "pf1"),
+            ({"name": 42}, "name", "pf1"),
+            ({"description": "Plex"}, "name", "pf1"),
+            ("not-a-dict", "name", "pf1"),
+        ],
+    )
+    def test_rule_display_name(
+        self, rule_data: Any, name_field: str, expected: str
+    ) -> None:
+        """Test rule_display_name strips the name and falls back to the rule id."""
+        assert rule_display_name(rule_data, "pf1", name_field) == expected
+
+    @pytest.mark.parametrize(
+        ("rule_data", "expected"),
+        [
+            ({"is_predefined": True}, True),
+            ({"is_predefined": True, "setting_preference": "manual"}, True),
+            ({"setting_preference": "auto"}, True),
+            ({"setting_preference": None}, True),
+            ({"is_predefined": False, "setting_preference": "manual"}, False),
+            ({}, False),
+            ({"is_predefined": "true"}, False),
+            ("not a dict", False),
+        ],
+    )
+    def test_is_predefined_nat_rule(self, rule_data: Any, *, expected: bool) -> None:
+        """Test is_predefined_nat_rule identifies controller-managed NAT rules."""
+        assert is_predefined_nat_rule(rule_data) is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_section_fetched_by_internal_reference(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Rule sections are fetched with internalReference and keyed by id."""
+        site1 = _create_mock_model(
+            {"id": "default", "name": "Default", "internalReference": "default"}
+        )
+        site2 = _create_mock_model(
+            {"id": "site2", "name": "Site 2", "internalReference": "branch"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(
+            return_value=[site1, site2]
+        )
+
+        record1 = {"_id": "rule-1", "name": "Rule 1", "enabled": True}
+        record2 = {"id": "rule-2", "name": "Rule 2", "enabled": False}
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+
+        def _fetch_side_effect(ref: str) -> list[Any]:
+            return (
+                [_create_mock_model(record1), _create_mock_model({"name": "No id"})]
+                if ref == "default"
+                else [_create_mock_model(record2)]
+            )
+
+        setattr(endpoint, list_method, AsyncMock(side_effect=_fetch_side_effect))
+
+        result = await coordinator._async_update_data()
+        mock_fn = getattr(endpoint, list_method)
+        assert [c.args[0] for c in mock_fn.await_args_list] == ["default", "branch"]
+        assert result[data_key]["default"] == {"rule-1": record1}
+        assert result[data_key]["site2"] == {"rule-2": record2}
+        avail_fn = getattr(coordinator, avail_method)
+        assert avail_fn("default") is True
+        assert avail_fn("site2") is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_section_ignores_fuzzy_legacy_mapping(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Rule sections ignore fuzzy legacy mapping from get_legacy_all."""
+        site1 = _create_mock_model(
+            {"id": "default", "name": "Default", "internalReference": "default"}
+        )
+        site2 = _create_mock_model(
+            {"id": "site2", "name": "Site 2", "internalReference": "branch"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(
+            return_value=[site1, site2]
+        )
+        coordinator.network_client.sites.get_legacy_all = AsyncMock(
+            return_value=[{"name": "default", "desc": "Site 2"}]
+        )
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        setattr(endpoint, list_method, AsyncMock(return_value=[]))
+
+        await coordinator._async_update_data()
+        mock_fn = getattr(endpoint, list_method)
+        assert [c.args[0] for c in mock_fn.await_args_list] == ["default", "branch"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_section_without_internal_reference_is_empty_and_available(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Without internalReference, fetch is skipped and data is empty."""
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        mock_fn = getattr(endpoint, list_method)
+
+        result = await coordinator._async_update_data()
+        mock_fn.assert_not_awaited()
+        assert result[data_key]["default"] == {}
+        assert result[data_key]["site2"] == {}
+        avail_fn = getattr(coordinator, avail_method)
+        assert avail_fn("default") is True
+        assert avail_fn("site2") is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiAuthenticationError("Forbidden", status_code=403),
+            UniFiNotFoundError("Not found", status_code=404),
+            UniFiResponseError("Non-JSON body", status_code=200),
+        ],
+    )
+    async def test_rule_section_unsupported_response_stores_empty(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+        *,
+        error: Exception,
+    ) -> None:
+        """Unsupported responses (403/404/200 non-JSON) store {} and keep available."""
+        site = _create_mock_model(
+            {"id": "default", "name": "Default", "internalReference": "default"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(return_value=[site])
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        setattr(endpoint, list_method, AsyncMock(side_effect=error))
+
+        result = await coordinator._async_update_data()
+        assert result[data_key]["default"] == {}
+        avail_fn = getattr(coordinator, avail_method)
+        assert avail_fn("default") is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_section_transient_failure_keeps_previous_data(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Transient failure preserves data and toggles available until recovery."""
+        site = _create_mock_model(
+            {"id": "default", "name": "Default", "internalReference": "default"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(return_value=[site])
+        rec = {"_id": "r1", "name": "R1", "enabled": True}
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        setattr(
+            endpoint, list_method, AsyncMock(return_value=[_create_mock_model(rec)])
+        )
+
+        res1 = await coordinator._async_update_data()
+        assert res1[data_key]["default"] == {"r1": rec}
+        avail_fn = getattr(coordinator, avail_method)
+        assert avail_fn("default") is True
+
+        setattr(
+            endpoint,
+            list_method,
+            AsyncMock(side_effect=UniFiConnectionError("Connection lost")),
+        )
+        res2 = await coordinator._async_update_data()
+        assert res2[data_key]["default"] == {"r1": rec}
+        assert avail_fn("default") is False
+
+        setattr(
+            endpoint, list_method, AsyncMock(return_value=[_create_mock_model(rec)])
+        )
+        res3 = await coordinator._async_update_data()
+        assert res3[data_key]["default"] == {"r1": rec}
+        assert avail_fn("default") is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_section_failure_is_per_site(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Failure on site A does not affect availability on site B."""
+        site_a = _create_mock_model(
+            {"id": "site_a", "name": "Site A", "internalReference": "ref_a"}
+        )
+        site_b = _create_mock_model(
+            {"id": "site_b", "name": "Site B", "internalReference": "ref_b"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(
+            return_value=[site_a, site_b]
+        )
+
+        rec_b = {"_id": "rb", "name": "RB", "enabled": True}
+
+        def _side_effect(ref: str) -> list[Any]:
+            if ref == "ref_a":
+                msg = "Failure on A"
+                raise UniFiConnectionError(msg)
+            return [_create_mock_model(rec_b)]
+
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        setattr(endpoint, list_method, AsyncMock(side_effect=_side_effect))
+
+        result = await coordinator._async_update_data()
+        avail_fn = getattr(coordinator, avail_method)
+        assert avail_fn("site_a") is False
+        assert avail_fn("site_b") is True
+        assert result[data_key]["site_b"] == {"rb": rec_b}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_section_401_triggers_reauth(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """401 error during rule fetch triggers reauthentication."""
+        site = _create_mock_model(
+            {"id": "default", "name": "Default", "internalReference": "default"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(return_value=[site])
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        setattr(
+            endpoint,
+            list_method,
+            AsyncMock(
+                side_effect=UniFiAuthenticationError("Unauthorized", status_code=401)
+            ),
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    async def test_rule_sections_pruned_with_sites(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Removed sites are pruned from rule sections, leaving empty dict."""
+        site1 = _create_mock_model(
+            {"id": "s1", "name": "S1", "internalReference": "r1"}
+        )
+        site2 = _create_mock_model(
+            {"id": "s2", "name": "S2", "internalReference": "r2"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(
+            return_value=[site1, site2]
+        )
+        endpoint = getattr(coordinator.network_client, endpoint_attr)
+        setattr(endpoint, list_method, AsyncMock(return_value=[]))
+
+        res1 = await coordinator._async_update_data()
+        assert "s1" in res1[data_key]
+        assert "s2" in res1[data_key]
+
+        coordinator.network_client.sites.get_all = AsyncMock(return_value=[site1])
+        res2 = await coordinator._async_update_data()
+        assert "s1" in res2[data_key]
+        assert "s2" not in res2[data_key]
+
+        coordinator.network_client.sites.get_all = AsyncMock(return_value=[])
+        res3 = await coordinator._async_update_data()
+        assert res3[data_key] == {}
+
+    @pytest.mark.asyncio
+    async def test_rule_sections_fetched_concurrently(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Port forwards and traffic rules are fetched concurrently with gather."""
+        site = _create_mock_model(
+            {"id": "default", "name": "Default", "internalReference": "default"}
+        )
+        coordinator.network_client.sites.get_all = AsyncMock(return_value=[site])
+
+        pf_started = asyncio.Event()
+        tr_started = asyncio.Event()
+
+        async def slow_list_pf(site_name: str) -> list[Any]:
+            pf_started.set()
+            await tr_started.wait()
+            return []
+
+        async def slow_list_tr(site_name: str) -> list[Any]:
+            tr_started.set()
+            await pf_started.wait()
+            return []
+
+        coordinator.network_client.port_forwards.list_port_forwards = AsyncMock(
+            side_effect=slow_list_pf
+        )
+        coordinator.network_client.traffic_rules.list_traffic_rules = AsyncMock(
+            side_effect=slow_list_tr
+        )
+
+        result = await asyncio.wait_for(coordinator._async_update_data(), timeout=2)
+        assert result["port_forwards"]["default"] == {}
+        assert result["traffic_rules"]["default"] == {}
+        assert pf_started.is_set()
+        assert tr_started.is_set()
 
 
 # ============================================================================
@@ -2156,7 +2659,7 @@ class TestUnifiDeviceCoordinator:
             side_effect=UniFiAuthenticationError("Forbidden", status_code=403)
         )
 
-        with pytest.raises(UpdateFailed, match="^Access forbidden for site"):
+        with pytest.raises(UpdateFailed, match=r"^Access forbidden for site"):
             await coordinator._async_update_data()
 
         assert coordinator._available is False
@@ -2631,6 +3134,195 @@ class TestUnifiDeviceCoordinator:
 
         assert "gone" not in coordinator._legacy_wan_failures
 
+    def test_merge_legacy_storage_data(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """The console's per-mount storage data is merged by MAC."""
+        device_dict: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {
+                "storage": [
+                    {
+                        "mount_point": "/data",
+                        "name": "eMMC",
+                        "type": "eMMC",
+                        "size": 4143677440,
+                        "used": 1700257792,
+                    }
+                ]
+            }
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_storage_data(
+            device_dict, legacy_devices_by_mac
+        )
+
+        assert device_dict["storage_mounts"] == [
+            {
+                "mount_point": "/data",
+                "name": "eMMC",
+                "type": "eMMC",
+                "size": 4143677440,
+                "used": 1700257792,
+            }
+        ]
+
+    def test_merge_legacy_storage_data_leaves_other_devices_untouched(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Devices without storage, or without legacy data, are untouched."""
+        switch: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        empty_storage: dict[str, Any] = {"macAddress": "AA:BB:CC:DD:EE:FF"}
+        unmatched: dict[str, Any] = {"macAddress": "11:22:33:44:55:66"}
+        no_mac: dict[str, Any] = {}
+        legacy_devices_by_mac: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {"port_table": []}
+        }
+
+        UnifiDeviceCoordinator._merge_legacy_storage_data(switch, legacy_devices_by_mac)
+        assert "storage_mounts" not in switch
+
+        legacy_devices_by_mac_empty: dict[str, dict[str, Any]] = {
+            "aa:bb:cc:dd:ee:ff": {"storage": []}
+        }
+        UnifiDeviceCoordinator._merge_legacy_storage_data(
+            empty_storage, legacy_devices_by_mac_empty
+        )
+        assert "storage_mounts" not in empty_storage
+
+        for device_dict in (unmatched, no_mac):
+            UnifiDeviceCoordinator._merge_legacy_storage_data(
+                device_dict, legacy_devices_by_mac
+            )
+            assert "storage_mounts" not in device_dict
+
+    @pytest.mark.asyncio
+    async def test_async_update_data_merges_legacy_storage(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Legacy storage reaches console through refresh with zero extra requests."""
+        udm_storage = [
+            {
+                "mount_point": "/data",
+                "name": "eMMC",
+                "type": "eMMC",
+                "size": 4143677440,
+                "used": 1700257792,
+            },
+            {
+                "mount_point": "/persistent",
+                "name": "Backup",
+                "type": "eMMC",
+                "size": 2046640128,
+                "used": 318767104,
+            },
+            {
+                "mount_point": "/" + "tmp",
+                "name": "Temporary",
+                "type": "other",
+                "size": 1073741824,
+                "used": 1748992,
+            },
+        ]
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "storage": udm_storage,
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        mounts = result["devices"]["default"]["device1"]["storage_mounts"]
+        assert mounts == udm_storage
+        assert (
+            coordinator.network_client.devices.get_legacy_site_devices.await_count == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_primary_devices_still_get_storage_mounts(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Storage mounts are merged when legacy devices replace a failing v1 list."""
+        coordinator.network_client.devices.get_all = AsyncMock(
+            side_effect=UniFiResponseError("Internal Server Error", status_code=500)
+        )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "_id": "60a1b2c3d4e5f67890123456",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Legacy Gateway",
+                    "model": "UDMPROSE",
+                    "type": "udm",
+                    "up": True,
+                    "storage": [
+                        {
+                            "mount_point": "/data",
+                            "name": "eMMC",
+                            "type": "eMMC",
+                            "size": 4143677440,
+                            "used": 1700257792,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        result = await coordinator._async_update_data()
+
+        (device,) = result["devices"]["default"].values()
+        assert "storage_mounts" in device
+        assert device["storage_mounts"][0]["mount_point"] == "/data"
+
+    @pytest.mark.asyncio
+    async def test_storage_mounts_reused_for_bounded_polls_then_dropped(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """A failing legacy call keeps the last storage mounts for a few polls."""
+        for model in coordinator.network_client.devices.get_all.return_value:
+            dumped = model.model_dump.return_value
+            model.model_dump = MagicMock(
+                side_effect=lambda *_a, d=dumped, **_k: dict(d)
+            )
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[
+                {
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "storage": [
+                        {
+                            "mount_point": "/data",
+                            "name": "eMMC",
+                            "type": "eMMC",
+                            "size": 4143677440,
+                            "used": 1700257792,
+                        }
+                    ],
+                }
+            ]
+        )
+        result = await coordinator._async_update_data()
+        good = result["devices"]["default"]["device1"]["storage_mounts"]
+
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        for _ in range(MAX_STATS_REUSE_POLLS):
+            result = await coordinator._async_update_data()
+            assert result["devices"]["default"]["device1"]["storage_mounts"] == good
+
+        result = await coordinator._async_update_data()
+        assert "storage_mounts" not in result["devices"]["default"]["device1"]
+
+        # A success resets the failure count.
+        coordinator.network_client.devices.get_legacy_site_devices = AsyncMock(
+            return_value=[]
+        )
+        await coordinator._async_update_data()
+        assert coordinator._legacy_wan_failures == {}
+
     def test_merge_legacy_port_data_includes_poe_good(
         self, coordinator: UnifiDeviceCoordinator
     ):
@@ -2855,6 +3547,208 @@ class TestUnifiDeviceCoordinator:
             "uplink_mac": "28:70:4e:00:00:01",
             "uplink_remote_port": 6,
         }
+
+    @pytest.mark.asyncio
+    async def test_process_device_filters_clients_without_index(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Direct device callers retain filtering, order, and client identity."""
+        coordinator.network_client.devices.get_statistics = AsyncMock(
+            return_value=_create_mock_model({"uptimeSec": 60})
+        )
+        camel = {"id": "camel", "uplinkDeviceId": "device1"}
+        snake = {"id": "snake", "uplink_device_id": "device1"}
+        other = {"id": "other", "uplinkDeviceId": "device2"}
+        fallback = {
+            "id": "fallback",
+            "uplinkDeviceId": "",
+            "uplink_device_id": "device1",
+        }
+        camel_priority = {
+            "id": "priority",
+            "uplinkDeviceId": "device2",
+            "uplink_device_id": "device1",
+        }
+        clients = [snake, other, camel, fallback, camel_priority, {"id": "unlinked"}]
+
+        _, _, stats = await coordinator._process_device(
+            "default", {"id": "device1"}, clients
+        )
+
+        assert stats["clients"] == [snake, camel, fallback]
+        assert stats["clients"][0] is snake
+        assert stats["clients"][1] is camel
+        assert stats["clients"][2] is fallback
+
+    @pytest.mark.asyncio
+    async def test_process_site_groups_clients_by_uplink(
+        self, coordinator: UnifiDeviceCoordinator
+    ) -> None:
+        """Site processing groups clients by uplink device in a single pass."""
+        dev_a = {"id": "a", "name": "Device A"}
+        dev_b = {"id": "b", "name": "Device B"}
+        dev_empty = {"id": "empty", "name": "Device Empty"}
+
+        coordinator.network_client.devices.get_all = AsyncMock(
+            return_value=[
+                _create_mock_model(dev_a),
+                _create_mock_model(dev_b),
+                _create_mock_model(dev_empty),
+            ]
+        )
+        coordinator.network_client.devices.get_statistics = AsyncMock(
+            side_effect=lambda site_id, device_id: _create_mock_model(
+                {
+                    "cpuUtilizationPct": 15.2,
+                    "memoryUtilizationPct": 42.8,
+                    "uptimeSec": 864000,
+                }
+            )
+        )
+
+        client_a1 = {"id": "a1", "name": "Client A1", "uplinkDeviceId": "a"}
+        client_b1 = {"id": "b1", "name": "Client B1", "uplink_device_id": "b"}
+        client_a2 = {"id": "a2", "name": "Client A2", "uplink_device_id": "a"}
+        client_both = {
+            "id": "both",
+            "name": "Client Both",
+            "uplinkDeviceId": "b",
+            "uplink_device_id": "a",
+        }
+        client_fallback = {
+            "id": "fallback",
+            "name": "Client Fallback",
+            "uplinkDeviceId": "",
+            "uplink_device_id": "a",
+        }
+        client_missing = {
+            "id": "missing",
+            "name": "Client Missing",
+            "uplinkDeviceId": None,
+            "uplink_device_id": "",
+        }
+        client_unlinked = {"id": "unlinked", "name": "Client Unlinked"}
+        client_unknown = {
+            "id": "unknown",
+            "name": "Client Unknown",
+            "uplinkDeviceId": "unknown-uplink",
+        }
+        client_bad_list = {
+            "id": "bad_list",
+            "name": "Client Bad List",
+            "uplinkDeviceId": ["bad", "list"],
+        }
+        client_bad_dict = {
+            "id": "bad_dict",
+            "name": "Client Bad Dict",
+            "uplinkDeviceId": {"nested": "dict"},
+        }
+        client_bad_int = {
+            "id": "bad_int",
+            "name": "Client Bad Int",
+            "uplinkDeviceId": 123,
+        }
+        client_bad_bool = {
+            "id": "bad_bool",
+            "name": "Client Bad Bool",
+            "uplinkDeviceId": True,
+        }
+        client_bad_float = {
+            "id": "bad_float",
+            "name": "Client Bad Float",
+            "uplinkDeviceId": 45.67,
+        }
+        client_camel_priority = {
+            "id": "camel_priority",
+            "name": "Client Camel Priority",
+            "uplinkDeviceId": ["bad"],
+            "uplink_device_id": "a",
+        }
+
+        coordinator.network_client.clients.get_all = AsyncMock(
+            return_value=[
+                _create_mock_model(client_a1),
+                _create_mock_model(client_b1),
+                _create_mock_model(client_a2),
+                _create_mock_model(client_both),
+                _create_mock_model(client_fallback),
+                _create_mock_model(client_missing),
+                _create_mock_model(client_unlinked),
+                _create_mock_model(client_unknown),
+                _create_mock_model(client_bad_list),
+                _create_mock_model(client_bad_dict),
+                _create_mock_model(client_bad_int),
+                _create_mock_model(client_bad_bool),
+                _create_mock_model(client_bad_float),
+                _create_mock_model(client_camel_priority),
+            ]
+        )
+
+        devices_dict, stats_dict, clients_dict = await coordinator._process_site(
+            "default"
+        )
+
+        # Device dictionary retains all devices
+        assert set(devices_dict.keys()) == {"a", "b", "empty"}
+
+        # Client id ordering in device stats
+        assert [c["id"] for c in stats_dict["a"]["clients"]] == [
+            "a1",
+            "a2",
+            "fallback",
+        ]
+        assert [c["id"] for c in stats_dict["b"]["clients"]] == ["b1", "both"]
+        assert stats_dict["empty"]["clients"] == []
+
+        # Concrete independent expected values
+        assert stats_dict["a"]["clients"] == [
+            client_a1,
+            client_a2,
+            client_fallback,
+        ]
+        assert stats_dict["b"]["clients"] == [client_b1, client_both]
+
+        # Empty device retains its statistics
+        assert stats_dict["empty"]["id"] == "empty"
+        assert "cpuUtilizationPct" in stats_dict["empty"]
+
+        # Object identity is shared between group list and sitewide clients dictionary
+        assert stats_dict["a"]["clients"][0] is clients_dict["a1"]
+        assert stats_dict["a"]["clients"][1] is clients_dict["a2"]
+        assert stats_dict["a"]["clients"][2] is clients_dict["fallback"]
+        assert stats_dict["b"]["clients"][0] is clients_dict["b1"]
+        assert stats_dict["b"]["clients"][1] is clients_dict["both"]
+
+        # Sitewide dictionary retains all clients including unlinked and malformed
+        assert set(clients_dict.keys()) == {
+            "a1",
+            "b1",
+            "a2",
+            "both",
+            "fallback",
+            "missing",
+            "unlinked",
+            "unknown",
+            "bad_list",
+            "bad_dict",
+            "bad_int",
+            "bad_bool",
+            "bad_float",
+            "camel_priority",
+        }
+        assert clients_dict["missing"] == client_missing
+        assert clients_dict["unlinked"] == client_unlinked
+        assert clients_dict["unknown"] == client_unknown
+        assert clients_dict["bad_list"] == client_bad_list
+        assert clients_dict["bad_dict"] == client_bad_dict
+        assert clients_dict["bad_int"] == client_bad_int
+        assert clients_dict["bad_bool"] == client_bad_bool
+        assert clients_dict["bad_float"] == client_bad_float
+        assert clients_dict["camel_priority"] == client_camel_priority
+
+        # Object identity is preserved for sitewide unassigned clients
+        assert clients_dict["bad_list"] is client_bad_list
+        assert clients_dict["camel_priority"] is client_camel_priority
 
 
 # ============================================================================
@@ -4220,7 +5114,7 @@ class TestUnifiProtectCoordinator:
         `on_connection_state_change` callback (see `async_start_websocket`)
         updates only the devices stream's health entry.
         """
-        coordinator._on_devices_connection_state_change(True)
+        coordinator._on_devices_connection_state_change(connected=True)
 
         assert coordinator.websocket_health["devices"]["connected"] is True
         assert coordinator.websocket_health["events"]["connected"] is False
@@ -4232,7 +5126,7 @@ class TestUnifiProtectCoordinator:
         `on_connection_state_change` callback updates only the events
         stream's health entry.
         """
-        coordinator._on_events_connection_state_change(True)
+        coordinator._on_events_connection_state_change(connected=True)
 
         assert coordinator.websocket_health["events"]["connected"] is True
         assert coordinator.websocket_health["devices"]["connected"] is False
@@ -5275,6 +6169,381 @@ class TestUnifiProtectCoordinator:
         await coordinator_no_protect._fetch_cameras()
         assert coordinator_no_protect.data["cameras"] == {}
 
+    @pytest.mark.asyncio
+    async def test_async_stop_websocket_no_protect_websocket(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test async_stop_websocket when _protect_websocket is None."""
+        coordinator._protect_websocket = None
+        await coordinator.async_stop_websocket()
+        assert coordinator.websocket_task is None
+        assert coordinator.events_websocket_task is None
+        assert coordinator._sensor_refresh_task is None
+        assert coordinator._sensor_reconcile_task is None
+        assert coordinator._sensor_reconnect_task is None
+
+    def test_handle_device_update_doorlock(self, coordinator: UnifiProtectCoordinator):
+        """Test handling doorlock device raw dictionary merge."""
+        coordinator.data["doorlocks"] = {
+            "lock1": {"id": "lock1", "name": "Front Door", "state": "LOCKED"}
+        }
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator._handle_device_update(
+            "doorlock", {"id": "lock1", "state": "UNLOCKED", "battery": 90}
+        )
+
+        assert coordinator.data["doorlocks"]["lock1"] == {
+            "id": "lock1",
+            "name": "Front Door",
+            "state": "UNLOCKED",
+            "battery": 90,
+        }
+        listener.assert_called_once()
+
+    def test_handle_device_update_viewport(self, coordinator: UnifiProtectCoordinator):
+        """Test handling viewport device raw dictionary merge."""
+        coordinator.data["viewports"] = {
+            "vp1": {"id": "vp1", "name": "Viewport 1", "state": "ONLINE"}
+        }
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator._handle_device_update(
+            "viewport", {"id": "vp1", "name": "Renamed Viewport"}
+        )
+
+        assert coordinator.data["viewports"]["vp1"] == {
+            "id": "vp1",
+            "name": "Renamed Viewport",
+            "state": "ONLINE",
+        }
+        listener.assert_called_once()
+
+    def test_normalize_camera_data_sparse_defensive_fallbacks(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Cover smart-detect and PTZ fallback arms with sparse dictionaries."""
+        # 1. Sparse camera dictionary with legacy snake_case fields (defensive fallback)
+        sparse_cam = {
+            "id": "cam_sparse",
+            "name": "Sparse Camera",
+            "smart_detect_types": ["person", "vehicle"],
+            "is_ptz": True,
+        }
+        normalized = coordinator._normalize_camera_data(sparse_cam)
+        assert normalized["smartDetectTypes"] == ["person", "vehicle"]
+        assert normalized["isPtz"] is True
+
+        # Sparse camera with legacy is_ptz=False fallback
+        sparse_cam_no_ptz = {
+            "id": "cam_sparse_no_ptz",
+            "name": "Sparse Camera No PTZ",
+            "is_ptz": False,
+        }
+        normalized_no_ptz = coordinator._normalize_camera_data(sparse_cam_no_ptz)
+        assert normalized_no_ptz["isPtz"] is False
+
+        # 2. Real Camera model dump showing default fields suppress the fallbacks
+        real_cam = Camera(id="cam_real", name="Real Camera", mac="AA:BB:CC:DD:EE:FF")
+        real_dump = real_cam.model_dump(by_alias=True)
+        real_dump["smart_detect_types"] = ["ignored_legacy"]
+        real_dump["is_ptz"] = True
+        normalized_real = coordinator._normalize_camera_data(real_dump)
+        assert normalized_real["smartDetectTypes"] == []
+        assert normalized_real["isPtz"] is False
+
+    def test_prune_rebuilt_trackers_motion_and_ring(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Cover REST rebuild tracker pruning branches for motion and ring."""
+        now = datetime.now(tz=UTC)
+        coordinator._camera_motion_started = {
+            "cam_survives": now,
+            "cam_pruned": now,
+            "cam_missing": now,
+        }
+        coordinator._camera_ring_started = {
+            "cam_survives": now,
+            "cam_pruned": now,
+            "cam_missing": now,
+        }
+
+        cameras = {
+            "cam_survives": {
+                "id": "cam_survives",
+                "lastMotionStart": 1000,
+                "lastRingStart": 2000,
+            },
+            "cam_pruned": {
+                "id": "cam_pruned",
+            },
+        }
+
+        coordinator._drop_rebuilt_latch_trackers(cameras)
+
+        assert "cam_survives" in coordinator._camera_motion_started
+        assert "cam_missing" in coordinator._camera_motion_started
+        assert "cam_pruned" not in coordinator._camera_motion_started
+
+        assert "cam_survives" in coordinator._camera_ring_started
+        assert "cam_missing" in coordinator._camera_ring_started
+        assert "cam_pruned" not in coordinator._camera_ring_started
+
+    @pytest.mark.asyncio
+    async def test_fetch_lights_unabsorbed_error_raises(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test _fetch_lights raises when errors exceed threshold."""
+        protect_client = coordinator.protect_client
+        assert protect_client is not None
+        get_lights = AsyncMock(side_effect=UniFiConnectionError("Connection failure"))
+        protect_client.lights.get_all = get_lights
+        for expected_count in range(1, MAX_CONSECUTIVE_EMPTY_FETCHES + 1):
+            await coordinator._fetch_lights()
+            assert coordinator._consecutive_fetch_errors["lights"] == expected_count
+        with pytest.raises(UniFiConnectionError, match="Connection failure"):
+            await coordinator._fetch_lights()
+        assert (
+            coordinator._consecutive_fetch_errors["lights"]
+            == MAX_CONSECUTIVE_EMPTY_FETCHES + 1
+        )
+        assert get_lights.await_count == MAX_CONSECUTIVE_EMPTY_FETCHES + 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_collections_skip_records_without_id(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test Protect collection fetches skip ID-less records."""
+        protect_client = coordinator.protect_client
+        assert protect_client is not None
+        protect_client.lights.get_all = AsyncMock(
+            return_value=[
+                Light.model_validate(
+                    {"id": "light1", "mac": "00:11:22:33:44:01", "name": "Light 1"}
+                ),
+                Light.model_validate(
+                    {"id": "", "mac": "00:11:22:33:44:02", "name": "NoIDLight"}
+                ),
+            ]
+        )
+        protect_client.lights.last_result_complete = True
+        await coordinator._fetch_lights()
+        assert list(coordinator.data["lights"].keys()) == ["light1"]
+        protect_client.sensors.get_all = AsyncMock(
+            return_value=[
+                Sensor.model_validate(
+                    {"id": "sensor1", "mac": "00:11:22:33:44:03", "name": "Sensor 1"}
+                ),
+                Sensor.model_validate(
+                    {"id": "", "mac": "00:11:22:33:44:04", "name": "NoIDSensor"}
+                ),
+            ]
+        )
+        await coordinator._fetch_sensors()
+        assert list(coordinator.data["sensors"].keys()) == ["sensor1"]
+        protect_client.chimes.get_all = AsyncMock(
+            return_value=[
+                Chime.model_validate(
+                    {"id": "chime1", "mac": "00:11:22:33:44:05", "name": "Chime 1"}
+                ),
+                Chime.model_validate(
+                    {"id": "", "mac": "00:11:22:33:44:06", "name": "NoIDChime"}
+                ),
+            ]
+        )
+        protect_client.chimes.last_result_complete = True
+        await coordinator._fetch_chimes()
+        assert list(coordinator.data["chimes"].keys()) == ["chime1"]
+        protect_client.viewers.get_all = AsyncMock(
+            return_value=[
+                Viewer.model_validate(
+                    {
+                        "id": "viewer1",
+                        "mac": "00:11:22:33:44:07",
+                        "state": "ONLINE",
+                        "name": "Viewer 1",
+                    }
+                ),
+                Viewer.model_validate(
+                    {
+                        "id": "",
+                        "mac": "00:11:22:33:44:08",
+                        "state": "ONLINE",
+                        "name": "NoIDViewer",
+                    }
+                ),
+            ]
+        )
+        protect_client.viewers.last_result_complete = True
+        await coordinator._fetch_viewers()
+        assert list(coordinator.data["viewers"].keys()) == ["viewer1"]
+        protect_client.liveviews.get_all = AsyncMock(
+            return_value=[
+                LiveView.model_validate({"id": "liveview1", "name": "Liveview 1"}),
+                LiveView.model_validate({"id": "", "name": "NoIDLiveview"}),
+            ]
+        )
+        await coordinator._fetch_liveviews()
+        assert list(coordinator.data["liveviews"].keys()) == ["liveview1"]
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_sensors_task_cleared_mid_execution(
+        self, coordinator: UnifiProtectCoordinator
+    ):
+        """Test _sensor_refresh_task cleared by production helper mid-execution."""
+        entered_fetch = asyncio.Event()
+        continue_fetch = asyncio.Event()
+
+        async def mock_fetch():
+            entered_fetch.set()
+            await continue_fetch.wait()
+
+        coordinator._fetch_sensors = mock_fetch
+
+        refresh_task = asyncio.create_task(
+            coordinator.async_refresh_sensors(notify=False)
+        )
+        await entered_fetch.wait()
+
+        # Task was launched and assigned through production helper
+        tracked_task = coordinator._sensor_refresh_task
+        assert tracked_task is not None
+        assert not tracked_task.done()
+
+        # Cancellation clears slot before await resumes
+        coordinator._cancel_sensor_background_task("_sensor_refresh_task")
+        assert coordinator._sensor_refresh_task is None
+
+        # Resume fetch and await completion (suppressing task cancellation)
+        continue_fetch.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresh_task
+        assert tracked_task.cancelled()
+        assert coordinator._sensor_refresh_task is None
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_sensors_completed_fetch_shutdown_race(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Test completed-fetch shutdown race preserves newer fetch owner.
+
+        Covers Protect coordinator 1162->1165: when _fetch_sensors finishes,
+        the fetch Task transitions to done. Before the awaiting driver task
+        (async_refresh_sensors) resumes on the event loop ready queue, a
+        concurrent public async_stop_websocket task executes, sees that
+        _sensor_refresh_task is already done, avoids cancelling it, and nulls
+        the attribute reference via the production helper. Immediately following
+        the stop task, a second async_refresh_sensors task executes, finds the
+        cleared slot, and launches a new inner fetch Task through the production
+        helper, becoming the legitimate new owner. When the original awaiting
+        driver task then resumes, its finally block observes
+        `self._sensor_refresh_task is task` as False (the newer fetch Task is
+        not the original task) and bypasses nulling without error, preserving
+        the newer owner's task in the slot.
+        """
+        entered_first_fetch = asyncio.Event()
+        release_first_fetch = asyncio.Event()
+        entered_second_fetch = asyncio.Event()
+        release_second_fetch = asyncio.Event()
+        fetch_tasks: list[asyncio.Task[Any]] = []
+        stop_tasks: list[asyncio.Task[None]] = []
+        second_refresh_tasks: list[asyncio.Task[None]] = []
+        listener_calls: list[int] = []
+        coordinator.async_add_listener(lambda: listener_calls.append(1))
+
+        fetch_count = 0
+
+        async def mock_fetch() -> None:
+            nonlocal fetch_count
+            fetch_count += 1
+            current = asyncio.current_task()
+            assert current is not None
+            fetch_tasks.append(current)
+
+            if fetch_count == 1:
+                entered_first_fetch.set()
+                await release_first_fetch.wait()
+                # Queue public async_stop_websocket Task and second refresh Task
+                # with eager_start=False before fetch returns without another await,
+                # so stop_task and second_refresh_task are queued before inner fetch
+                # completion queues driver resumption.
+                stop_task = asyncio.create_task(
+                    coordinator.async_stop_websocket(),
+                    eager_start=False,
+                )
+                stop_tasks.append(stop_task)
+                second_refresh_task = asyncio.create_task(
+                    coordinator.async_refresh_sensors(notify=False),
+                    eager_start=False,
+                )
+                second_refresh_tasks.append(second_refresh_task)
+            else:
+                entered_second_fetch.set()
+                await release_second_fetch.wait()
+
+        coordinator._fetch_sensors = mock_fetch
+
+        driver_task: asyncio.Task[None] = asyncio.create_task(
+            coordinator.async_refresh_sensors(notify=True)
+        )
+        await entered_first_fetch.wait()
+
+        # Task was launched and assigned through production helper
+        assert len(fetch_tasks) == 1
+        inner_fetch_task = fetch_tasks[0]
+        assert coordinator._sensor_refresh_task is inner_fetch_task
+        assert not inner_fetch_task.done()
+
+        # Unblock first fetch; fetch queues stop_task then second_refresh_task,
+        # and returns without another await.
+        release_first_fetch.set()
+
+        await driver_task
+        assert len(stop_tasks) == 1
+        stop_task = stop_tasks[0]
+        await stop_task
+        assert len(second_refresh_tasks) == 1
+        second_refresh_task = second_refresh_tasks[0]
+
+        second_fetch_task: asyncio.Task[Any] | None = None
+        try:
+            # Assert second fetch has started and coordinator owns it
+            assert entered_second_fetch.is_set()
+            assert len(fetch_tasks) == 2
+            second_fetch_task = fetch_tasks[1]
+            assert coordinator._sensor_refresh_task is second_fetch_task
+            assert not second_fetch_task.done()
+            assert not second_fetch_task.cancelled()
+            assert inner_fetch_task.done()
+            assert not inner_fetch_task.cancelled()
+            assert stop_task.done()
+            assert not stop_task.cancelled()
+            assert driver_task.done()
+            assert not driver_task.cancelled()
+            assert listener_calls == [1]
+            assert coordinator.protect_client is not None
+            assert coordinator.protect_client.websocket is not None
+            stop_websocket = coordinator.protect_client.websocket.stop
+            assert isinstance(stop_websocket, MagicMock)
+            stop_websocket.assert_called_once()
+        finally:
+            # Robustness: release and await second refresh even if identity assertion
+            # fails under guard mutation, preventing hung teardown or leaked tasks.
+            release_second_fetch.set()
+            await second_refresh_task
+
+        # Assert second fetch + driver DONE/not cancelled, slot None,
+        # listener still once
+        assert second_fetch_task is not None
+        assert second_fetch_task.done()
+        assert not second_fetch_task.cancelled()
+        assert second_refresh_task.done()
+        assert not second_refresh_task.cancelled()
+        assert coordinator._sensor_refresh_task is None
+        assert listener_calls == [1]
+
 
 # ============================================================================
 # UnifiFacadeCoordinator Tests
@@ -5415,6 +6684,16 @@ class TestUnifiFacadeCoordinator:
         """Test facade coordinator initialization."""
         assert facade_coordinator.name == f"{DOMAIN}_facade"
 
+    def test_aggregate_without_protect_has_security_device_keys(
+        self, facade_coordinator_no_protect: UnifiFacadeCoordinator
+    ):
+        """The empty Protect fallback carries every collection entities index."""
+        facade_coordinator_no_protect._aggregate_data()
+
+        protect = facade_coordinator_no_protect.data["protect"]
+        for collection in ("fobs", "link_stations", "alarm_hubs", "sirens"):
+            assert protect[collection] == {}
+
     def test_aggregate_data(self, facade_coordinator: UnifiFacadeCoordinator):
         """Test data aggregation."""
         facade_coordinator._aggregate_data()
@@ -5451,6 +6730,16 @@ class TestUnifiFacadeCoordinator:
         # Protect data should have default empty structure
         assert facade_coordinator_no_protect.data["protect"]["cameras"] == {}
         assert facade_coordinator_no_protect.data["protect"]["lights"] == {}
+
+    def test_aggregate_data_includes_rule_changes(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        config_coordinator: UnifiConfigCoordinator,
+    ) -> None:
+        """Rule change records in config data are included in facade data."""
+        config_coordinator.data["rule_changes"] = {"site1": [{"sequence": 1}]}
+        facade_coordinator._aggregate_data()
+        assert facade_coordinator.data["rule_changes"] == {"site1": [{"sequence": 1}]}
 
     def test_get_site(self, facade_coordinator: UnifiFacadeCoordinator):
         """Test get_site delegation to config coordinator."""
@@ -5886,9 +7175,11 @@ class TestUnifiFacadeCoordinator:
         self, facade_coordinator: UnifiFacadeCoordinator
     ):
         """Test _async_execute_api_action wraps generic errors."""
-        action = AsyncMock(side_effect=RuntimeError("boom"))
-        with pytest.raises(HomeAssistantError, match="test error"):
+        cause = RuntimeError("boom")
+        action = AsyncMock(side_effect=cause)
+        with pytest.raises(HomeAssistantError, match="test error") as exc_info:
             await facade_coordinator._async_execute_api_action("test error", action)
+        assert exc_info.value.__cause__ is cause
 
     @pytest.mark.asyncio
     async def test_async_restart_device(
@@ -5900,6 +7191,21 @@ class TestUnifiFacadeCoordinator:
         assert result is True
         facade_coordinator.network_client.devices.restart.assert_called_once_with(
             "site1", "dev1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_power_cycle_port(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test async_power_cycle_port delegates to network client."""
+        facade_coordinator.network_client.devices.execute_port_action = AsyncMock(
+            return_value=True
+        )
+        result = await facade_coordinator.async_power_cycle_port("site1", "dev1", 3)
+        assert result is True
+        devices_api = facade_coordinator.network_client.devices
+        devices_api.execute_port_action.assert_called_once_with(
+            "site1", "dev1", 3, "POWER_CYCLE"
         )
 
     @pytest.mark.asyncio
@@ -6069,6 +7375,193 @@ class TestUnifiFacadeCoordinator:
         )
 
     @pytest.mark.asyncio
+    async def test_async_get_historical_clients_verified_site(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test async_get_historical_clients uses verified site mapping."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "branch"}}
+        }
+        facade_coordinator.network_client.clients.get_historical_legacy = AsyncMock(
+            return_value=[{"mac": "aa:bb"}]
+        )
+        result = await facade_coordinator.async_get_historical_clients("site1")
+        assert result == [{"mac": "aa:bb"}]
+        facade_coordinator.network_client.clients.get_historical_legacy.assert_called_once_with(
+            "branch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_get_historical_clients_unmapped_site_raises(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Unmapped site raises HomeAssistantError and does NOT fall back to default."""
+        facade_coordinator._config_coordinator.data = {"sites": {}}
+        facade_coordinator.network_client.clients.get_historical_legacy = AsyncMock()
+        with pytest.raises(
+            HomeAssistantError, match="No verified classic site name found"
+        ) as excinfo:
+            await facade_coordinator.async_get_historical_clients("site1")
+        assert excinfo.value.translation_key == "legacy_site_not_found"
+        assert excinfo.value.translation_placeholders == {"site_id": "site1"}
+        facade_coordinator.network_client.clients.get_historical_legacy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_get_historical_clients_api_error_wrapped(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """API error in async_get_historical_clients is wrapped."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "branch"}}
+        }
+        facade_coordinator.network_client.clients.get_historical_legacy = AsyncMock(
+            side_effect=RuntimeError("connection dropped")
+        )
+        with pytest.raises(
+            HomeAssistantError,
+            match="Unable to read historical clients for site site1",
+        ):
+            await facade_coordinator.async_get_historical_clients("site1")
+
+    @pytest.mark.asyncio
+    async def test_async_forget_clients_batch_verified_site(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test async_forget_clients_batch uses verified site mapping."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "branch"}}
+        }
+        facade_coordinator.network_client.clients.forget_batch = AsyncMock(
+            return_value=True
+        )
+        result = await facade_coordinator.async_forget_clients_batch(
+            "site1", ["aa:bb:cc:dd:ee:ff"]
+        )
+        assert result is True
+        facade_coordinator.network_client.clients.forget_batch.assert_called_once_with(
+            "branch", ["aa:bb:cc:dd:ee:ff"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_forget_clients_batch_unmapped_site_raises(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Unmapped site in batch forget raises error without fallback."""
+        facade_coordinator._config_coordinator.data = {"sites": {}}
+        facade_coordinator.network_client.clients.forget_batch = AsyncMock()
+        with pytest.raises(
+            HomeAssistantError, match="No verified classic site name found"
+        ) as excinfo:
+            await facade_coordinator.async_forget_clients_batch(
+                "site1", ["aa:bb:cc:dd:ee:ff"]
+            )
+        assert excinfo.value.translation_key == "legacy_site_not_found"
+        facade_coordinator.network_client.clients.forget_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_forget_clients_batch_api_error_wrapped(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """API error in async_forget_clients_batch is wrapped in HomeAssistantError."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "branch"}}
+        }
+        facade_coordinator.network_client.clients.forget_batch = AsyncMock(
+            side_effect=RuntimeError("connection dropped")
+        )
+        with pytest.raises(
+            HomeAssistantError, match="Unable to forget clients for site site1"
+        ):
+            await facade_coordinator.async_forget_clients_batch(
+                "site1", ["aa:bb:cc:dd:ee:ff"]
+            )
+
+    @pytest.mark.asyncio
+    async def test_classic_site_two_sites_same_description_uses_internal_reference(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Resolve requests ONLY via internalReference for two sites named Office."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {
+                "site_alpha": {
+                    "id": "site_alpha",
+                    "name": "Office",
+                    "internalReference": "alpha",
+                },
+                "site_beta": {
+                    "id": "site_beta",
+                    "name": "Office",
+                    "internalReference": "beta",
+                },
+            }
+        }
+        # Simulate device coordinator fuzzy mapping returning beta for both
+        facade_coordinator._device_coordinator._legacy_site_names = {
+            "site_alpha": "beta",
+            "site_beta": "beta",
+        }
+        facade_coordinator.network_client.clients.get_historical_legacy = AsyncMock(
+            return_value=[{"mac": "aa:bb:cc:dd:ee:ff"}]
+        )
+        facade_coordinator.network_client.clients.forget_batch = AsyncMock(
+            return_value=True
+        )
+
+        clients = await facade_coordinator.async_get_historical_clients("site_alpha")
+        assert clients == [{"mac": "aa:bb:cc:dd:ee:ff"}]
+        clients_api = facade_coordinator.network_client.clients
+        clients_api.get_historical_legacy.assert_called_once_with("alpha")
+
+        result = await facade_coordinator.async_forget_clients_batch(
+            "site_alpha", ["aa:bb:cc:dd:ee:ff"]
+        )
+        assert result is True
+        facade_coordinator.network_client.clients.forget_batch.assert_called_once_with(
+            "alpha", ["aa:bb:cc:dd:ee:ff"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_classic_site_blank_internal_reference_sends_nothing(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Missing or blank internalReference raises and sends no requests."""
+        facade_coordinator.network_client.clients.get_historical_legacy = AsyncMock()
+        facade_coordinator.network_client.clients.forget_batch = AsyncMock()
+
+        for blank_ref in [None, "", "   "]:
+            facade_coordinator._config_coordinator.data = {
+                "sites": {"site1": {"id": "site1", "internalReference": blank_ref}}
+            }
+            with pytest.raises(HomeAssistantError) as exc_info:
+                await facade_coordinator.async_get_historical_clients("site1")
+            assert exc_info.value.translation_key == "legacy_site_not_found"
+
+            with pytest.raises(HomeAssistantError) as exc_info:
+                await facade_coordinator.async_forget_clients_batch(
+                    "site1", ["aa:bb:cc:dd:ee:ff"]
+                )
+            assert exc_info.value.translation_key == "legacy_site_not_found"
+
+        facade_coordinator.network_client.clients.get_historical_legacy.assert_not_called()
+        facade_coordinator.network_client.clients.forget_batch.assert_not_called()
+
+    def test_facade_network_usability_accessors(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test network_available and is_network_usable accessors on facade."""
+        assert facade_coordinator.network_available is True
+        assert facade_coordinator.is_network_usable is True
+
+        facade_coordinator._config_coordinator._network_available = False
+        assert facade_coordinator._config_coordinator.network_available is False
+        assert facade_coordinator.network_available is False
+        assert facade_coordinator.is_network_usable is False
+
+        facade_coordinator._config_coordinator._network_available = True
+        facade_coordinator.network_client = None  # type: ignore[assignment]
+        assert facade_coordinator.is_network_usable is False
+
+    @pytest.mark.asyncio
     async def test_async_set_outlet_state(
         self, facade_coordinator: UnifiFacadeCoordinator
     ):
@@ -6096,7 +7589,7 @@ class TestUnifiFacadeCoordinator:
             "branch",
             "60a1b2c3d4e5f67890123456",
             1,
-            True,
+            state=True,
             cycle_enabled=False,
             current_device={
                 "id": "device1",
@@ -6141,10 +7634,35 @@ class TestUnifiFacadeCoordinator:
 
     @pytest.mark.asyncio
     async def test_async_play_chime(self, facade_coordinator: UnifiFacadeCoordinator):
-        """Test async_play_chime delegates correctly."""
-        facade_coordinator.protect_client.chimes.play = AsyncMock()
-        await facade_coordinator.async_play_chime("chime1")
-        facade_coordinator.protect_client.chimes.play.assert_called_once_with("chime1")
+        """The vendored no-I/O stub surfaces a translated unsupported error."""
+        client = facade_coordinator.protect_client
+        assert client is not None
+        with (
+            patch.object(client, "chimes", ChimesEndpoint(client)),
+            patch.object(client, "build_api_path") as build_api_path,
+            patch.object(client, "_post") as post,
+            pytest.raises(HomeAssistantError) as raised,
+        ):
+            await facade_coordinator.async_play_chime("chime1")
+        assert raised.value.translation_key == "chime_playback_unsupported"
+        assert raised.value.translation_domain == DOMAIN
+        build_api_path.assert_not_called()
+        post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_play_chime_generic_failure(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Unexpected play failures are wrapped with the chime-specific message."""
+        facade_coordinator.protect_client.chimes.play = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        with pytest.raises(
+            HomeAssistantError, match="Unable to play chime chime1"
+        ) as raised:
+            await facade_coordinator.async_play_chime("chime1")
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert str(raised.value.__cause__) == "boom"
 
     @pytest.mark.asyncio
     async def test_async_start_ptz_patrol(
@@ -6189,26 +7707,89 @@ class TestUnifiFacadeCoordinator:
         )
 
     @pytest.mark.asyncio
-    async def test_async_set_recording_mode(
-        self, facade_coordinator: UnifiFacadeCoordinator
-    ):
-        """Test async_set_recording_mode delegates correctly."""
-        facade_coordinator.protect_client.cameras.update = AsyncMock()
-        await facade_coordinator.async_set_recording_mode("cam1", "always")
-        facade_coordinator.protect_client.cameras.update.assert_called_once_with(
-            "cam1", recordingMode="always"
-        )
-
-    @pytest.mark.asyncio
     async def test_async_set_chime_ringtone(
         self, facade_coordinator: UnifiFacadeCoordinator
     ):
-        """Test async_set_chime_ringtone delegates correctly."""
+        """Use the ringtone setter and refresh only after a successful write."""
+        assert facade_coordinator.protect_client is not None
+        facade_coordinator.protect_client.chimes.set_ringtone = AsyncMock()
         facade_coordinator.protect_client.chimes.update = AsyncMock()
-        await facade_coordinator.async_set_chime_ringtone("chime1", "ring2")
-        facade_coordinator.protect_client.chimes.update.assert_called_once_with(
-            "chime1", ringtone="ring2"
+        with patch.object(
+            facade_coordinator._protect_coordinator,
+            "async_request_refresh",
+            new_callable=AsyncMock,
+        ) as refresh:
+            await facade_coordinator.async_set_chime_ringtone("chime1", "tone-2")
+        facade_coordinator.protect_client.chimes.set_ringtone.assert_awaited_once_with(
+            "chime1", "tone-2"
         )
+        refresh.assert_awaited_once()
+        facade_coordinator.protect_client.chimes.update.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ValueError("Incomplete ring settings"),
+            UniFiResponseError("Ringtone rejected", status_code=400),
+        ],
+    )
+    async def test_async_set_chime_ringtone_error_skips_refresh(
+        self, facade_coordinator: UnifiFacadeCoordinator, error: Exception
+    ) -> None:
+        """Validation and API failures become a user-facing error without refresh."""
+        assert facade_coordinator.protect_client is not None
+        facade_coordinator.protect_client.chimes.set_ringtone = AsyncMock(
+            side_effect=error
+        )
+        with (
+            patch.object(
+                facade_coordinator._protect_coordinator,
+                "async_request_refresh",
+                new_callable=AsyncMock,
+            ) as refresh,
+            pytest.raises(
+                HomeAssistantError, match="Unable to set ringtone for chime chime1"
+            ),
+        ):
+            await facade_coordinator.async_set_chime_ringtone("chime1", "tone-2")
+        refresh.assert_not_awaited()
+
+    async def test_async_set_chime_ringtone_without_protect_coordinator(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """The setter also works when no child coordinator needs a refresh."""
+        assert facade_coordinator.protect_client is not None
+        facade_coordinator.protect_client.chimes.set_ringtone = AsyncMock()
+        with patch.object(facade_coordinator, "_protect_coordinator", None):
+            await facade_coordinator.async_set_chime_ringtone("chime1", "tone-2")
+        facade_coordinator.protect_client.chimes.set_ringtone.assert_awaited_once_with(
+            "chime1", "tone-2"
+        )
+
+    @pytest.mark.parametrize("raises", [False, True])
+    async def test_chime_ringtone_success_survives_refresh_failure(
+        self, facade_coordinator: UnifiFacadeCoordinator, raises, caplog
+    ) -> None:
+        """A recorded or raised refresh error cannot undo a successful PATCH."""
+        client = facade_coordinator.protect_client
+        assert client is not None
+        client.chimes.set_ringtone = AsyncMock()
+        child = facade_coordinator._protect_coordinator
+
+        async def refresh() -> None:
+            assert child is not None
+            child.last_update_success = False
+            if raises:
+                msg = "Synthetic refresh failure"
+                raise RuntimeError(msg)
+
+        with patch.object(child, "async_request_refresh", side_effect=refresh):
+            await facade_coordinator.async_set_chime_ringtone("chime1", "tone-new")
+        assert client is not None
+        assert child is not None
+        client.chimes.set_ringtone.assert_awaited_once_with("chime1", "tone-new")
+        assert child.last_update_success is False
+        assert ("ringtone was updated" in caplog.text) == raises
 
     @pytest.mark.asyncio
     async def test_async_move_ptz_to_preset(
@@ -6244,14 +7825,152 @@ class TestUnifiFacadeCoordinator:
         )
 
     @pytest.mark.asyncio
+    async def test_async_start_camera_talkback_success(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Test async_start_camera_talkback creates session and starts stream."""
+        session = TalkbackSession(
+            url="rtp://192.168.1.10:7004",
+            codec="opus",
+            samplingRate=24000,
+            bitsPerSample=16,
+        )
+        facade_coordinator.protect_client.cameras.create_talkback_session = AsyncMock(
+            return_value=session
+        )
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade.TalkbackStream"
+        ) as mock_stream_cls:
+            mock_stream = mock_stream_cls.return_value
+            mock_stream.start = AsyncMock()
+            result = await facade_coordinator.async_start_camera_talkback(
+                "cam1", "http://media.local/audio.mp3"
+            )
+            assert result is mock_stream
+            facade_coordinator.protect_client.cameras.create_talkback_session.assert_called_once_with(
+                "cam1"
+            )
+            mock_stream_cls.assert_called_once_with(
+                session, "http://media.local/audio.mp3", facade_coordinator.hass
+            )
+            mock_stream.start.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_start_camera_talkback_no_protect(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Test async_start_camera_talkback raises when protect client is None."""
+        facade_coordinator.protect_client = None
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await facade_coordinator.async_start_camera_talkback(
+                "cam1", "http://media.local/audio.mp3"
+            )
+        assert exc_info.value.translation_key == "protect_not_available_for_talkback"
+
+    @pytest.mark.asyncio
+    async def test_async_start_camera_talkback_session_failure(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test async_start_camera_talkback raises when session creation fails."""
+        facade_coordinator.protect_client.cameras.create_talkback_session = AsyncMock(
+            side_effect=ValueError("Session failed")
+        )
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await facade_coordinator.async_start_camera_talkback(
+                "cam1", "https://media.local/audio.mp3"
+            )
+        assert exc_info.value.translation_key == "talkback_session_invalid"
+
+        # Also verify ValidationError handling logs sanitized fields without raw URL
+        distinctive_url = "rtp://custom-token@192.168.1.10:7004"
+        validation_err = ValidationError.from_exception_data(
+            "TalkbackSession",
+            [
+                {
+                    "type": "string_type",
+                    "loc": ("url",),
+                    "msg": "Input should be a valid string",
+                    "input": distinctive_url,
+                }
+            ],
+        )
+        facade_coordinator.protect_client.cameras.create_talkback_session = AsyncMock(
+            side_effect=validation_err
+        )
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(HomeAssistantError) as exc_info,
+        ):
+            await facade_coordinator.async_start_camera_talkback(
+                "cam1", "https://media.local/audio.mp3"
+            )
+        assert exc_info.value.translation_key == "talkback_session_invalid"
+        assert "invalid fields: url" in caplog.text
+        assert distinctive_url not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_async_start_camera_talkback_unsupported_params(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Test async_start_camera_talkback raises for unsupported stream parameters."""
+        session = TalkbackSession(
+            url="rtp://192.168.1.10:7004",
+            codec="opus",
+            samplingRate=24000,
+            bitsPerSample=16,
+        )
+        facade_coordinator.protect_client.cameras.create_talkback_session = AsyncMock(
+            return_value=session
+        )
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade.TalkbackStream.start",
+            side_effect=TalkbackSchemeError("Bad scheme"),
+        ):
+            with pytest.raises(HomeAssistantError) as exc_info:
+                await facade_coordinator.async_start_camera_talkback(
+                    "cam1", "http://media.local/audio.mp3"
+                )
+            assert (
+                exc_info.value.translation_key == "talkback_unsupported_codec_or_scheme"
+            )
+
+    @pytest.mark.asyncio
+    async def test_async_start_camera_talkback_stream_failure(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Test async_start_camera_talkback raises for stream start failure."""
+        session = TalkbackSession(
+            url="rtp://192.168.1.10:7004",
+            codec="opus",
+            samplingRate=24000,
+            bitsPerSample=16,
+        )
+        facade_coordinator.protect_client.cameras.create_talkback_session = AsyncMock(
+            return_value=session
+        )
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade.TalkbackStream.start",
+            side_effect=TalkbackStreamError("Stream failed"),
+        ):
+            with pytest.raises(HomeAssistantError) as exc_info:
+                await facade_coordinator.async_start_camera_talkback(
+                    "cam1", "http://media.local/audio.mp3"
+                )
+            assert exc_info.value.translation_key == "talkback_stream_failure"
+
+    @pytest.mark.asyncio
     async def test_async_set_light_brightness(
         self, facade_coordinator: UnifiFacadeCoordinator
     ):
         """Test async_set_light_brightness delegates correctly."""
         facade_coordinator.protect_client.lights.set_brightness = AsyncMock()
-        await facade_coordinator.async_set_light_brightness("light1", 75)
+        await facade_coordinator.async_set_light_brightness("light1", 5)
         facade_coordinator.protect_client.lights.set_brightness.assert_called_once_with(
-            "light1", 75
+            "light1", 5
         )
 
     @pytest.mark.asyncio
@@ -6262,7 +7981,49 @@ class TestUnifiFacadeCoordinator:
         facade_coordinator.protect_client.lights.update = AsyncMock()
         await facade_coordinator.async_set_light_mode("light1", "motion")
         facade_coordinator.protect_client.lights.update.assert_called_once_with(
-            "light1", lightMode="motion"
+            "light1", lightModeSettings={"mode": "motion"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_set_light_mode_sends_spec_patch_body(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test async_set_light_mode sends spec lightModeSettings PATCH body."""
+        client = UniFiProtectClient(
+            auth=ApiKeyAuth(api_key="test-key"),
+            base_url="https://192.168.1.1",
+            connection_type=ConnectionType.LOCAL,
+        )
+        client._patch = AsyncMock(
+            return_value={"id": "light1", "mac": "00:11:22:33:44:66"}
+        )
+        facade_coordinator.protect_client = client
+        facade_coordinator._protect_coordinator.protect_client = client
+        await facade_coordinator.async_set_light_mode("light1", "motion")
+        client._patch.assert_awaited_once_with(
+            client.build_api_path("/lights/light1"),
+            json_data={"lightModeSettings": {"mode": "motion"}},
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_set_light_brightness_sends_spec_patch_body(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """Test async_set_light_brightness sends spec lightDeviceSettings PATCH body."""
+        client = UniFiProtectClient(
+            auth=ApiKeyAuth(api_key="test-key"),
+            base_url="https://192.168.1.1",
+            connection_type=ConnectionType.LOCAL,
+        )
+        client._patch = AsyncMock(
+            return_value={"id": "light1", "mac": "00:11:22:33:44:66"}
+        )
+        facade_coordinator.protect_client = client
+        facade_coordinator._protect_coordinator.protect_client = client
+        await facade_coordinator.async_set_light_brightness("light1", 6)
+        client._patch.assert_awaited_once_with(
+            client.build_api_path("/lights/light1"),
+            json_data={"lightDeviceSettings": {"ledLevel": 6}},
         )
 
     @pytest.mark.asyncio
@@ -6277,14 +8038,102 @@ class TestUnifiFacadeCoordinator:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("camera_ids", [["cam_a", "cam_b"], []])
+    async def test_async_set_chime_paired_cameras_patches_and_requests_refresh(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+        camera_ids: list[str],
+    ):
+        """The PATCH carries only cameraIds, then Protect is asked to refresh."""
+        facade_coordinator.protect_client.chimes.update = AsyncMock()
+
+        with patch.object(
+            protect_coordinator, "async_request_refresh", AsyncMock()
+        ) as refresh:
+            await facade_coordinator.async_set_chime_paired_cameras(
+                "chime1", camera_ids
+            )
+
+        facade_coordinator.protect_client.chimes.update.assert_awaited_once_with(
+            "chime1", cameraIds=camera_ids
+        )
+        refresh.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_async_set_chime_paired_cameras_api_error_skips_the_refresh(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+    ):
+        """A rejected PATCH is a HomeAssistantError and refreshes nothing."""
+        facade_coordinator.protect_client.chimes.update = AsyncMock(
+            side_effect=UniFiResponseError("x", 400)
+        )
+
+        with (
+            patch.object(
+                protect_coordinator, "async_request_refresh", AsyncMock()
+            ) as refresh,
+            pytest.raises(
+                HomeAssistantError,
+                match="Unable to set the paired doorbells of chime chime1",
+            ),
+        ):
+            await facade_coordinator.async_set_chime_paired_cameras("chime1", [])
+
+        refresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_async_set_chime_paired_cameras_without_protect_coordinator(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry: MockConfigEntry,
+        config_coordinator: UnifiConfigCoordinator,
+        device_coordinator: UnifiDeviceCoordinator,
+    ):
+        """A facade with a client but no Protect coordinator still sends the PATCH."""
+        protect_client = _create_mock_protect_client()
+        protect_client.chimes.update = AsyncMock()
+        facade = UnifiFacadeCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=protect_client,
+            entry=mock_config_entry,
+            config_coordinator=config_coordinator,
+            device_coordinator=device_coordinator,
+            protect_coordinator=None,
+        )
+        try:
+            await facade.async_set_chime_paired_cameras("chime1", ["cam_a"])
+        finally:
+            await facade.async_shutdown()
+            await config_coordinator.async_shutdown()
+            await device_coordinator.async_shutdown()
+
+        protect_client.chimes.update.assert_awaited_once_with(
+            "chime1", cameraIds=["cam_a"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_set_chime_paired_cameras_without_protect_client_raises(
+        self, facade_coordinator_no_protect: UnifiFacadeCoordinator
+    ):
+        """Pairing without Protect fails with the shared "not available" error."""
+        with pytest.raises(HomeAssistantError, match="Protect is not available"):
+            await facade_coordinator_no_protect.async_set_chime_paired_cameras(
+                "chime1", []
+            )
+
+    @pytest.mark.asyncio
     async def test_async_set_chime_repeat(
         self, facade_coordinator: UnifiFacadeCoordinator
     ):
         """Test async_set_chime_repeat delegates correctly."""
-        facade_coordinator.protect_client.chimes.update = AsyncMock()
+        facade_coordinator.protect_client.chimes.set_repeat_times = AsyncMock()
         await facade_coordinator.async_set_chime_repeat("chime1", 3)
-        facade_coordinator.protect_client.chimes.update.assert_called_once_with(
-            "chime1", repeatTimes=3
+        facade_coordinator.protect_client.chimes.set_repeat_times.assert_called_once_with(
+            "chime1", 3
         )
 
     @pytest.mark.asyncio
@@ -6313,17 +8162,6 @@ class TestUnifiFacadeCoordinator:
         )
 
     @pytest.mark.asyncio
-    async def test_async_generate_voucher_minimal(
-        self, facade_coordinator: UnifiFacadeCoordinator
-    ):
-        """Test async_generate_voucher with minimal args."""
-        facade_coordinator.network_client.vouchers.create = AsyncMock()
-        await facade_coordinator.async_generate_voucher("site1")
-        facade_coordinator.network_client.vouchers.create.assert_called_once_with(
-            "site1", count=1
-        )
-
-    @pytest.mark.asyncio
     async def test_async_delete_voucher(
         self, facade_coordinator: UnifiFacadeCoordinator
     ):
@@ -6346,6 +8184,168 @@ class TestUnifiFacadeCoordinator:
         facade_coordinator.protect_client.application.trigger_alarm_webhook.assert_called_once_with(
             "alarm1"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "endpoint"),
+        [("async_arm_alarm", "enable"), ("async_disarm_alarm", "disable")],
+    )
+    async def test_async_arm_and_disarm_call_endpoint_and_request_refresh(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+        method: str,
+        endpoint: str,
+    ):
+        """Arm and disarm hit the matching endpoint with no arguments, then refresh.
+
+        The Protect coordinator's own debounced refresh is the fallback for the
+        NVR's WebSocket frame; there is no optimistic state.
+        """
+        arm_profiles = facade_coordinator.protect_client.arm_profiles
+        arm_profiles.enable = AsyncMock(return_value=True)
+        arm_profiles.disable = AsyncMock(return_value=True)
+
+        with patch.object(
+            protect_coordinator, "async_request_refresh", AsyncMock()
+        ) as refresh:
+            await getattr(facade_coordinator, method)()
+
+        called = getattr(arm_profiles, endpoint)
+        called.assert_awaited_once_with()
+        other = arm_profiles.disable if endpoint == "enable" else arm_profiles.enable
+        other.assert_not_awaited()
+        refresh.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "endpoint"),
+        [("async_arm_alarm", "enable"), ("async_disarm_alarm", "disable")],
+    )
+    async def test_async_arm_global_alarm_manager_raises_translated_error(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+        method: str,
+        endpoint: str,
+    ):
+        """Protect's global alarm manager refusal becomes a translated error.
+
+        Nothing is refreshed, because nothing changed.
+        """
+        arm_profiles = facade_coordinator.protect_client.arm_profiles
+        setattr(
+            arm_profiles,
+            endpoint,
+            AsyncMock(side_effect=UniFiGlobalAlarmManagerError("x", 400, "body")),
+        )
+        protect_coordinator.data["global_alarm_manager"] = False
+
+        with (
+            patch.object(
+                protect_coordinator, "async_request_refresh", AsyncMock()
+            ) as refresh,
+            pytest.raises(HomeAssistantError) as err,
+        ):
+            await getattr(facade_coordinator, method)()
+
+        assert err.value.translation_domain == DOMAIN
+        assert err.value.translation_key == "global_alarm_manager"
+        refresh.assert_not_awaited()
+        # The refusal is also the answer to whether the manager is on.
+        assert protect_coordinator.data["global_alarm_manager"] is True
+
+    @pytest.mark.asyncio
+    async def test_async_arm_alarm_other_error_wraps_message(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+    ):
+        """Any other API failure keeps the house "Unable to ..." wording."""
+        facade_coordinator.protect_client.arm_profiles.enable = AsyncMock(
+            side_effect=UniFiResponseError("x", 500)
+        )
+
+        with (
+            patch.object(
+                protect_coordinator, "async_request_refresh", AsyncMock()
+            ) as refresh,
+            pytest.raises(
+                HomeAssistantError, match="Unable to arm the UniFi Protect alarm"
+            ),
+        ):
+            await facade_coordinator.async_arm_alarm()
+
+        refresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_async_disarm_alarm_without_protect_coordinator(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry: MockConfigEntry,
+        config_coordinator: UnifiConfigCoordinator,
+        device_coordinator: UnifiDeviceCoordinator,
+    ):
+        """A facade with a client but no Protect coordinator still sends the request."""
+        protect_client = _create_mock_protect_client()
+        protect_client.arm_profiles.disable = AsyncMock(return_value=True)
+        facade = UnifiFacadeCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=protect_client,
+            entry=mock_config_entry,
+            config_coordinator=config_coordinator,
+            device_coordinator=device_coordinator,
+            protect_coordinator=None,
+        )
+        try:
+            await facade.async_disarm_alarm()
+        finally:
+            await facade.async_shutdown()
+            await config_coordinator.async_shutdown()
+            await device_coordinator.async_shutdown()
+
+        protect_client.arm_profiles.disable.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_async_arm_global_alarm_manager_without_protect_coordinator(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry: MockConfigEntry,
+        config_coordinator: UnifiConfigCoordinator,
+        device_coordinator: UnifiDeviceCoordinator,
+    ):
+        """The refusal is still translated when there is no coordinator to tell."""
+        protect_client = _create_mock_protect_client()
+        protect_client.arm_profiles.enable = AsyncMock(
+            side_effect=UniFiGlobalAlarmManagerError("x", 400, "body")
+        )
+        facade = UnifiFacadeCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=protect_client,
+            entry=mock_config_entry,
+            config_coordinator=config_coordinator,
+            device_coordinator=device_coordinator,
+            protect_coordinator=None,
+        )
+        try:
+            with pytest.raises(HomeAssistantError) as err:
+                await facade.async_arm_alarm()
+        finally:
+            await facade.async_shutdown()
+            await config_coordinator.async_shutdown()
+            await device_coordinator.async_shutdown()
+
+        assert err.value.translation_key == "global_alarm_manager"
+
+    @pytest.mark.asyncio
+    async def test_async_arm_alarm_without_protect_client_raises(
+        self, facade_coordinator_no_protect: UnifiFacadeCoordinator
+    ):
+        """Arming without Protect fails with the shared "not available" error."""
+        with pytest.raises(HomeAssistantError, match="Protect is not available"):
+            await facade_coordinator_no_protect.async_arm_alarm()
 
     @pytest.mark.asyncio
     async def test_async_create_liveview(
@@ -6438,6 +8438,712 @@ class TestUnifiFacadeCoordinator:
             assert unsub.call_count == 1
 
         assert facade_coordinator._sub_coordinator_unsubs == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("duration", [10, None])
+    async def test_async_play_siren_passes_duration(
+        self, facade_coordinator: UnifiFacadeCoordinator, duration: int | None
+    ):
+        """async_play_siren awaits the endpoint with the duration as a keyword."""
+        sirens = facade_coordinator.protect_client.sirens
+        sirens.play = AsyncMock(return_value=True)
+
+        await facade_coordinator.async_play_siren("siren_1", duration=duration)
+
+        sirens.play.assert_awaited_once_with("siren_1", duration=duration)
+
+    @pytest.mark.asyncio
+    async def test_async_set_siren_volume(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """async_set_siren_volume awaits the endpoint's set_volume."""
+        sirens = facade_coordinator.protect_client.sirens
+        sirens.set_volume = AsyncMock()
+
+        await facade_coordinator.async_set_siren_volume("siren_1", 50)
+
+        sirens.set_volume.assert_awaited_once_with("siren_1", 50)
+
+    @pytest.mark.asyncio
+    async def test_async_stop_siren_marks_stopped(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+    ):
+        """A stop is sent, then the cache shows the siren off in the facade data."""
+        sirens = facade_coordinator.protect_client.sirens
+        sirens.stop = AsyncMock(return_value=True)
+        active = copy.deepcopy(SAMPLE_SIREN)
+        active["sirenStatus"] = {"isActive": True}
+        protect_coordinator.data["sirens"] = {"siren_1": active}
+
+        await facade_coordinator.async_stop_siren("siren_1")
+
+        sirens.stop.assert_awaited_once_with("siren_1")
+        siren = facade_coordinator.data["protect"]["sirens"]["siren_1"]
+        assert siren["sirenStatus"]["isActive"] is False
+
+    @pytest.mark.asyncio
+    async def test_async_stop_siren_without_protect_coordinator(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry: MockConfigEntry,
+        config_coordinator: UnifiConfigCoordinator,
+        device_coordinator: UnifiDeviceCoordinator,
+    ):
+        """A facade with a client but no Protect coordinator still sends the stop."""
+        protect_client = _create_mock_protect_client()
+        protect_client.sirens.stop = AsyncMock(return_value=True)
+        facade = UnifiFacadeCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=protect_client,
+            entry=mock_config_entry,
+            config_coordinator=config_coordinator,
+            device_coordinator=device_coordinator,
+            protect_coordinator=None,
+        )
+        try:
+            await facade.async_stop_siren("siren_1")
+        finally:
+            await facade.async_shutdown()
+            await config_coordinator.async_shutdown()
+            await device_coordinator.async_shutdown()
+
+        protect_client.sirens.stop.assert_awaited_once_with("siren_1")
+
+    @pytest.mark.asyncio
+    async def test_async_play_siren_api_error_raises_home_assistant_error(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ):
+        """An API failure surfaces as a HomeAssistantError naming the siren."""
+        facade_coordinator.protect_client.sirens.play = AsyncMock(
+            side_effect=UniFiResponseError("x", 500)
+        )
+
+        with pytest.raises(HomeAssistantError, match="Unable to sound siren siren_1"):
+            await facade_coordinator.async_play_siren("siren_1")
+
+    @pytest.mark.asyncio
+    async def test_async_stop_siren_api_error_leaves_cache_untouched(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        protect_coordinator: UnifiProtectCoordinator,
+    ):
+        """A failed stop must not pretend the siren is off."""
+        facade_coordinator.protect_client.sirens.stop = AsyncMock(
+            side_effect=UniFiResponseError("x", 500)
+        )
+        active = copy.deepcopy(SAMPLE_SIREN)
+        active["sirenStatus"] = {"isActive": True}
+        protect_coordinator.data["sirens"] = {"siren_1": active}
+
+        with pytest.raises(HomeAssistantError, match="Unable to stop siren siren_1"):
+            await facade_coordinator.async_stop_siren("siren_1")
+
+        assert protect_coordinator.data["sirens"]["siren_1"]["sirenStatus"] == {
+            "isActive": True
+        }
+
+    def test_aggregate_data_includes_rule_sections(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Test aggregate data includes port_forwards and traffic_rules."""
+        facade_coordinator._config_coordinator.data["port_forwards"] = {
+            "site1": {"pf1": {}}
+        }
+        facade_coordinator._config_coordinator.data["traffic_rules"] = {
+            "site1": {"tr1": {}}
+        }
+        facade_coordinator._aggregate_data()
+        assert "port_forwards" in facade_coordinator.data
+        assert "traffic_rules" in facade_coordinator.data
+        assert facade_coordinator.data["port_forwards"] == {"site1": {"pf1": {}}}
+        assert facade_coordinator.data["traffic_rules"] == {"site1": {"tr1": {}}}
+
+    def test_aggregate_data_includes_nat_and_static_route_sections(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Test aggregated data includes NAT and static route sections."""
+        facade_coordinator._config_coordinator.data["nat_rules"] = {
+            "site1": {"nat1": {}}
+        }
+        facade_coordinator._config_coordinator.data["static_routes"] = {
+            "site1": {"sr1": {}}
+        }
+        facade_coordinator._aggregate_data()
+        assert "nat_rules" in facade_coordinator.data
+        assert "static_routes" in facade_coordinator.data
+        assert facade_coordinator.data["nat_rules"] == {"site1": {"nat1": {}}}
+        assert facade_coordinator.data["static_routes"] == {"site1": {"sr1": {}}}
+
+    @pytest.mark.parametrize(
+        ("data_key", "endpoint_attr", "list_method", "avail_method"),
+        _RULE_SECTION_PARAMS,
+    )
+    def test_rule_section_availability_passthrough(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        data_key: str,
+        endpoint_attr: str,
+        list_method: str,
+        avail_method: str,
+    ) -> None:
+        """Test facade availability methods pass through to config coordinator."""
+        setattr(
+            facade_coordinator._config_coordinator,
+            avail_method,
+            MagicMock(return_value=True),
+        )
+        avail_fn = getattr(facade_coordinator, avail_method)
+        assert avail_fn("site1") is True
+        getattr(
+            facade_coordinator._config_coordinator, avail_method
+        ).assert_called_once_with("site1")
+
+    @pytest.mark.asyncio
+    async def test_async_set_port_forward_enabled_uses_internal_reference(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Port forward toggle resolves site ONLY via internalReference."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {
+                "site_alpha": {
+                    "id": "site_alpha",
+                    "name": "Office",
+                    "internalReference": "alpha",
+                },
+                "site_beta": {
+                    "id": "site_beta",
+                    "name": "Office",
+                    "internalReference": "beta",
+                },
+            }
+        }
+        facade_coordinator._device_coordinator._legacy_site_names = {
+            "site_alpha": "beta",
+            "site_beta": "beta",
+        }
+        facade_coordinator.network_client.port_forwards.update_port_forward = (
+            AsyncMock()
+        )
+
+        await facade_coordinator.async_set_port_forward_enabled(
+            "site_alpha", "pf1", enabled=False
+        )
+        facade_coordinator.network_client.port_forwards.update_port_forward.assert_called_once_with(
+            "alpha", "pf1", enabled=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_set_traffic_rule_enabled_uses_internal_reference(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Traffic rule toggle resolves site ONLY via internalReference."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {
+                "site_alpha": {
+                    "id": "site_alpha",
+                    "name": "Office",
+                    "internalReference": "alpha",
+                },
+                "site_beta": {
+                    "id": "site_beta",
+                    "name": "Office",
+                    "internalReference": "beta",
+                },
+            }
+        }
+        facade_coordinator._device_coordinator._legacy_site_names = {
+            "site_alpha": "beta",
+            "site_beta": "beta",
+        }
+        facade_coordinator.network_client.traffic_rules.update_traffic_rule = (
+            AsyncMock()
+        )
+
+        await facade_coordinator.async_set_traffic_rule_enabled(
+            "site_alpha", "tr1", enabled=False
+        )
+        facade_coordinator.network_client.traffic_rules.update_traffic_rule.assert_called_once_with(
+            "alpha", "tr1", enabled=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_set_nat_rule_enabled_uses_internal_reference(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """NAT rule toggle resolves site ONLY via internalReference."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {
+                "site_alpha": {
+                    "id": "site_alpha",
+                    "name": "Office",
+                    "internalReference": "alpha",
+                },
+                "site_beta": {
+                    "id": "site_beta",
+                    "name": "Office",
+                    "internalReference": "beta",
+                },
+            }
+        }
+        facade_coordinator._device_coordinator._legacy_site_names = {
+            "site_alpha": "beta",
+            "site_beta": "beta",
+        }
+        facade_coordinator.network_client.nat_rules.update_nat_rule = AsyncMock()
+
+        await facade_coordinator.async_set_nat_rule_enabled(
+            "site_alpha", "nat1", enabled=False
+        )
+        facade_coordinator.network_client.nat_rules.update_nat_rule.assert_called_once_with(
+            "alpha", "nat1", enabled=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_export_network_rules_passes_console_and_sites(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """The facade hands its client, sites and console identity to the builder."""
+        sites = {"s": {"id": "s", "internalReference": "default"}}
+        facade_coordinator._config_coordinator.data = {"sites": sites}
+        document = {"format_version": 1, "sites": {}}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade."
+            "async_build_rule_export",
+            AsyncMock(return_value=document),
+        ) as build:
+            result = await facade_coordinator.async_export_network_rules(
+                ["s"], ["nat_rule"]
+            )
+
+        assert result is document
+        build.assert_awaited_once()
+        assert build.await_args is not None
+        assert build.await_args.args == (facade_coordinator.network_client, sites)
+        entry = facade_coordinator.config_entry
+        assert build.await_args.kwargs == {
+            "console": {"entry_id": entry.entry_id, "title": entry.title},
+            "site_ids": ["s"],
+            "rule_types": ["nat_rule"],
+            "is_unsupported": (
+                facade_coordinator._config_coordinator._is_unsupported_response
+            ),
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_export_network_rules_without_a_config_entry(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Without a config entry the console identity is exported as unknown."""
+        facade_coordinator._config_coordinator.data = {"sites": {}}
+        facade_coordinator.config_entry = None
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.facade."
+            "async_build_rule_export",
+            AsyncMock(return_value={}),
+        ) as build:
+            await facade_coordinator.async_export_network_rules()
+
+        assert build.await_args is not None
+        assert build.await_args.kwargs["console"] == {"entry_id": None, "title": None}
+
+    @pytest.mark.asyncio
+    async def test_async_set_nat_rule_enabled_console_managed_refreshes_and_raises(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """UniFiRuleNotEditableError requests refresh and raises translated error."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "default"}},
+            "nat_rules": {"site1": {"nat1": {"description": "DNS"}}},
+        }
+        facade_coordinator.network_client.nat_rules.update_nat_rule = AsyncMock(
+            side_effect=UniFiRuleNotEditableError(
+                "NAT rule nat1 is managed by the console"
+            )
+        )
+        facade_coordinator.async_request_refresh = AsyncMock()
+
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await facade_coordinator.async_set_nat_rule_enabled(
+                "site1", "nat1", enabled=False
+            )
+
+        facade_coordinator.async_request_refresh.assert_awaited_once()
+        assert exc_info.value.translation_key == "network_rule_console_managed"
+
+    @pytest.mark.parametrize(
+        ("setter_name", "endpoint_mock_path", "rule_type_placeholder"),
+        [
+            ("async_set_nat_rule_enabled", "nat_rules.update_nat_rule", "NAT rule"),
+            (
+                "async_set_static_route_enabled",
+                "static_routes.update_static_route",
+                "static route",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_async_set_new_rule_enabled_not_found_is_translated(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        setter_name: str,
+        endpoint_mock_path: str,
+        rule_type_placeholder: str,
+    ) -> None:
+        """A vanished rule raises the translated error and requests a refresh."""
+        if "nat" in setter_name:
+            section_key = "nat_rules"
+            rule_id = "nat1"
+            rule_record = {"description": "DNS"}
+            expected_name = "DNS"
+        else:
+            section_key = "static_routes"
+            rule_id = "sr1"
+            rule_record = {"name": "Lab"}
+            expected_name = "Lab"
+
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "default"}},
+            section_key: {"site1": {rule_id: rule_record}},
+        }
+        ep_name, meth_name = endpoint_mock_path.split(".")
+        setattr(
+            getattr(facade_coordinator.network_client, ep_name),
+            meth_name,
+            AsyncMock(
+                side_effect=UniFiNotFoundError(
+                    f"Rule {rule_id} not found", status_code=404
+                )
+            ),
+        )
+        facade_coordinator.async_request_refresh = AsyncMock()
+
+        setter = getattr(facade_coordinator, setter_name)
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await setter("site1", rule_id, enabled=True)
+
+        assert exc_info.value.translation_domain == DOMAIN
+        assert exc_info.value.translation_key == "network_rule_not_found"
+        assert exc_info.value.translation_placeholders == {
+            "rule_type": rule_type_placeholder,
+            "rule_name": expected_name,
+        }
+        facade_coordinator.async_request_refresh.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("setter_name", "endpoint_mock_path", "rule_type_placeholder"),
+        [
+            ("async_set_nat_rule_enabled", "nat_rules.update_nat_rule", "NAT rule"),
+            (
+                "async_set_static_route_enabled",
+                "static_routes.update_static_route",
+                "static route",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_async_set_new_rule_enabled_api_error_is_translated(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        setter_name: str,
+        endpoint_mock_path: str,
+        rule_type_placeholder: str,
+    ) -> None:
+        """API error during rule toggle raises translated error."""
+        if "nat" in setter_name:
+            section_key = "nat_rules"
+            rule_id = "nat1"
+            rule_record = {"description": "DNS"}
+            expected_name = "DNS"
+        else:
+            section_key = "static_routes"
+            rule_id = "sr1"
+            rule_record = {"name": "Lab"}
+            expected_name = "Lab"
+
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "default"}},
+            section_key: {"site1": {rule_id: rule_record}},
+        }
+        ep_name, meth_name = endpoint_mock_path.split(".")
+        setattr(
+            getattr(facade_coordinator.network_client, ep_name),
+            meth_name,
+            AsyncMock(side_effect=UniFiConnectionError("Connection failed")),
+        )
+
+        setter = getattr(facade_coordinator, setter_name)
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await setter("site1", rule_id, enabled=True)
+
+        assert exc_info.value.translation_domain == DOMAIN
+        assert exc_info.value.translation_key == "network_rule_update_failed"
+        assert exc_info.value.translation_placeholders == {
+            "rule_type": rule_type_placeholder,
+            "rule_name": expected_name,
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_set_static_route_enabled_uses_internal_reference(
+        self, facade_coordinator: UnifiFacadeCoordinator
+    ) -> None:
+        """Static route toggle resolves site ONLY via internalReference."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {
+                "site_alpha": {
+                    "id": "site_alpha",
+                    "name": "Office",
+                    "internalReference": "alpha",
+                },
+                "site_beta": {
+                    "id": "site_beta",
+                    "name": "Office",
+                    "internalReference": "beta",
+                },
+            }
+        }
+        facade_coordinator._device_coordinator._legacy_site_names = {
+            "site_alpha": "beta",
+            "site_beta": "beta",
+        }
+        facade_coordinator.network_client.static_routes.update_static_route = (
+            AsyncMock()
+        )
+
+        await facade_coordinator.async_set_static_route_enabled(
+            "site_alpha", "sr1", enabled=False
+        )
+        facade_coordinator.network_client.static_routes.update_static_route.assert_called_once_with(
+            "alpha", "sr1", enabled=False
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("action_method", "endpoint_attr", "update_method"),
+        [
+            (
+                "async_set_port_forward_enabled",
+                "port_forwards",
+                "update_port_forward",
+            ),
+            (
+                "async_set_traffic_rule_enabled",
+                "traffic_rules",
+                "update_traffic_rule",
+            ),
+            (
+                "async_set_nat_rule_enabled",
+                "nat_rules",
+                "update_nat_rule",
+            ),
+            (
+                "async_set_static_route_enabled",
+                "static_routes",
+                "update_static_route",
+            ),
+        ],
+    )
+    async def test_async_set_rule_enabled_without_internal_reference_raises(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        action_method: str,
+        endpoint_attr: str,
+        update_method: str,
+    ) -> None:
+        """Toggling a rule without internalReference raises HomeAssistantError."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1"}}
+        }
+        action_fn = getattr(facade_coordinator, action_method)
+        endpoint = getattr(facade_coordinator.network_client, endpoint_attr)
+        setattr(endpoint, update_method, AsyncMock())
+
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await action_fn("site1", "rule1", enabled=True)
+
+        assert exc_info.value.translation_key == "legacy_site_not_found"
+        getattr(endpoint, update_method).assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "action_method",
+            "endpoint_attr",
+            "update_method",
+            "rule_id",
+            "expected_msg",
+        ),
+        [
+            (
+                "async_set_port_forward_enabled",
+                "port_forwards",
+                "update_port_forward",
+                "pf1",
+                "Unable to update port forward pf1",
+            ),
+            (
+                "async_set_traffic_rule_enabled",
+                "traffic_rules",
+                "update_traffic_rule",
+                "tr1",
+                "Unable to update traffic rule tr1",
+            ),
+        ],
+    )
+    async def test_async_set_rule_enabled_wraps_api_errors(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        action_method: str,
+        endpoint_attr: str,
+        update_method: str,
+        rule_id: str,
+        *,
+        expected_msg: str,
+    ) -> None:
+        """API errors during rule toggles are wrapped in HomeAssistantError."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "default"}}
+        }
+        endpoint = getattr(facade_coordinator.network_client, endpoint_attr)
+        setattr(
+            endpoint,
+            update_method,
+            AsyncMock(side_effect=UniFiConnectionError("Connection failed")),
+        )
+        action_fn = getattr(facade_coordinator, action_method)
+
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await action_fn("site1", rule_id, enabled=True)
+
+        assert expected_msg in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("action_method", "endpoint_attr", "update_method"),
+        [
+            (
+                "async_set_port_forward_enabled",
+                "port_forwards",
+                "update_port_forward",
+            ),
+            (
+                "async_set_traffic_rule_enabled",
+                "traffic_rules",
+                "update_traffic_rule",
+            ),
+            (
+                "async_set_nat_rule_enabled",
+                "nat_rules",
+                "update_nat_rule",
+            ),
+            (
+                "async_set_static_route_enabled",
+                "static_routes",
+                "update_static_route",
+            ),
+        ],
+    )
+    async def test_async_set_rule_enabled_reraises_home_assistant_error(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        action_method: str,
+        endpoint_attr: str,
+        update_method: str,
+    ) -> None:
+        """A HomeAssistantError from a rule toggle propagates unwrapped."""
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "default"}}
+        }
+        error = HomeAssistantError("already translated")
+        endpoint = getattr(facade_coordinator.network_client, endpoint_attr)
+        setattr(endpoint, update_method, AsyncMock(side_effect=error))
+        action_fn = getattr(facade_coordinator, action_method)
+
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await action_fn("site1", "rule1", enabled=True)
+
+        assert exc_info.value is error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "action_method",
+            "endpoint_attr",
+            "update_method",
+            "rule_id",
+            "rule_key",
+            "name_key",
+            "rule_name",
+            "error_label",
+        ),
+        [
+            (
+                "async_set_port_forward_enabled",
+                "port_forwards",
+                "update_port_forward",
+                "pf1",
+                "port_forwards",
+                "name",
+                "Plex",
+                "port forward",
+            ),
+            (
+                "async_set_traffic_rule_enabled",
+                "traffic_rules",
+                "update_traffic_rule",
+                "tr1",
+                "traffic_rules",
+                "description",
+                "Bedtime",
+                "traffic rule",
+            ),
+        ],
+    )
+    async def test_async_set_rule_enabled_not_found_refreshes_and_raises_rule_name(
+        self,
+        facade_coordinator: UnifiFacadeCoordinator,
+        action_method: str,
+        endpoint_attr: str,
+        update_method: str,
+        rule_id: str,
+        *,
+        rule_key: str,
+        name_key: str,
+        rule_name: str,
+        error_label: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When a toggled rule is vanished, request refresh and raise.
+
+        Verifies that HomeAssistantError is raised without traceback.
+        """
+        facade_coordinator._config_coordinator.data = {
+            "sites": {"site1": {"id": "site1", "internalReference": "default"}},
+            rule_key: {"site1": {rule_id: {name_key: rule_name}}},
+        }
+        endpoint = getattr(facade_coordinator.network_client, endpoint_attr)
+        setattr(
+            endpoint,
+            update_method,
+            AsyncMock(
+                side_effect=UniFiNotFoundError(
+                    f"Rule {rule_id} not found", status_code=404
+                )
+            ),
+        )
+        facade_coordinator.async_request_refresh = AsyncMock()
+        action_fn = getattr(facade_coordinator, action_method)
+
+        with pytest.raises(HomeAssistantError) as exc_info:
+            await action_fn("site1", rule_id, enabled=True)
+
+        assert f"Unable to update {error_label} {rule_name}" in str(exc_info.value)
+        facade_coordinator.async_request_refresh.assert_awaited_once()
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
 
 
 # ============================================================================
@@ -6778,6 +9484,113 @@ class TestUnifiInsightsInnerSpaceCoordinator:
                 await coord._async_update_data()
 
     @pytest.mark.asyncio
+    async def test_stale_floor_plan_device_removed_current_kept(
+        self,
+        hass: HomeAssistant,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_innerspace_client: MagicMock,
+        mock_config_entry: MockConfigEntry,
+    ) -> None:
+        """A floor plan that disappears loses its device; present ones keep it."""
+        mock_config_entry.add_to_hass(hass)
+        registry = dr.async_get(hass)
+        for plan_id in ("fp-1", "fp-2"):
+            registry.async_get_or_create(
+                config_entry_id=mock_config_entry.entry_id,
+                identifiers={(DOMAIN, f"innerspace_floor_plan_{plan_id}")},
+            )
+
+        def plans(*ids: str) -> list[InnerSpaceFloorPlan]:
+            return [
+                InnerSpaceFloorPlan(
+                    id=plan_id,
+                    name=plan_id,
+                    image_url=f"/v1/assets/{plan_id}/plan.png",
+                )
+                for plan_id in ids
+            ]
+
+        mock_innerspace_client.get_project.return_value = InnerSpaceProject(
+            project=InnerSpaceProjectIdentity(id="proj-1"),
+        )
+        coord = UnifiInsightsInnerSpaceCoordinator(
+            hass=hass,
+            network_client=mock_network_client,
+            protect_client=mock_protect_client,
+            innerspace_client=mock_innerspace_client,
+            entry=mock_config_entry,
+        )
+
+        def device(plan_id: str) -> object:
+            return async_get_device_entry(
+                registry,
+                (DOMAIN, f"innerspace_floor_plan_{plan_id}"),
+                mock_config_entry.entry_id,
+            )
+
+        mock_innerspace_client.list_floor_plans.return_value = plans("fp-1", "fp-2")
+        await coord._async_update_data()
+        assert device("fp-1") is not None
+        assert device("fp-2") is not None
+
+        mock_innerspace_client.list_floor_plans.return_value = plans("fp-1")
+        await coord._async_update_data()
+        assert device("fp-1") is not None
+        assert device("fp-2") is None
+
+        # A plan that vanishes without ever having had a device is a no-op.
+        registry.async_clear_config_entry(mock_config_entry.entry_id)
+        mock_innerspace_client.list_floor_plans.return_value = []
+        await coord._async_update_data()
+        assert device("fp-1") is None
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_keeps_floor_plan_devices(
+        self,
+        hass: HomeAssistant,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_innerspace_client: MagicMock,
+        mock_config_entry: MockConfigEntry,
+    ) -> None:
+        """A failed poll keeps the last snapshot and must not prune devices."""
+        mock_config_entry.add_to_hass(hass)
+        registry = dr.async_get(hass)
+        registry.async_get_or_create(
+            config_entry_id=mock_config_entry.entry_id,
+            identifiers={(DOMAIN, "innerspace_floor_plan_fp-1")},
+        )
+        mock_innerspace_client.get_project.return_value = InnerSpaceProject(
+            project=InnerSpaceProjectIdentity(id="proj-1"),
+        )
+        mock_innerspace_client.list_floor_plans.return_value = [
+            InnerSpaceFloorPlan(
+                id="fp-1", name="fp-1", image_url="/v1/assets/fp-1/plan.png"
+            )
+        ]
+        coord = UnifiInsightsInnerSpaceCoordinator(
+            hass=hass,
+            network_client=mock_network_client,
+            protect_client=mock_protect_client,
+            innerspace_client=mock_innerspace_client,
+            entry=mock_config_entry,
+        )
+        await coord._async_update_data()
+
+        mock_innerspace_client.get_project.side_effect = UniFiConnectionError("Down")
+        with pytest.raises(UpdateFailed):
+            await coord._async_update_data()
+        assert (
+            async_get_device_entry(
+                registry,
+                (DOMAIN, "innerspace_floor_plan_fp-1"),
+                mock_config_entry.entry_id,
+            )
+            is not None
+        )
+
+    @pytest.mark.asyncio
     async def test_refresh_retains_warning_on_200_html_and_preserves_snapshot(
         self,
         hass: HomeAssistant,
@@ -7032,7 +9845,8 @@ class TestUnifiInsightsInnerSpaceCoordinator:
             site_name: str, interval: str, *, start_ms: int, end_ms: int
         ) -> list[dict[str, int]]:
             if interval == "hourly":
-                raise UniFiTimeoutError("Hourly timeout")
+                msg = "Hourly timeout"
+                raise UniFiTimeoutError(msg)
             return []
 
         mock_network_client.reports.get_site_report = AsyncMock(
@@ -7049,7 +9863,8 @@ class TestUnifiInsightsInnerSpaceCoordinator:
             site_name: str, interval: str, *, start_ms: int, end_ms: int
         ) -> list[dict[str, int]]:
             if interval == "daily":
-                raise UniFiTimeoutError("Daily timeout")
+                msg = "Daily timeout"
+                raise UniFiTimeoutError(msg)
             return []
 
         mock_network_client.reports.get_site_report = AsyncMock(side_effect=_fail_daily)
@@ -7182,3 +9997,1594 @@ class TestUnifiInsightsInnerSpaceCoordinator:
             dummy_coord, "site1", "default", set()
         )
         assert "w1" in wifi_res
+
+
+# ============================================================================
+# Protect 7.3.70 security device families (fobs, link stations, alarm hubs)
+# ============================================================================
+
+_SECURITY_FAMILIES = [
+    ("fobs", "_fetch_fobs", Fob, SAMPLE_KEYPAD_FOB),
+    ("link_stations", "_fetch_link_stations", LinkStation, SAMPLE_THREAD_LINK_STATION),
+    ("alarm_hubs", "_fetch_alarm_hubs", LinkStation, SAMPLE_ALARM_HUB),
+    ("sirens", "_fetch_sirens", Siren, SAMPLE_SIREN),
+]
+
+
+class TestProtectSecurityDeviceFamilies:
+    """Polling, WebSocket and event handling for fobs/link stations/alarm hubs."""
+
+    @pytest.fixture
+    async def coordinator(
+        self, hass: HomeAssistant, mock_config_entry: MockConfigEntry
+    ) -> AsyncGenerator[UnifiProtectCoordinator]:
+        """Create a protect coordinator, shut down on teardown."""
+        coord = UnifiProtectCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=_create_mock_protect_client(),
+            entry=mock_config_entry,
+        )
+        yield coord
+        await coord.async_shutdown()
+
+    def test_collections_are_initialised(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Each family has a data key named device_type + "s" from the start.
+
+        `UnifiProtectEntity` indexes `data["protect"][f"{device_type}s"]`
+        directly, so a missing key is a KeyError in every entity.
+        """
+        for collection in ("fobs", "link_stations", "alarm_hubs", "sirens"):
+            assert coordinator.data[collection] == {}
+            assert coordinator._previous_protect_device_ids[collection] == set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("collection", "fetch_method", "model", "sample"), _SECURITY_FAMILIES
+    )
+    async def test_fetch_populates_collection_with_camelcase_dicts(
+        self,
+        coordinator: UnifiProtectCoordinator,
+        collection: str,
+        fetch_method: str,
+        model: type,
+        sample: dict[str, Any],
+    ) -> None:
+        """A fetch stores the alias-keyed dump of each real model by id."""
+        getattr(coordinator.protect_client, collection).get_all = AsyncMock(
+            return_value=[model.model_validate(sample)]
+        )
+
+        await getattr(coordinator, fetch_method)()
+
+        stored = coordinator.data[collection][sample["id"]]
+        assert stored["id"] == sample["id"]
+        assert stored["state"] == "CONNECTED"
+        if collection == "fobs":
+            assert stored["keypadSettings"]["beepVolume"] == 60
+        elif collection == "sirens":
+            assert stored["sirenStatus"]["isActive"] is False
+            assert stored["volume"] == 50
+        else:
+            assert "threadState" in stored
+
+    @pytest.mark.asyncio
+    async def test_scheduled_poll_fetches_every_family(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """The 30s poll includes the three new families."""
+        client = coordinator.protect_client
+        client.fobs.get_all = AsyncMock(
+            return_value=[Fob.model_validate(SAMPLE_KEYPAD_FOB)]
+        )
+        client.link_stations.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_THREAD_LINK_STATION)]
+        )
+        client.alarm_hubs.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_ALARM_HUB)]
+        )
+        client.sirens.get_all = AsyncMock(
+            return_value=[Siren.model_validate(SAMPLE_SIREN)]
+        )
+
+        data = await coordinator._async_update_data()
+
+        assert set(data["fobs"]) == {"fob_1"}
+        assert set(data["link_stations"]) == {"link_station_thread"}
+        assert set(data["alarm_hubs"]) == {"alarm_hub_1"}
+        assert set(data["sirens"]) == {"siren_1"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("collection", "fetch_method", "model", "sample"), _SECURITY_FAMILIES
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiNotFoundError("Not Found", 404),
+            UniFiResponseError("API returned non-JSON response (status 200)", 200),
+        ],
+        ids=["404", "non-json-200"],
+    )
+    async def test_unsupported_answer_marks_family_unsupported_and_logs_once(
+        self,
+        coordinator: UnifiProtectCoordinator,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        collection: str,
+        fetch_method: str,
+        model: type,
+        sample: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        """An older Protect without the endpoint is polled hourly, logged once.
+
+        It may answer 404 or serve its HTML page with a 200. Without this
+        every 30s poll spends a request (and a warning) on an endpoint the
+        console does not have.
+        """
+        get_all = AsyncMock(side_effect=error)
+        getattr(coordinator.protect_client, collection).get_all = get_all
+        clock = 1000.0
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.time.monotonic",
+            side_effect=lambda: clock,
+        ):
+            with caplog.at_level(logging.INFO):
+                await getattr(coordinator, fetch_method)()
+                await getattr(coordinator, fetch_method)()
+            assert get_all.await_count == 1
+            assert coordinator.data[collection] == {}
+
+            clock += UNSUPPORTED_RESOURCE_RETRY.total_seconds() + 1
+            with caplog.at_level(logging.INFO):
+                await getattr(coordinator, fetch_method)()
+            assert get_all.await_count == 2
+
+        unsupported = [r for r in caplog.records if "does not expose" in r.getMessage()]
+        assert len(unsupported) == 1
+        assert unsupported[0].levelno == logging.INFO
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        # Never answered, so the HTML page is expected and logged at DEBUG.
+        get_all.assert_awaited_with(expected_unsupported=True)
+
+    @pytest.mark.asyncio
+    async def test_non_json_after_success_warns_and_keeps_polling(
+        self, coordinator: UnifiProtectCoordinator, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A family that answered before is not written off on an HTML page.
+
+        It stopped being an "unsupported endpoint" signal once the family
+        answered, so the call opts out and the error warns like any other.
+        """
+        endpoint = coordinator.protect_client.link_stations
+        endpoint.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_THREAD_LINK_STATION)]
+        )
+        await coordinator._fetch_link_stations()
+        endpoint.get_all.assert_awaited_once_with(expected_unsupported=True)
+
+        endpoint.get_all = AsyncMock(
+            side_effect=UniFiResponseError(
+                "API returned non-JSON response (status 200)", 200
+            )
+        )
+        await coordinator._fetch_link_stations()
+        await coordinator._fetch_link_stations()
+
+        assert "link_station_thread" in coordinator.data["link_stations"]
+        assert endpoint.get_all.await_count == 2
+        endpoint.get_all.assert_awaited_with(expected_unsupported=False)
+        assert "Error fetching link_stations" in caplog.text
+        assert "does not expose" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_http_400_before_first_answer_is_not_unsupported(
+        self, coordinator: UnifiProtectCoordinator, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 400 is a request problem, not a missing endpoint: warn, keep polling."""
+        endpoint = coordinator.protect_client.fobs
+        endpoint.get_all = AsyncMock(
+            side_effect=UniFiResponseError("API error (status 400)", 400)
+        )
+
+        await coordinator._fetch_fobs()
+        await coordinator._fetch_fobs()
+
+        assert endpoint.get_all.await_count == 2
+        assert "Error fetching fobs" in caplog.text
+        assert "does not expose" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unsupported_family_recovers_once_endpoint_answers(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A Protect upgrade is picked up at the next hourly re-probe."""
+        endpoint = coordinator.protect_client.fobs
+        endpoint.get_all = AsyncMock(
+            side_effect=[
+                UniFiNotFoundError("Not Found", 404),
+                [Fob.model_validate(SAMPLE_KEYPAD_FOB)],
+            ]
+        )
+        clock = 1000.0
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.time.monotonic",
+            side_effect=lambda: clock,
+        ):
+            await coordinator._fetch_fobs()
+            clock += UNSUPPORTED_RESOURCE_RETRY.total_seconds() + 1
+            await coordinator._fetch_fobs()
+            await coordinator._fetch_fobs()
+
+        assert "fob_1" in coordinator.data["fobs"]
+        # Not skipped after recovering: the third call went to the API.
+        assert endpoint.get_all.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_404_after_success_keeps_cache_and_keeps_polling(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A family that answered before is not written off on one 404.
+
+        It goes through the bounded 404 cache path instead, like cameras.
+        """
+        endpoint = coordinator.protect_client.alarm_hubs
+        endpoint.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_ALARM_HUB)]
+        )
+        await coordinator._fetch_alarm_hubs()
+
+        endpoint.get_all = AsyncMock(side_effect=UniFiNotFoundError("Not Found", 404))
+        await coordinator._fetch_alarm_hubs()
+        await coordinator._fetch_alarm_hubs()
+
+        assert "alarm_hub_1" in coordinator.data["alarm_hubs"]
+        assert endpoint.get_all.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_error_keeps_cached_devices(
+        self, coordinator: UnifiProtectCoordinator, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Any other error preserves the cache and is logged."""
+        coordinator.data["link_stations"] = {"ls1": {"id": "ls1"}}
+        coordinator.protect_client.link_stations.get_all = AsyncMock(
+            side_effect=Exception("500 Internal Server Error")
+        )
+
+        await coordinator._fetch_link_stations()
+
+        assert coordinator.data["link_stations"] == {"ls1": {"id": "ls1"}}
+        assert "Error fetching link_stations" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_incomplete_response_is_merged_over_cache(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A device the endpoint dropped on a parse error is not treated as gone."""
+        coordinator.data["fobs"] = {"fob_old": {"id": "fob_old"}}
+        endpoint = coordinator.protect_client.fobs
+        endpoint.get_all = AsyncMock(
+            return_value=[Fob.model_validate(SAMPLE_KEYPAD_FOB)]
+        )
+        endpoint.last_result_complete = False
+
+        await coordinator._fetch_fobs()
+
+        assert set(coordinator.data["fobs"]) == {"fob_old", "fob_1"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("collection", "identifier"),
+        [
+            ("fobs", "protect_fob_dev1"),
+            ("link_stations", "protect_link_station_dev1"),
+            ("alarm_hubs", "protect_alarm_hub_dev1"),
+            ("sirens", "protect_siren_dev1"),
+        ],
+    )
+    async def test_stale_cleanup_removes_vanished_device(
+        self,
+        hass: HomeAssistant,
+        coordinator: UnifiProtectCoordinator,
+        collection: str,
+        identifier: str,
+    ) -> None:
+        """A device gone past the grace window leaves the registry.
+
+        The identifier must match the entity's `protect_{device_type}_{id}`.
+        """
+        coordinator._previous_protect_device_ids[collection] = {"dev1"}
+        coordinator.data[collection] = {}
+        mock_device = MagicMock()
+        mock_device.id = "registry_dev1"
+
+        with (
+            patch(
+                "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+            ) as mock_registry,
+            patch(
+                "custom_components.unifi_insights.coordinators.protect.async_get_device_entry",
+                side_effect=lambda _reg, ident, _entry: (
+                    mock_device if ident == (DOMAIN, identifier) else None
+                ),
+            ),
+        ):
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 1):
+                coordinator._cleanup_stale_devices()
+
+            mock_registry.return_value.async_update_device.assert_called_once_with(
+                device_id="registry_dev1",
+                remove_config_entry_id=coordinator.config_entry.entry_id,
+            )
+
+    # -- WebSocket device frames ------------------------------------------
+
+    def _seed_hub(self, coordinator: UnifiProtectCoordinator) -> dict[str, Any]:
+        hub = copy.deepcopy(SAMPLE_ALARM_HUB)
+        hub["alarmHub"]["armed"] = "on"
+        coordinator.data["alarm_hubs"] = {"alarm_hub_1": hub}
+        return hub
+
+    def test_linkstation_frame_for_known_alarm_hub_updates_alarm_hubs(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Alarm hubs and link stations share modelKey "linkstation".
+
+        The frame is routed by which collection already holds the id.
+        """
+        self._seed_hub(coordinator)
+        coordinator.data["link_stations"] = {
+            "link_station_thread": copy.deepcopy(SAMPLE_THREAD_LINK_STATION)
+        }
+
+        coordinator._handle_device_update(
+            "linkstation", {"id": "alarm_hub_1", "state": "DISCONNECTED"}
+        )
+        coordinator._handle_device_update(
+            "linkstation", {"id": "link_station_thread", "name": "Renamed"}
+        )
+
+        assert coordinator.data["alarm_hubs"]["alarm_hub_1"]["state"] == "DISCONNECTED"
+        assert "alarm_hub_1" not in coordinator.data["link_stations"]
+        assert coordinator.data["link_stations"]["link_station_thread"]["name"] == (
+            "Renamed"
+        )
+        assert "link_station_thread" not in coordinator.data["alarm_hubs"]
+
+    @pytest.mark.parametrize(
+        ("is_alarm_hub", "collection"),
+        [(True, "alarm_hubs"), (False, "link_stations")],
+    )
+    def test_linkstation_frame_for_new_device_uses_is_alarm_hub(
+        self,
+        coordinator: UnifiProtectCoordinator,
+        *,
+        is_alarm_hub: bool,
+        collection: str,
+    ) -> None:
+        """An id no poll has seen yet is routed by the frame's isAlarmHub."""
+        coordinator._handle_device_update(
+            "linkstation", {"id": "new1", "isAlarmHub": is_alarm_hub}
+        )
+
+        assert "new1" in coordinator.data[collection]
+
+    def test_linkstation_frame_for_unknown_device_is_dropped(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Without an id match or isAlarmHub there is no safe target."""
+        coordinator._handle_device_update(
+            "linkstation", {"id": "mystery", "state": "CONNECTED"}
+        )
+
+        assert "mystery" not in coordinator.data["alarm_hubs"]
+        assert "mystery" not in coordinator.data["link_stations"]
+
+    def test_partial_nested_frame_keeps_sibling_fields(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A partial alarmHub frame must not wipe armed/battery until next poll."""
+        self._seed_hub(coordinator)
+
+        coordinator._handle_device_update(
+            "linkstation",
+            {"id": "alarm_hub_1", "alarmHub": {"deviceTamperStatus": "tampered"}},
+        )
+
+        alarm_hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]["alarmHub"]
+        assert alarm_hub["deviceTamperStatus"] == "tampered"
+        assert alarm_hub["armed"] == "on"
+        assert alarm_hub["battery"] == {
+            "charging": "off",
+            "batteryStatus": "ok",
+            "voltage": 13.1,
+        }
+
+    def test_partial_thread_network_frame_keeps_sibling_fields(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Merging recurses through threadState.network."""
+        coordinator.data["link_stations"] = {
+            "link_station_thread": copy.deepcopy(SAMPLE_THREAD_LINK_STATION)
+        }
+
+        coordinator._handle_device_update(
+            "linkstation",
+            {
+                "id": "link_station_thread",
+                "threadState": {"network": {"joinedDeviceCount": 5}},
+            },
+        )
+
+        network = coordinator.data["link_stations"]["link_station_thread"][
+            "threadState"
+        ]["network"]
+        assert network["joinedDeviceCount"] == 5
+        assert network["role"] == "leader"
+        assert network["channel"] == 15
+
+    def test_explicit_null_in_frame_replaces_nested_value(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Only dict-over-dict merges; a null network is a real state change."""
+        coordinator.data["link_stations"] = {
+            "link_station_thread": copy.deepcopy(SAMPLE_THREAD_LINK_STATION)
+        }
+
+        coordinator._handle_device_update(
+            "linkstation",
+            {"id": "link_station_thread", "threadState": {"network": None}},
+        )
+
+        state = coordinator.data["link_stations"]["link_station_thread"]["threadState"]
+        assert state["network"] is None
+
+    def test_merge_never_mutates_the_previous_dicts(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Listeners holding the old dict must see it unchanged."""
+        hub = self._seed_hub(coordinator)
+        old_alarm_hub = hub["alarmHub"]
+        snapshot = copy.deepcopy(hub)
+
+        coordinator._handle_device_update(
+            "linkstation",
+            {"id": "alarm_hub_1", "alarmHub": {"deviceTamperStatus": "tampered"}},
+        )
+
+        assert hub == snapshot
+        assert old_alarm_hub["deviceTamperStatus"] == "restored"
+        new_hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert new_hub is not hub
+        assert new_hub["alarmHub"] is not old_alarm_hub
+
+    def test_fob_frame_deep_merges_keypad_settings(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Fob frames ("fob" modelKey) deep-merge into fobs."""
+        coordinator.data["fobs"] = {"fob_1": copy.deepcopy(SAMPLE_KEYPAD_FOB)}
+
+        coordinator._handle_device_update(
+            "fob", {"id": "fob_1", "keypadSettings": {"beepVolume": 20}}
+        )
+
+        keypad = coordinator.data["fobs"]["fob_1"]["keypadSettings"]
+        assert keypad == {"beepEnabled": True, "beepVolume": 20}
+
+    def test_siren_frame_deep_merges_siren_status(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A partial siren frame keeps the nested siblings it does not carry.
+
+        Goes through the confirmed {"type", "item"} envelope. The siren starts
+        out sounding, and the frame carries only the changed leaves.
+        """
+        sounding = copy.deepcopy(SAMPLE_SIREN)
+        sounding["sirenStatus"] = {
+            "isActive": True,
+            "activatedAt": 1759700000000,
+            "duration": 10000,
+        }
+        coordinator.data["sirens"] = {"siren_1": sounding}
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator._on_websocket_message(
+            {
+                "type": "update",
+                "item": {
+                    "id": "siren_1",
+                    "modelKey": "siren",
+                    "sirenStatus": {"isActive": False},
+                    "wirelessConnectionState": {"batteryStatus": {"percentage": 80}},
+                },
+            }
+        )
+
+        siren = coordinator.data["sirens"]["siren_1"]
+        assert siren["sirenStatus"] == {
+            "isActive": False,
+            "activatedAt": 1759700000000,
+            "duration": 10000,
+        }
+        wireless = siren["wirelessConnectionState"]
+        assert wireless["batteryStatus"] == {"percentage": 80, "isLow": False}
+        assert wireless["signalState"] == {
+            "signalQuality": None,
+            "signalStrength": None,
+        }
+        assert siren["volume"] == 50
+        listener.assert_called()
+
+    def test_siren_frame_for_unpolled_siren_creates_entry(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A frame for a siren the poll has not seen yet creates its entry."""
+        coordinator._handle_device_update(
+            "siren", {"id": "siren_new", "sirenStatus": {"isActive": True}}
+        )
+
+        assert coordinator.data["sirens"]["siren_new"] == {
+            "id": "siren_new",
+            "sirenStatus": {"isActive": True},
+        }
+
+    def test_mark_siren_stopped_clears_is_active_and_notifies(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A manual stop shows off in the cache and notifies listeners once."""
+        active = copy.deepcopy(SAMPLE_SIREN)
+        active["sirenStatus"] = {
+            "isActive": True,
+            "activatedAt": 1759700000000,
+            "duration": 10000,
+        }
+        coordinator.data["sirens"] = {"siren_1": active}
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator.mark_siren_stopped("siren_1")
+
+        status = coordinator.data["sirens"]["siren_1"]["sirenStatus"]
+        assert status == {
+            "isActive": False,
+            "activatedAt": 1759700000000,
+            "duration": 10000,
+        }
+        listener.assert_called_once()
+
+    def test_mark_siren_stopped_with_null_status_sets_status(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A siren whose status was null still ends up with an explicit off."""
+        siren = copy.deepcopy(SAMPLE_SIREN)
+        siren["sirenStatus"] = None
+        coordinator.data["sirens"] = {"siren_1": siren}
+
+        coordinator.mark_siren_stopped("siren_1")
+
+        status = coordinator.data["sirens"]["siren_1"]["sirenStatus"]
+        assert status == {"isActive": False}
+
+    @pytest.mark.parametrize("record", [None, "not-a-dict"], ids=["absent", "garbage"])
+    def test_mark_siren_stopped_ignores_unknown_siren(
+        self, coordinator: UnifiProtectCoordinator, record: Any
+    ) -> None:
+        """A stop for a siren the cache has no usable record of changes nothing."""
+        if record is not None:
+            coordinator.data["sirens"] = {"siren_1": record}
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator.mark_siren_stopped("siren_1")
+
+        assert coordinator.data["sirens"] == (
+            {} if record is None else {"siren_1": record}
+        )
+        listener.assert_not_called()
+
+    def test_mark_siren_stopped_leaves_poll_state_alone(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Nothing was polled, so the poll is neither marked good nor pushed back."""
+        active = copy.deepcopy(SAMPLE_SIREN)
+        active["sirenStatus"] = {"isActive": True}
+        coordinator.data["sirens"] = {"siren_1": active}
+        coordinator.last_update_success = False
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        with patch.object(coordinator, "_schedule_refresh") as reschedule:
+            coordinator.mark_siren_stopped("siren_1")
+
+        assert coordinator.last_update_success is False
+        reschedule.assert_not_called()
+        listener.assert_called_once()
+
+    @staticmethod
+    def _siren_with_status(**status: Any) -> dict[str, Any]:
+        siren = copy.deepcopy(SAMPLE_SIREN)
+        siren["sirenStatus"] = {"isActive": True, "duration": 10000, **status}
+        return siren
+
+    async def _poll_sirens(
+        self, coordinator: UnifiProtectCoordinator, siren: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run one siren poll that answers with ``siren`` and return its record."""
+        coordinator.protect_client.sirens.get_all = AsyncMock(
+            return_value=[Siren.model_validate(siren)]
+        )
+        await coordinator._fetch_sirens()
+        return coordinator.data["sirens"]["siren_1"]["sirenStatus"]
+
+    @pytest.mark.asyncio
+    async def test_poll_in_flight_during_a_stop_cannot_switch_the_siren_back_on(
+        self, coordinator: UnifiProtectCoordinator, freezer: Any
+    ) -> None:
+        """A reading of the run that was just stopped does not resurrect it."""
+        freezer.move_to("2026-10-06 12:00:00+00:00")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        running = self._siren_with_status(activatedAt=now_ms - 3000)
+        coordinator.data["sirens"] = {"siren_1": copy.deepcopy(running)}
+
+        coordinator.mark_siren_stopped("siren_1")
+        status = await self._poll_sirens(coordinator, running)
+
+        assert status["isActive"] is False
+        # The reading is applied but for the flag, so nothing else is lost.
+        assert status["activatedAt"] == now_ms - 3000
+
+        # The console keeps saying so until it reports the siren idle.
+        status = await self._poll_sirens(coordinator, running)
+        assert status["isActive"] is False
+        assert "siren_1" in coordinator._siren_stopped_at
+
+        idle = self._siren_with_status(isActive=False, activatedAt=now_ms - 3000)
+        status = await self._poll_sirens(coordinator, idle)
+        assert status["isActive"] is False
+        assert coordinator._siren_stopped_at == {}
+
+    @pytest.mark.asyncio
+    async def test_run_started_after_the_stop_is_believed(
+        self, coordinator: UnifiProtectCoordinator, freezer: Any
+    ) -> None:
+        """A poll showing a run that began after the stop is a new run."""
+        freezer.move_to("2026-10-06 12:00:00+00:00")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        coordinator.data["sirens"] = {
+            "siren_1": self._siren_with_status(activatedAt=now_ms - 3000)
+        }
+        coordinator.mark_siren_stopped("siren_1")
+
+        freezer.tick(2)
+        status = await self._poll_sirens(
+            coordinator, self._siren_with_status(activatedAt=now_ms + 1500)
+        )
+
+        assert status["isActive"] is True
+        assert coordinator._siren_stopped_at == {}
+
+    @pytest.mark.asyncio
+    async def test_active_siren_without_a_start_time_is_believed(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """With no start time to compare, an active reading is taken as it is."""
+        coordinator.data["sirens"] = {"siren_1": self._siren_with_status()}
+        coordinator.mark_siren_stopped("siren_1")
+
+        status = await self._poll_sirens(
+            coordinator, self._siren_with_status(activatedAt=None)
+        )
+
+        assert status["isActive"] is True
+        assert coordinator._siren_stopped_at == {}
+
+    @pytest.mark.asyncio
+    async def test_stop_guard_is_dropped_for_a_siren_that_is_gone(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A siren the console no longer lists leaves no guard behind."""
+        coordinator.data["sirens"] = {"siren_1": self._siren_with_status()}
+        coordinator.mark_siren_stopped("siren_1")
+
+        coordinator.protect_client.sirens.get_all = AsyncMock(return_value=[])
+        coordinator.data["sirens"] = {}
+        await coordinator._fetch_sirens()
+
+        assert coordinator._siren_stopped_at == {}
+
+    @pytest.mark.asyncio
+    async def test_console_clock_ahead_cannot_resurrect_the_stopped_run(
+        self, coordinator: UnifiProtectCoordinator, freezer: Any
+    ) -> None:
+        """The run is recognised by its own start time, not Home Assistant's clock.
+
+        A console 5 s ahead stamps the run with a time later than the moment
+        Home Assistant stopped it, so comparing the two clocks would believe
+        the stale reading.
+        """
+        freezer.move_to("2026-10-06 12:00:00+00:00")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        running = self._siren_with_status(activatedAt=now_ms + 5000)
+        coordinator.data["sirens"] = {"siren_1": copy.deepcopy(running)}
+        coordinator.mark_siren_stopped("siren_1")
+
+        status = await self._poll_sirens(coordinator, running)
+
+        assert status["isActive"] is False
+        assert "siren_1" in coordinator._siren_stopped_at
+
+    @pytest.mark.asyncio
+    async def test_home_assistant_clock_ahead_does_not_hide_a_new_run(
+        self, coordinator: UnifiProtectCoordinator, freezer: Any
+    ) -> None:
+        """A new run is later than the stopped one on the console's own clock.
+
+        With Home Assistant 5 s ahead of the console, a run started 2 s after
+        the stop is stamped earlier than the moment of the stop, so comparing
+        the two clocks would hide it for its whole run.
+        """
+        freezer.move_to("2026-10-06 12:00:00+00:00")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        coordinator.data["sirens"] = {
+            "siren_1": self._siren_with_status(activatedAt=now_ms - 8000)
+        }
+        coordinator.mark_siren_stopped("siren_1")
+
+        freezer.tick(2)
+        status = await self._poll_sirens(
+            coordinator, self._siren_with_status(activatedAt=now_ms - 3000)
+        )
+
+        assert status["isActive"] is True
+        assert coordinator._siren_stopped_at == {}
+
+    @pytest.mark.asyncio
+    async def test_siren_without_a_cached_start_falls_back_to_the_wall_clock(
+        self, coordinator: UnifiProtectCoordinator, freezer: Any
+    ) -> None:
+        """With no start time cached at the stop, the clocks are all there is."""
+        freezer.move_to("2026-10-06 12:00:00+00:00")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        siren = copy.deepcopy(SAMPLE_SIREN)
+        siren["sirenStatus"] = None
+        coordinator.data["sirens"] = {"siren_1": siren}
+        coordinator.mark_siren_stopped("siren_1")
+
+        stale = await self._poll_sirens(
+            coordinator, self._siren_with_status(activatedAt=now_ms - 3000)
+        )
+        assert stale["isActive"] is False
+
+        fresh = await self._poll_sirens(
+            coordinator, self._siren_with_status(activatedAt=now_ms + 1500)
+        )
+        assert fresh["isActive"] is True
+        assert coordinator._siren_stopped_at == {}
+
+    @pytest.mark.asyncio
+    async def test_stop_guard_expires_after_two_poll_intervals(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """The guard cannot linger: after its TTL a reading is taken as it is."""
+        clock = [5000.0]
+        running = self._siren_with_status(activatedAt=1_000_000)
+        coordinator.data["sirens"] = {"siren_1": copy.deepcopy(running)}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.time.monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            coordinator.mark_siren_stopped("siren_1")
+
+            clock[0] += SIREN_STOP_GUARD_TTL - 1
+            held = await self._poll_sirens(coordinator, running)
+            assert held["isActive"] is False
+
+            clock[0] += 2
+            expired = await self._poll_sirens(coordinator, running)
+
+        assert expired["isActive"] is True
+        assert coordinator._siren_stopped_at == {}
+
+    def test_late_frame_of_the_stopped_run_does_not_switch_the_siren_back_on(
+        self, coordinator: UnifiProtectCoordinator, freezer: Any
+    ) -> None:
+        """The guard covers WebSocket frames as well as polls."""
+        freezer.move_to("2026-10-06 12:00:00+00:00")
+        now_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+        coordinator.data["sirens"] = {
+            "siren_1": self._siren_with_status(activatedAt=now_ms - 3000)
+        }
+        coordinator.mark_siren_stopped("siren_1")
+
+        coordinator._handle_device_update(
+            "siren",
+            {
+                "id": "siren_1",
+                "sirenStatus": {"isActive": True, "activatedAt": now_ms - 3000},
+            },
+        )
+
+        assert coordinator.data["sirens"]["siren_1"]["sirenStatus"]["isActive"] is False
+
+    async def _read_in_flight_while_a_frame_lands(
+        self,
+        coordinator: UnifiProtectCoordinator,
+        *,
+        collection: str,
+        fetch: Any,
+        frame_model_key: str,
+        frame: dict[str, Any],
+        older_reading: Any,
+        frame_before_request: bool = False,
+    ) -> None:
+        """Start ``fetch``, land ``frame`` while its request is out, then answer.
+
+        The answer is ``older_reading``: what the console reported before the
+        frame, handed back late.
+        """
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_get_all(*_args: Any, **_kwargs: Any) -> list[Any]:
+            started.set()
+            await release.wait()
+            return [older_reading]
+
+        getattr(coordinator.protect_client, collection).get_all = slow_get_all
+        if frame_before_request:
+            coordinator._handle_device_update(frame_model_key, copy.deepcopy(frame))
+        task = asyncio.create_task(fetch())
+        await started.wait()
+        if not frame_before_request:
+            coordinator._handle_device_update(frame_model_key, copy.deepcopy(frame))
+        release.set()
+        await task
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["poll", "reconcile"])
+    async def test_older_read_does_not_overwrite_a_siren_frame_that_landed_meanwhile(
+        self, coordinator: UnifiProtectCoordinator, path: str
+    ) -> None:
+        """A WebSocket frame that lands while a read is out is newer than the read.
+
+        Applying the read would replace the siren family and switch the run
+        the frame reported back off, until the next frame or poll.
+        """
+        coordinator.data["sirens"] = {
+            "siren_1": self._siren_with_status(isActive=False)
+        }
+        fetch = (
+            coordinator._fetch_sirens
+            if path == "poll"
+            else coordinator._reconcile_sirens
+        )
+
+        await self._read_in_flight_while_a_frame_lands(
+            coordinator,
+            collection="sirens",
+            fetch=fetch,
+            frame_model_key="siren",
+            frame={
+                "id": "siren_1",
+                "sirenStatus": {"isActive": True, "activatedAt": 1_000_000},
+            },
+            older_reading=Siren.model_validate(self._siren_with_status(isActive=False)),
+        )
+
+        status = coordinator.data["sirens"]["siren_1"]["sirenStatus"]
+        assert status["isActive"] is True
+        assert status["activatedAt"] == 1_000_000
+
+    @pytest.mark.asyncio
+    async def test_read_started_after_a_siren_frame_is_applied(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Only a frame that lands after the request started makes it stale."""
+        coordinator.data["sirens"] = {"siren_1": self._siren_with_status(isActive=True)}
+
+        await self._read_in_flight_while_a_frame_lands(
+            coordinator,
+            collection="sirens",
+            fetch=coordinator._fetch_sirens,
+            frame_model_key="siren",
+            frame={"id": "siren_1", "sirenStatus": {"isActive": True}},
+            older_reading=Siren.model_validate(self._siren_with_status(isActive=False)),
+            frame_before_request=True,
+        )
+
+        assert coordinator.data["sirens"]["siren_1"]["sirenStatus"]["isActive"] is False
+
+    @pytest.mark.asyncio
+    async def test_families_without_a_counter_are_fetched_as_before(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """The check applies to the families that have a generation, no others."""
+        coordinator.data["fobs"] = {"fob_1": {"id": "fob_1"}}
+
+        await self._read_in_flight_while_a_frame_lands(
+            coordinator,
+            collection="fobs",
+            fetch=coordinator._fetch_fobs,
+            frame_model_key="fob",
+            frame={"id": "fob_1", "keypadSettings": {"beepVolume": 20}},
+            older_reading=Fob.model_validate(SAMPLE_KEYPAD_FOB),
+        )
+
+        assert coordinator.data["fobs"]["fob_1"]["keypadSettings"]["beepVolume"] == 60
+
+    @pytest.mark.asyncio
+    async def test_reconcile_refreshes_sirens_and_notifies_only_on_change(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """The independent timer re-reads sirens, and stays quiet when nothing moved."""
+        coordinator.data["sirens"] = {"siren_1": self._siren_with_status()}
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+        idle = self._siren_with_status(isActive=False)
+        coordinator.protect_client.sirens.get_all = AsyncMock(
+            return_value=[Siren.model_validate(idle)]
+        )
+
+        await coordinator._reconcile_sirens()
+
+        assert coordinator.data["sirens"]["siren_1"]["sirenStatus"]["isActive"] is False
+        listener.assert_called_once()
+
+        await coordinator._reconcile_sirens()
+
+        listener.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_timer_refresh_includes_sirens(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """The sensor reconcile tick also reconciles the sirens."""
+        with (
+            patch.object(coordinator, "async_refresh_sensors", AsyncMock()) as sensors,
+            patch.object(coordinator, "_reconcile_sirens", AsyncMock()) as sirens,
+        ):
+            await coordinator._reconcile_sensor_refresh()
+
+        sensors.assert_awaited_once()
+        sirens.assert_awaited_once()
+
+    def test_real_envelope_linkstation_frame_reaches_alarm_hubs(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """End to end through the confirmed {"type", "item"} envelope."""
+        self._seed_hub(coordinator)
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator._on_websocket_message(
+            {
+                "type": "update",
+                "item": {
+                    "id": "alarm_hub_1",
+                    "modelKey": "linkstation",
+                    "alarmHub": {"armed": "off"},
+                },
+            }
+        )
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["armed"] == "off"
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+        assert hub["type"] == "UP-AlarmHub"
+        listener.assert_called()
+
+    # -- alarmHubDeviceTamper events --------------------------------------
+
+    def test_tamper_event_sets_status_user_and_time(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """status is a {text} wrapper; userName is a plain string."""
+        hub = self._seed_hub(coordinator)
+        snapshot = copy.deepcopy(hub)
+
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        )
+
+        updated = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert updated["alarmHub"]["deviceTamperStatus"] == "tampered"
+        assert updated["alarmHub"]["armed"] == "on"
+        assert updated["_lastTamperUser"] == "Installer"
+        assert updated["_lastTamperAt"] == 1759628100000
+        assert hub == snapshot
+
+    @pytest.mark.parametrize(
+        ("user_name", "expected"),
+        [({"text": "Installer"}, "Installer"), (None, None), (42, None)],
+    )
+    def test_tamper_event_user_name_shapes(
+        self,
+        coordinator: UnifiProtectCoordinator,
+        user_name: Any,
+        expected: str | None,
+    ) -> None:
+        """A {text} wrapper is tolerated; anything else is no user."""
+        self._seed_hub(coordinator)
+        event = copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        event["metadata"]["userName"] = user_name
+
+        coordinator._handle_event_update("alarmHubDeviceTamper", event)
+
+        assert coordinator.data["alarm_hubs"]["alarm_hub_1"]["_lastTamperUser"] == (
+            expected
+        )
+
+    def test_tamper_event_without_status_keeps_reported_status(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """An unreadable status never overwrites the hub's reported one."""
+        self._seed_hub(coordinator)
+        event = copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        event["metadata"]["status"] = {"value": "tampered"}  # no "text"
+
+        coordinator._handle_event_update("alarmHubDeviceTamper", event)
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+        assert hub["_lastTamperAt"] == 1759628100000
+
+    def test_tamper_event_without_metadata_records_time_only(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A frame missing metadata changes no status and names no user."""
+        self._seed_hub(coordinator)
+        event = copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        event["metadata"] = None
+
+        coordinator._handle_event_update("alarmHubDeviceTamper", event)
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+        assert hub["_lastTamperUser"] is None
+        assert hub["_lastTamperAt"] == 1759628100000
+
+    def test_tamper_event_for_unknown_device_is_ignored(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """An event for a hub no poll has seen changes nothing."""
+        event = copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        event["device"] = "not_a_hub"
+
+        coordinator._handle_event_update("alarmHubDeviceTamper", event)
+
+        assert coordinator.data["alarm_hubs"] == {}
+        assert coordinator._alarm_hub_last_tamper == {}
+
+    @pytest.mark.asyncio
+    async def test_tamper_details_survive_the_next_poll(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """The REST poll rebuilds each hub dict; the event details persist.
+
+        Status stays authoritative from REST.
+        """
+        self._seed_hub(coordinator)
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        )
+        coordinator.protect_client.alarm_hubs.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_ALARM_HUB)]
+        )
+
+        await coordinator._fetch_alarm_hubs()
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+        assert hub["_lastTamperUser"] == "Installer"
+        assert hub["_lastTamperAt"] == 1759628100000
+
+    @pytest.mark.asyncio
+    async def test_event_status_survives_poll_without_rest_status(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """Protect 7.2.x has the tamper event but no REST deviceTamperStatus.
+
+        The event's status must outlive the next poll, or the sensor blinks
+        on for one poll and then sits at unknown.
+        """
+        rest_hub = copy.deepcopy(SAMPLE_ALARM_HUB)
+        del rest_hub["alarmHub"]["deviceTamperStatus"]
+        coordinator.data["alarm_hubs"] = {"alarm_hub_1": copy.deepcopy(rest_hub)}
+        coordinator.protect_client.alarm_hubs.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(rest_hub)]
+        )
+
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        )
+        await coordinator._fetch_alarm_hubs()
+        await coordinator._fetch_alarm_hubs()
+
+        alarm_hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]["alarmHub"]
+        assert alarm_hub["deviceTamperStatus"] == "tampered"
+        assert alarm_hub["armed"] == "off"
+
+    @pytest.mark.asyncio
+    async def test_event_during_in_flight_poll_beats_the_stale_snapshot(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A REST snapshot taken before the tamper must not read as clear.
+
+        The next poll, requested after the event, is authoritative again.
+        """
+        self._seed_hub(coordinator)
+
+        async def get_all_with_tamper_mid_flight(
+            *, expected_unsupported: bool
+        ) -> list[LinkStation]:
+            coordinator._handle_event_update(
+                "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+            )
+            return [LinkStation.model_validate(SAMPLE_ALARM_HUB)]  # "restored"
+
+        endpoint = coordinator.protect_client.alarm_hubs
+        endpoint.get_all = get_all_with_tamper_mid_flight
+        await coordinator._fetch_alarm_hubs()
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "tampered"
+
+        endpoint.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_ALARM_HUB)]
+        )
+        await coordinator._fetch_alarm_hubs()
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+
+    def test_later_frame_of_same_event_keeps_user_and_time(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """An update frame of the same event (e.g. its end) fills gaps only."""
+        self._seed_hub(coordinator)
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        )
+
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper",
+            {"id": "event_tamper_1", "device": "alarm_hub_1", "end": 1759628200000},
+        )
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["_lastTamperUser"] == "Installer"
+        assert hub["_lastTamperAt"] == 1759628100000
+        assert hub["alarmHub"]["deviceTamperStatus"] == "tampered"
+
+    def test_new_event_without_user_does_not_inherit_previous_user(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A different event naming nobody must not show the last event's user."""
+        self._seed_hub(coordinator)
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        )
+        restored = copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        restored["id"] = "event_tamper_2"
+        restored["start"] = 1759628300000
+        restored["metadata"]["status"] = {"text": "restored"}
+        del restored["metadata"]["userName"]
+
+        coordinator._handle_event_update("alarmHubDeviceTamper", restored)
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["_lastTamperUser"] is None
+        assert hub["_lastTamperAt"] == 1759628300000
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+
+    def test_tamper_event_through_events_stream_envelope(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """End to end: the event's top-level "device" names the hub."""
+        self._seed_hub(coordinator)
+
+        coordinator._on_websocket_event_message(
+            {"type": "add", "item": copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)}
+        )
+
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "tampered"
+
+    def test_stale_cleanup_forgets_tamper_details(
+        self, hass: HomeAssistant, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """An evicted hub's event details must not leak onto a reused id."""
+        coordinator._alarm_hub_last_tamper["gone"] = {"_lastTamperUser": "x"}
+        coordinator._previous_protect_device_ids["alarm_hubs"] = {"gone"}
+        coordinator.data["alarm_hubs"] = {}
+
+        with patch(
+            "custom_components.unifi_insights.coordinators.protect.dr.async_get"
+        ) as mock_registry:
+            set_mock_device_lookup(mock_registry.return_value, None)
+            for _ in range(MAX_CONSECUTIVE_MISSING_POLLS + 1):
+                coordinator._cleanup_stale_devices()
+
+        assert "gone" not in coordinator._alarm_hub_last_tamper
+
+    # -- remaining branches ------------------------------------------------
+
+    def test_unrelated_model_key_leaves_security_collections_alone(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A frame for a family this coordinator doesn't track changes nothing."""
+        self._seed_hub(coordinator)
+        before = copy.deepcopy(coordinator.data["alarm_hubs"])
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator._handle_device_update("relay", {"id": "alarm_hub_1"})
+
+        assert coordinator.data["alarm_hubs"] == before
+        assert coordinator.data["fobs"] == {}
+        assert coordinator.data["link_stations"] == {}
+        listener.assert_called()
+
+    def test_later_frame_of_same_event_with_status_replaces_it(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A same-event frame that carries its own values wins over the first."""
+        self._seed_hub(coordinator)
+        coordinator._handle_event_update(
+            "alarmHubDeviceTamper", copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        )
+        first_received = coordinator._alarm_hub_last_tamper["alarm_hub_1"]["received"]
+        update = copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+        update["metadata"]["status"] = {"text": "restored"}
+        update["metadata"]["userName"] = "Owner"
+
+        coordinator._handle_event_update("alarmHubDeviceTamper", update)
+
+        record = coordinator._alarm_hub_last_tamper["alarm_hub_1"]
+        assert record["status"] == "restored"
+        assert record["_lastTamperUser"] == "Owner"
+        assert record["received"] >= first_received
+        hub = coordinator.data["alarm_hubs"]["alarm_hub_1"]
+        assert hub["alarmHub"]["deviceTamperStatus"] == "restored"
+
+    @pytest.mark.asyncio
+    async def test_poll_skips_tamper_record_of_hub_no_longer_listed(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """A record whose hub is not in the collection is not re-added."""
+        self._seed_hub(coordinator)
+        coordinator._alarm_hub_last_tamper["gone"] = {
+            "event_id": "e0",
+            "status": "tampered",
+            "received": 0.0,
+            "_lastTamperUser": None,
+            "_lastTamperAt": None,
+        }
+        coordinator.protect_client.alarm_hubs.get_all = AsyncMock(
+            return_value=[LinkStation.model_validate(SAMPLE_ALARM_HUB)]
+        )
+
+        await coordinator._fetch_alarm_hubs()
+
+        assert set(coordinator.data["alarm_hubs"]) == {"alarm_hub_1"}
+
+    @pytest.mark.asyncio
+    async def test_fetch_without_protect_client_is_a_no_op(
+        self, hass: HomeAssistant, mock_config_entry: MockConfigEntry
+    ) -> None:
+        """A coordinator without a Protect client fetches nothing."""
+        coord = UnifiProtectCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=None,
+            entry=mock_config_entry,
+        )
+        try:
+            await coord._fetch_fobs()
+            await coord._fetch_link_stations()
+            await coord._fetch_alarm_hubs()
+            await coord._fetch_sirens()
+            assert coord.data["fobs"] == {}
+            assert coord.data["link_stations"] == {}
+            assert coord.data["alarm_hubs"] == {}
+            assert coord.data["sirens"] == {}
+        finally:
+            await coord.async_shutdown()
+
+    @pytest.mark.asyncio
+    async def test_device_without_id_is_skipped(
+        self, coordinator: UnifiProtectCoordinator
+    ) -> None:
+        """An item the API returns without an id can't be keyed, so it's left out."""
+        coordinator.protect_client.fobs.get_all = AsyncMock(
+            return_value=[{"name": "no id"}, Fob.model_validate(SAMPLE_KEYPAD_FOB)]
+        )
+
+        await coordinator._fetch_fobs()
+
+        assert set(coordinator.data["fobs"]) == {"fob_1"}
+
+
+class TestConfigCoordinatorVouchers:
+    """Tests for voucher polling in UnifiConfigCoordinator."""
+
+    @pytest.fixture
+    async def coordinator(
+        self, hass: HomeAssistant, mock_config_entry: MockConfigEntry
+    ) -> AsyncGenerator[UnifiConfigCoordinator]:
+        """Create a config coordinator for testing."""
+        network_client = _create_mock_network_client()
+        protect_client = _create_mock_protect_client()
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=network_client,
+            protect_client=protect_client,
+            entry=mock_config_entry,
+        )
+        try:
+            yield coordinator
+        finally:
+            await coordinator.async_shutdown()
+
+    @pytest.mark.asyncio
+    async def test_vouchers_polled_for_each_selected_site(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Vouchers are polled for each selected site and stored keyed by voucher ID."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_API_KEY: "test_api_key"},
+            options={CONF_SITE_IDS: ["default", "site2"]},
+        )
+        network_client = _create_mock_network_client()
+        network_client.vouchers.get_all_pages = AsyncMock(
+            side_effect=lambda site_id: [
+                _create_mock_model(
+                    {
+                        "id": f"{site_id}_v1",
+                        "code": "1234567890",
+                        "timeLimitMinutes": 480,
+                    }
+                )
+            ]
+        )
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=network_client,
+            protect_client=None,
+            entry=entry,
+        )
+        result = await coordinator._async_update_data()
+        assert coordinator.network_client.vouchers.get_all_pages.await_count == 2
+        polled_sites = [
+            c.args[0]
+            for c in coordinator.network_client.vouchers.get_all_pages.await_args_list
+        ]
+        assert polled_sites == ["default", "site2"]
+        assert "vouchers" in result
+        assert result["vouchers"]["default"]["default_v1"]["code"] == "1234567890"
+        assert result["vouchers"]["default"]["default_v1"]["timeLimitMinutes"] == 480
+        assert result["vouchers"]["site2"]["site2_v1"]["code"] == "1234567890"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiNotFoundError("Not found", status_code=404),
+            UniFiResponseError("Bad request", status_code=400),
+            UniFiAuthenticationError("Forbidden", status_code=403),
+            UniFiResponseError("HTML instead of JSON", status_code=200),
+        ],
+        ids=["404", "400", "403", "200-non-json"],
+    )
+    async def test_vouchers_unsupported_endpoint_gives_empty_inventory(
+        self, coordinator: UnifiConfigCoordinator, error: Exception
+    ) -> None:
+        """A 4xx / non-JSON error gives empty inventory and stays available."""
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(side_effect=error)
+        result = await coordinator._async_update_data()
+        assert result["vouchers"]["default"] == {}
+        assert coordinator.vouchers_available("default") is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            UniFiResponseError("Server error", status_code=500),
+            UniFiRateLimitError("Slow down", status_code=429),
+            UniFiConnectionError("Connection refused"),
+            UniFiTimeoutError("Timed out"),
+            ValueError("Unparseable payload"),
+        ],
+        ids=["500", "429", "connection", "timeout", "unexpected"],
+    )
+    async def test_vouchers_transient_failure_keeps_inventory_and_flags_section(
+        self, coordinator: UnifiConfigCoordinator, error: Exception
+    ) -> None:
+        """Transient error keeps inventory and marks section unavailable."""
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            return_value=[_create_mock_model({"id": "v1", "code": "1111111111"})]
+        )
+        await coordinator.async_refresh()
+        assert coordinator.vouchers_available("default") is True
+        assert coordinator.wifi_available("default") is True
+        assert coordinator.firewall_available("default") is True
+        assert "v1" in coordinator.data["vouchers"]["default"]
+
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(side_effect=error)
+        await coordinator.async_refresh()
+
+        assert coordinator.last_update_success is True
+        assert "v1" in coordinator.data["vouchers"]["default"]
+        assert coordinator.vouchers_available("default") is False
+        assert coordinator.wifi_available("default") is True
+        assert coordinator.firewall_available("default") is True
+
+    @pytest.mark.asyncio
+    async def test_vouchers_recover_after_failure(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Section flags as recovered and available after transient failure resolves."""
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            side_effect=UniFiConnectionError("Connection lost")
+        )
+        await coordinator.async_refresh()
+        assert coordinator.vouchers_available("default") is False
+
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            return_value=[_create_mock_model({"id": "v1", "code": "1111111111"})]
+        )
+        await coordinator.async_refresh()
+        assert coordinator.vouchers_available("default") is True
+        assert "v1" in coordinator.data["vouchers"]["default"]
+
+    @pytest.mark.asyncio
+    async def test_vouchers_authentication_failure_raises_auth_failed(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """A 401 error from vouchers endpoint raises ConfigEntryAuthFailed."""
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            side_effect=UniFiAuthenticationError("Revoked", status_code=401)
+        )
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+        assert coordinator._available is False
+
+    @pytest.mark.asyncio
+    async def test_vouchers_pruned_when_site_deselected(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Vouchers for deselected sites are pruned from coordinator data."""
+        coordinator.data["vouchers"]["stale_site"] = {"v1": {"id": "v1"}}
+        result = await coordinator._async_update_data()
+        assert "stale_site" not in result["vouchers"]
+        assert "default" in result["vouchers"]
+
+    @pytest.mark.asyncio
+    async def test_vouchers_cleared_when_no_site_selected(
+        self, hass: HomeAssistant
+    ) -> None:
+        """Vouchers dict is cleared when no sites exist / match selection."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_API_KEY: "test_api_key"},
+            options={CONF_SITE_IDS: ["nonexistent"]},
+        )
+        coordinator = UnifiConfigCoordinator(
+            hass=hass,
+            network_client=_create_mock_network_client(),
+            protect_client=None,
+            entry=entry,
+        )
+        result = await coordinator._async_update_data()
+        assert result["vouchers"] == {}
+
+    @pytest.mark.asyncio
+    async def test_async_refresh_vouchers_updates_only_that_site(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """async_refresh_vouchers refreshes only target site and notifies listeners."""
+        await coordinator.async_refresh()
+        listener = MagicMock()
+        coordinator.async_add_listener(listener)
+
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            return_value=[_create_mock_model({"id": "v-new", "code": "2222222222"})]
+        )
+        await coordinator.async_refresh_vouchers("default")
+
+        assert coordinator.network_client.vouchers.get_all_pages.await_count == 1
+        assert coordinator.network_client.vouchers.get_all_pages.await_args[0] == (
+            "default",
+        )
+        assert "v-new" in coordinator.data["vouchers"]["default"]
+        listener.assert_called_once()
+
+        # Target error sets failed section without throwing
+        listener.reset_mock()
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            side_effect=UniFiConnectionError("Refused")
+        )
+        await coordinator.async_refresh_vouchers("default")
+        assert coordinator.vouchers_available("default") is False
+        assert "v-new" in coordinator.data["vouchers"]["default"]
+        listener.assert_called_once()
+
+        # Target success clears failed section
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(return_value=[])
+        await coordinator.async_refresh_vouchers("default")
+        assert coordinator.vouchers_available("default") is True
+
+        # Unselected site returns without call
+        coordinator.network_client.vouchers.get_all_pages.reset_mock()
+        await coordinator.async_refresh_vouchers("unknown_site")
+        coordinator.network_client.vouchers.get_all_pages.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_vouchers_available_follows_last_update_success(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """vouchers_available returns False when last_update_success is False."""
+        await coordinator.async_refresh()
+        assert coordinator.vouchers_available("default") is True
+        coordinator.last_update_success = False
+        assert coordinator.vouchers_available("default") is False
+
+    @pytest.mark.asyncio
+    async def test_vouchers_incomplete_listing_keeps_inventory_and_flags_section(
+        self, coordinator: UnifiConfigCoordinator
+    ) -> None:
+        """Incomplete voucher listing keeps inventory and marks unavailable."""
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            return_value=[_create_mock_model({"id": "v1", "code": "1111111111"})]
+        )
+        await coordinator.async_refresh()
+        assert coordinator.vouchers_available("default") is True
+        assert "v1" in coordinator.data["vouchers"]["default"]
+
+        coordinator.network_client.vouchers.get_all_pages = AsyncMock(
+            side_effect=RuntimeError(
+                "Incomplete voucher listing for site default: reached page limit 50"
+            )
+        )
+        await coordinator.async_refresh()
+        assert coordinator.vouchers_available("default") is False
+        assert "v1" in coordinator.data["vouchers"]["default"]
+
+    async def test_vouchers_validation_error_does_not_leak_code_in_logs(
+        self,
+        coordinator: UnifiConfigCoordinator,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Pydantic validation error during polling does not log the voucher code."""
+        synthetic_code = "1234567890"
+
+        class _TestClient:
+            def build_api_path(self, path: str) -> str:
+                return path
+
+            async def _get(
+                self,
+                path: str,
+                params: Any = None,
+                *,
+                expected_unsupported: bool = False,
+                log_body: bool = True,
+            ) -> Any:
+                assert path.endswith("/hotspot/vouchers")
+                assert params == {"offset": 0, "limit": 1000}
+                assert expected_unsupported is True
+                assert log_body is False
+                return {"data": [{"code": synthetic_code}], "totalCount": 1}
+
+        coordinator.network_client.vouchers = VouchersEndpoint(_TestClient())  # type: ignore[assignment]
+        with caplog.at_level("DEBUG"):
+            await coordinator.async_refresh()
+
+        assert coordinator.vouchers_available("default") is False
+        assert synthetic_code not in caplog.text
+        assert "Invalid voucher data (fields: id)" in caplog.text

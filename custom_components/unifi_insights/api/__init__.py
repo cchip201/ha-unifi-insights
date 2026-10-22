@@ -39,19 +39,22 @@ Example (Remote/Cloud Connection):
 
 from __future__ import annotations
 
+from .access import UniFiAccessClient
 from .auth import ApiKeyAuth, ApiKeyType, LocalAuth
+from .carrier_fabric import UniFiCarrierFabricClient
 from .const import ConnectionType, __version__
 from .exceptions import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiError,
+    UniFiGlobalAlarmManagerError,
     UniFiNotFoundError,
     UniFiRateLimitError,
     UniFiResponseError,
+    UniFiRuleNotEditableError,
     UniFiTimeoutError,
     UniFiValidationError,
 )
-
 from .innerspace import UniFiInnerSpaceClient
 
 __all__ = [
@@ -64,14 +67,18 @@ __all__ = [
     # Connection types
     "ConnectionType",
     # Clients
+    "UniFiAccessClient",
+    "UniFiCarrierFabricClient",
     "UniFiInnerSpaceClient",
     # Exceptions
     "UniFiAuthenticationError",
     "UniFiConnectionError",
     "UniFiError",
+    "UniFiGlobalAlarmManagerError",
     "UniFiNotFoundError",
     "UniFiRateLimitError",
     "UniFiResponseError",
+    "UniFiRuleNotEditableError",
     "UniFiTimeoutError",
     "UniFiValidationError",
 ]

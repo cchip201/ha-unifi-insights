@@ -15,7 +15,14 @@ agent: "agent"
 #   Timeouts: commands should complete within 120 seconds
 #   Environment: commands run inside the dev container (sandboxed);
 #     verify by checking that $PWD is under /workspaces/
-tools: ["search/codebase", "edit", "search", "execute/runInTerminal", "execute/getTerminalOutput"]
+tools:
+  [
+    "search/codebase",
+    "edit",
+    "search",
+    "execute/runInTerminal",
+    "execute/getTerminalOutput",
+  ]
 description: "Perform a comprehensive quality review of the UniFi Insights integration"
 ---
 
@@ -81,7 +88,7 @@ Treat the official Quality Scale rules as mandatory review criteria:
 
 ### Testing
 
-- [ ] 90%+ coverage maintained
+- [ ] 95%+ coverage maintained
 - [ ] Config flow tested (success + error paths)
 - [ ] Coordinator tested (success + failure paths)
 - [ ] Entity state and availability tested

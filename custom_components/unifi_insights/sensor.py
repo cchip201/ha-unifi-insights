@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Support for UniFi Insights sensors."""
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import site_internet_activity_sensor
+from .console_identity import resolve_console_namespace
 from .const import (
     ATTR_NVR_ID,
     ATTR_NVR_NAME,
@@ -57,26 +60,22 @@ from .entity import (
     first_not_none,
     get_field,
     is_gateway_device,
-    site_unique_id_prefix,
 )
 from .entity import (
     get_client_type as _get_client_type,
 )
+from .helpers import async_migrate_site_entity
 from .innerspace_entity import (
     _discover_innerspace_sensors,
 )
-from .site_internet_activity_sensor import (
-    SITE_INTERNET_ACTIVITY_SENSOR_TYPES as SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
-)
-from .site_internet_activity_sensor import (
-    UnifiSiteInternetActivitySensor as UnifiSiteInternetActivitySensor,
-)
-from .site_internet_activity_sensor import (
-    UnifiSiteInternetActivitySensorEntityDescription as UnifiSiteInternetActivitySensorEntityDescription,
-)
+from .mobility_entity import async_setup_mobility_sensors
+from .protect_security_entity import discover_protect_security_sensors
 from .site_internet_activity_sensor import (
     _discover_site_internet_activity_sensors,
 )
+from .storage_entity import discover_storage_sensors, is_storage_unique_id
+from .storage_telemetry import normalize_nvr_storage
+from .voucher_sensor import discover_voucher_sensors
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -86,8 +85,23 @@ if TYPE_CHECKING:
     from homeassistant.helpers.typing import StateType
 
     from . import UnifiInsightsConfigEntry
+    from .carrier_fabric_data import CarrierFabricConfigEntry
 
 from homeassistant.helpers.entity import DeviceInfo
+
+from .carrier_fabric_data import CarrierFabricData
+from .carrier_fabric_sensor import async_setup_carrier_fabric_sensors
+
+# Preserve these public sensor-module exports without redundant import aliases.
+SITE_INTERNET_ACTIVITY_SENSOR_TYPES = (
+    site_internet_activity_sensor.SITE_INTERNET_ACTIVITY_SENSOR_TYPES
+)
+UnifiSiteInternetActivitySensor = (
+    site_internet_activity_sensor.UnifiSiteInternetActivitySensor
+)
+UnifiSiteInternetActivitySensorEntityDescription = (
+    site_internet_activity_sensor.UnifiSiteInternetActivitySensorEntityDescription
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -294,95 +308,37 @@ def _bytes_to_gb(bytes_value: int | None) -> float | None:
 
 
 def _has_storage_info(nvr_data: dict[str, Any]) -> bool:
-    """
-    Check if NVR data contains storage information.
-
-    The UniFi Protect Integration API v1 (public API with API keys) does not
-    return storage information. This function checks if storage data is available.
-    """
-    # Check for direct storage fields
-    if nvr_data.get("storageUsedBytes") or nvr_data.get("storageTotalBytes"):
-        return True
-    if nvr_data.get("storage_used_bytes") or nvr_data.get("storage_total_bytes"):
-        return True
-
-    # Check nested storageInfo
-    storage_info = nvr_data.get("storageInfo")
-    if isinstance(storage_info, dict):
-        # Check library model field names (usedSize, totalSize)
-        if storage_info.get("usedSize") or storage_info.get("totalSize"):
-            return True
-        # Check alternative field names
-        if storage_info.get("used_size") or storage_info.get("total_size"):
-            return True
-
-    return False
+    """Return True when at least one valid capacity signal exists."""
+    storage = normalize_nvr_storage(nvr_data)
+    return any(
+        value is not None
+        for value in (
+            storage.used_bytes,
+            storage.total_bytes,
+            storage.available_bytes,
+            storage.used_percent,
+        )
+    )
 
 
 def _get_storage_bytes(nvr_data: dict[str, Any], field: str) -> int | None:
-    """
-    Get storage bytes from NVR data, checking both direct and nested fields.
-
-    The API may return storage data in different formats:
-    - Direct: storageUsedBytes, storageTotalBytes
-    - Snake case: storage_used_bytes, storage_total_bytes
-    - Nested (library model): storageInfo.usedSize, storageInfo.totalSize
-    - Nested (snake_case): storageInfo.used_size, storageInfo.total_size
-    """
-    # Check direct camelCase fields. A zero-byte reading is legitimate (an
-    # empty NVR), so candidates are combined with first_not_none, not `or`.
-    if field == "used":
-        value = first_not_none(
-            nvr_data.get("storageUsedBytes"), nvr_data.get("storage_used_bytes")
-        )
-        if value is not None:
-            return int(value) if isinstance(value, (int, float)) else None
-        # Check nested storageInfo (library model uses usedSize/totalSize)
-        storage_info = nvr_data.get("storageInfo")
-        if isinstance(storage_info, dict):
-            nested_value = first_not_none(
-                storage_info.get("usedSize"),
-                storage_info.get("used_size"),
-                storage_info.get("usedSpaceBytes"),
-                storage_info.get("used_space_bytes"),
-            )
-            return int(nested_value) if isinstance(nested_value, (int, float)) else None
-    elif field == "total":
-        value = first_not_none(
-            nvr_data.get("storageTotalBytes"), nvr_data.get("storage_total_bytes")
-        )
-        if value is not None:
-            return int(value) if isinstance(value, (int, float)) else None
-        # Check nested storageInfo (library model uses usedSize/totalSize)
-        storage_info = nvr_data.get("storageInfo")
-        if isinstance(storage_info, dict):
-            nested_value = first_not_none(
-                storage_info.get("totalSize"),
-                storage_info.get("total_size"),
-                storage_info.get("totalSpaceBytes"),
-                storage_info.get("total_space_bytes"),
-            )
-            return int(nested_value) if isinstance(nested_value, (int, float)) else None
-    return None
+    """Read a validated byte signal from the shared normalizer."""
+    storage = normalize_nvr_storage(nvr_data)
+    return {
+        "used": storage.used_bytes,
+        "total": storage.total_bytes,
+        "available": storage.available_bytes,
+    }.get(field)
 
 
 def _calculate_storage_percent(nvr_data: dict[str, Any]) -> float | None:
-    """Calculate storage used percentage."""
-    used = _get_storage_bytes(nvr_data, "used")
-    total = _get_storage_bytes(nvr_data, "total")
-    if used is None or total is None or total == 0:
-        return None
-    result: float = round((used / total) * 100, 1)
-    return result
+    """Read the normalized percentage, including percentage-only telemetry."""
+    return normalize_nvr_storage(nvr_data).used_percent
 
 
 def _calculate_storage_available(nvr_data: dict[str, Any]) -> float | None:
-    """Calculate available storage in GB."""
-    used = _get_storage_bytes(nvr_data, "used")
-    total = _get_storage_bytes(nvr_data, "total")
-    if used is None or total is None:
-        return None
-    return _bytes_to_gb(total - used)
+    """Read available storage using the existing GB/base-2 conversion."""
+    return _bytes_to_gb(normalize_nvr_storage(nvr_data).available_bytes)
 
 
 # Sensor descriptions for UniFi Protect NVR
@@ -662,7 +618,7 @@ def _outlet_has_metering(outlet: dict[str, Any]) -> bool:
         try:
             if int(caps) & 2:
                 return True
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # fmt: skip
             pass
     for key in (
         "outlet_power",
@@ -929,9 +885,6 @@ def _migrate_sensor_units(
         if desc.suggested_unit_of_measurement is not None:
             expected_units[desc.key] = str(desc.suggested_unit_of_measurement)
 
-    if not expected_units:
-        return
-
     for entity_entry in er.async_entries_for_config_entry(
         registry, config_entry.entry_id
     ):
@@ -977,6 +930,7 @@ def _discover_device_sensors(
     device_id: str,
     device_data: dict[str, Any],
     known_sensor_keys: set[tuple[Any, ...]],
+    *,
     entities: list[SensorEntity],
 ) -> None:
     """Discover standard network device sensors."""
@@ -1085,6 +1039,7 @@ def _discover_port_sensors(
     device_id: str,
     device_data: dict[str, Any],
     known_sensor_keys: set[tuple[Any, ...]],
+    *,
     entities: list[SensorEntity],
 ) -> None:
     """Discover port sensors for a network device."""
@@ -1132,14 +1087,14 @@ def _discover_port_sensors(
                         if pw is not None and float(pw) > 0:
                             poe_marker = True
                             break
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError):  # fmt: skip
                         pass
 
         if not poe_marker:
             norm = get_field(port, "poe_power_w")
             try:
                 poe_marker = norm is not None and float(norm) > 0
-            except (ValueError, TypeError):
+            except (ValueError, TypeError):  # fmt: skip
                 poe_marker = False
 
         if poe_marker:
@@ -1207,8 +1162,8 @@ def _discover_port_sensors(
                 site_id,
                 device_id,
                 active_port_indices,
-                known_sensor_keys,
-                entities,
+                known_sensor_keys=known_sensor_keys,
+                entities=entities,
             )
 
 
@@ -1218,6 +1173,7 @@ def _create_port_stats_fallback(
     site_id: str,
     device_id: str,
     active_ports: set[int],
+    *,
     known_sensor_keys: set[tuple[Any, ...]],
     entities: list[SensorEntity],
 ) -> None:
@@ -1233,7 +1189,7 @@ def _create_port_stats_fallback(
             try:
                 if val is not None and float(val) <= 0:
                     continue
-            except (ValueError, TypeError):
+            except (ValueError, TypeError):  # fmt: skip
                 continue
             desc = PORT_SENSOR_TYPES[0]
             key = (site_id, device_id, port_idx, desc.key)
@@ -1278,6 +1234,7 @@ def _discover_outlet_sensors(
     device_id: str,
     device_data: dict[str, Any],
     known_sensor_keys: set[tuple[Any, ...]],
+    *,
     entities: list[SensorEntity],
 ) -> None:
     """Discover outlet sensors for PDUs and smart power strips."""
@@ -1295,7 +1252,7 @@ def _discover_outlet_sensors(
             continue
         try:
             outlet_idx = int(idx)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # fmt: skip
             continue
 
         if not _outlet_has_metering(outlet):
@@ -1357,9 +1314,8 @@ def _discover_protect_sensors(
         for nvr_id, nvr_data in nvrs.items():
             if not isinstance(nvr_data, dict):
                 continue
-            has_storage = _has_storage_info(nvr_data)
             for nvr_desc in NVR_SENSOR_TYPES:
-                if nvr_desc.key.startswith("storage_") and not has_storage:
+                if nvr_desc.value_fn is None or nvr_desc.value_fn(nvr_data) is None:
                     continue
                 nvr_key = (nvr_id, nvr_desc.key)
                 if nvr_key not in known_sensor_keys:
@@ -1373,13 +1329,59 @@ def _discover_protect_sensors(
                     )
 
 
+def _is_owned_port_sensor(
+    entity: er.RegistryEntry,
+    config_entry_id: str,
+    known_device_ids: set[str],
+) -> bool:
+    """
+    Recognize physical port rows using the constructor's identity and ownership.
+
+    Matching description metadata also identifies ports of removed devices.
+    Without that metadata, require a device from the current API inventory;
+    incompatible or otherwise ambiguous rows are retained. Namespace, site,
+    and storage-path text containing ``_port_`` never establishes port identity.
+    """
+    if (
+        entity.domain != "sensor"
+        or entity.platform != DOMAIN
+        or entity.config_entry_id != config_entry_id
+        or is_storage_unique_id(entity.unique_id)
+    ):
+        return False
+    prefix, separator, port_idx = entity.unique_id.rpartition("_")
+    try:
+        if not separator or str(int(port_idx)) != port_idx:
+            return False
+    except ValueError:
+        return False
+    for description in (
+        *PORT_SENSOR_TYPES,
+        *PORT_RATE_SENSOR_TYPES,
+        *SFP_SENSOR_TYPES,
+    ):
+        ending = f"_{description.key}"
+        if not prefix.endswith(ending):
+            continue
+        device_id = prefix[: -len(ending)]
+        if not device_id:
+            return False
+        return entity.translation_key == description.translation_key or (
+            entity.translation_key in (None, "") and device_id in known_device_ids
+        )
+    return False
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: UnifiInsightsConfigEntry,
+    config_entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up sensors for UniFi Insights integration."""
-    _ = hass
+    if isinstance(config_entry.runtime_data, CarrierFabricData):
+        await async_setup_carrier_fabric_sensors(hass, config_entry, async_add_entities)
+        return
+
     _LOGGER.debug("Setting up UniFi Insights sensors")
 
     # Migrate existing entities to pick up new suggested_unit_of_measurement
@@ -1416,7 +1418,7 @@ async def async_setup_entry(
                         device_id,
                         device_data,
                         known_sensor_keys,
-                        entities,
+                        entities=entities,
                     )
                     _discover_port_sensors(
                         coordinator,
@@ -1424,7 +1426,7 @@ async def async_setup_entry(
                         device_id,
                         device_data,
                         known_sensor_keys,
-                        entities,
+                        entities=entities,
                     )
                     _discover_outlet_sensors(
                         coordinator,
@@ -1432,28 +1434,65 @@ async def async_setup_entry(
                         device_id,
                         device_data,
                         known_sensor_keys,
-                        entities,
+                        entities=entities,
+                    )
+                    entities.extend(
+                        discover_storage_sensors(
+                            coordinator,
+                            site_id,
+                            device_id,
+                            device_data,
+                            known_sensor_keys,
+                        )
                     )
 
         # Add site-level client count sensors
+        namespace = resolve_console_namespace(config_entry)
         clients_by_site = coordinator.data.get("clients", {})
         if isinstance(clients_by_site, dict):
             for site_id in clients_by_site:
                 for site_desc in SITE_CLIENT_SENSOR_TYPES:
                     site_key = (site_id, site_desc.key)
                     if site_key not in known_sensor_keys:
-                        known_sensor_keys.add(site_key)
-                        entities.append(
-                            UnifiSiteClientSensor(
-                                coordinator=coordinator,
-                                description=site_desc,
-                                site_id=site_id,
-                            )
+                        unique_id = async_migrate_site_entity(
+                            hass,
+                            config_entry,
+                            "sensor",
+                            namespace,
+                            site_id,
+                            suffix=site_desc.key,
                         )
+                        if unique_id is None:
+                            continue
+                        entity = UnifiSiteClientSensor(
+                            coordinator=coordinator,
+                            description=site_desc,
+                            site_id=site_id,
+                            unique_id=unique_id,
+                        )
+                        known_sensor_keys.add(site_key)
+                        entities.append(entity)
 
         # Add site-level internet activity rolling-window sensors
         entities.extend(
-            _discover_site_internet_activity_sensors(coordinator, known_sensor_keys)
+            _discover_site_internet_activity_sensors(
+                coordinator,
+                known_sensor_keys,
+                hass=hass,
+                entry=config_entry,
+                namespace=namespace,
+            )
+        )
+
+        # Add hotspot voucher management sensors
+        entities.extend(
+            discover_voucher_sensors(
+                coordinator,
+                known_sensor_keys,
+                hass=hass,
+                entry=config_entry,
+                namespace=namespace,
+            )
         )
 
         # Add per-WiFi-network connected client count sensors
@@ -1482,6 +1521,11 @@ async def async_setup_entry(
         # Add UniFi InnerSpace placement sensors
         _discover_innerspace_sensors(coordinator, known_sensor_keys, entities)
 
+        # Add Protect alarm hub, link station and fob sensors
+        entities.extend(
+            discover_protect_security_sensors(coordinator, known_sensor_keys)
+        )
+
         if entities:
             _LOGGER.info("Adding %d UniFi Insights sensors", len(entities))
             async_add_entities(entities)
@@ -1492,15 +1536,37 @@ async def async_setup_entry(
     setup_complete = True
     config_entry.async_on_unload(coordinator.async_add_listener(async_discover_sensors))
 
+    if mobility_coordinator := config_entry.runtime_data.mobility_coordinator:
+        async_setup_mobility_sensors(
+            hass, config_entry, mobility_coordinator, async_add_entities
+        )
+
     # Clean up stale port entities from previous runs
     created_uids = {getattr(e, "unique_id", None) for e in initial_entities}
+    devices_by_site = (
+        coordinator.data.get("devices", {})
+        if isinstance(coordinator.data, dict)
+        else {}
+    )
+    known_device_ids = (
+        {
+            device_id
+            for devices in devices_by_site.values()
+            if isinstance(devices, dict)
+            for device_id, device_data in devices.items()
+            if isinstance(device_id, str)
+            and device_id
+            and isinstance(device_data, dict)
+        }
+        if isinstance(devices_by_site, dict)
+        else set()
+    )
     ent_reg = er.async_get(hass)
     stale = [
         entry
         for entry in er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
-        if entry.domain == "sensor"
-        and "_port_" in entry.unique_id
-        and entry.unique_id not in created_uids
+        if entry.unique_id not in created_uids
+        and _is_owned_port_sensor(entry, config_entry.entry_id, known_device_ids)
     ]
     for entry in stale:
         _LOGGER.debug("Removing stale port sensor entity: %s", entry.unique_id)
@@ -1596,6 +1662,7 @@ class UnifiPortSensor(UnifiInsightsEntity, SensorEntity):
         site_id: str,
         device_id: str,
         port_idx: int,
+        *,
         port_label: str | None = None,
     ) -> None:
         """Initialize the port sensor."""
@@ -2028,7 +2095,7 @@ class UnifiOutletSensor(UnifiInsightsEntity, SensorEntity):
                 try:
                     if int(idx) == self._outlet_index:
                         return outlet
-                except (TypeError, ValueError):
+                except (TypeError, ValueError):  # fmt: skip
                     continue
         return None
 
@@ -2207,24 +2274,14 @@ class UnifiProtectNVRSensor(UnifiProtectEntity, SensorEntity):
         if not nvr_data or not isinstance(nvr_data, dict):
             return False
 
-        # For storage sensors, check if storage data is available
-        if self.entity_description.key in [
-            "storage_used",
-            "storage_total",
-            "storage_available",
-            "storage_used_percent",
-        ]:
-            # Check both direct fields and nested storageInfo
-            storage_info = nvr_data.get("storageInfo")
-            has_direct = (
-                nvr_data.get("storageUsedBytes") is not None
-                or nvr_data.get("storageTotalBytes") is not None
-            )
-            has_nested = storage_info is not None and isinstance(storage_info, dict)
-            return has_direct or has_nested
-
-        # For other NVR sensors, just check if we have data
-        return True
+        if not self.entity_description.key.startswith("storage_"):
+            return True
+        value_fn = self.entity_description.value_fn
+        return (
+            nvr_data.get("state") not in ("DISCONNECTED", "DISCONNECTING")
+            and value_fn is not None
+            and value_fn(nvr_data) is not None
+        )
 
     @property
     def native_value(self) -> StateType:
@@ -2249,13 +2306,9 @@ class UnifiProtectNVRSensor(UnifiProtectEntity, SensorEntity):
         """Update entity from data."""
         nvr_data = self.coordinator.data["protect"]["nvrs"].get(self._device_id, {})
 
-        # Get storage values
-        storage_used = nvr_data.get("storageUsedBytes") or nvr_data.get(
-            "storage_used_bytes"
-        )
-        storage_total = nvr_data.get("storageTotalBytes") or nvr_data.get(
-            "storage_total_bytes"
-        )
+        storage = normalize_nvr_storage(nvr_data)
+        storage_used = storage.used_bytes
+        storage_total = storage.total_bytes
 
         # Set attributes
         self._attr_extra_state_attributes = {
@@ -2280,14 +2333,15 @@ class UnifiSiteClientSensor(CoordinatorEntity[UnifiFacadeCoordinator], SensorEnt
         coordinator: UnifiFacadeCoordinator,
         description: UnifiInsightsSensorEntityDescription,
         site_id: str,
+        *,
+        unique_id: str,
     ) -> None:
         """Initialize the site-level client sensor."""
         super().__init__(coordinator)
         self.entity_description = description
         self._site_id = site_id
 
-        prefix = site_unique_id_prefix(coordinator.data, site_id)
-        self._attr_unique_id = f"{prefix}_{description.key}"
+        self._attr_unique_id = unique_id
         self._attr_device_info = DeviceInfo(**self._build_device_info())  # type: ignore[typeddict-item]
 
     def _build_device_info(self) -> dict[str, Any]:

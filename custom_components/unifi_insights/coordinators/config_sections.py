@@ -1,22 +1,50 @@
+# Copyright 2026 UniFi Insights contributors
 """Site configuration and legacy section helpers for UnifiConfigCoordinator."""
 
 from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from custom_components.unifi_insights.api import UniFiAuthenticationError
+from custom_components.unifi_insights.api.network.models import is_predefined_nat_rule
 from custom_components.unifi_insights.topology_contract import normalize_mac
 
-from .internet_activity import resolve_report_site_name as resolve_report_site_name
+from .internet_activity import resolve_report_site_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from custom_components.unifi_insights.api.network import UniFiNetworkClient
 
 _LOGGER = logging.getLogger(__name__)
+
+SECTION_OUTCOME_OK: Final = "ok"
+SECTION_OUTCOME_UNSUPPORTED: Final = "unsupported"
+SECTION_OUTCOME_FAILED: Final = "failed"
+
+__all__ = [
+    "SECTION_OUTCOME_FAILED",
+    "SECTION_OUTCOME_OK",
+    "SECTION_OUTCOME_UNSUPPORTED",
+    "async_fetch_site_firewall",
+    "async_fetch_site_routes",
+    "async_fetch_site_rule_section",
+    "async_fetch_site_vouchers",
+    "async_fetch_site_vpn_clients",
+    "async_fetch_site_vpns",
+    "async_fetch_site_wifi_and_links",
+    "client_links",
+    "enrich_wifi",
+    "is_predefined_firewall_rule",
+    "is_predefined_nat_rule",
+    "map_legacy_site_names",
+    "resolve_report_site_name",
+    "rule_display_name",
+    "verified_legacy_site_name",
+    "wifi_qr_payload",
+]
 
 
 def map_legacy_site_names(
@@ -239,12 +267,15 @@ async def async_fetch_site_firewall(
     coordinator: Any,
     site_id: str,
     failed_sections: set[tuple[str, str]],
+    *,
+    outcomes: dict[tuple[str, str], str] | None = None,
 ) -> dict[str, Any]:
     """Fetch firewall rules for one site."""
     firewall_models = await coordinator._fetch_optional_section(
         "firewall_rules",
         site_id,
         partial(coordinator.network_client.firewall.list_rules, site_id),
+        outcomes=outcomes,
     )
     if firewall_models is None:
         failed_sections.add(("firewall_rules", site_id))
@@ -258,13 +289,108 @@ async def async_fetch_site_firewall(
     return firewall_rules_dict
 
 
+async def async_fetch_site_vouchers(
+    coordinator: Any,
+    site_id: str,
+    failed_sections: set[tuple[str, str]],
+) -> dict[str, Any]:
+    """Fetch the voucher inventory of one site, keyed by voucher id."""
+    models = await coordinator._fetch_optional_section(
+        "vouchers",
+        site_id,
+        partial(coordinator.network_client.vouchers.get_all_pages, site_id),
+    )
+    if models is None:
+        failed_sections.add(("vouchers", site_id))
+        return dict(coordinator.data.get("vouchers", {}).get(site_id, {}))
+    inventory: dict[str, Any] = {}
+    for model in models:
+        record = coordinator._model_to_dict(model)
+        if voucher_id := record.get("id"):
+            inventory[voucher_id] = record
+    return inventory
+
+
+def verified_legacy_site_name(site_data: Any) -> str | None:
+    """
+    Return the verified classic site name (internalReference) for older APIs.
+
+    Spec: internal unique name of the site used in older APIs; never fuzzy.
+    """
+    if isinstance(site_data, dict):
+        val = site_data.get("internalReference")
+        if isinstance(val, str) and (stripped := val.strip()):
+            return stripped
+    return None
+
+
+def rule_display_name(
+    rule_data: Any,
+    rule_id: str,
+    name_field: str = "name",
+) -> str:
+    """Return stripped display name for a rule or fall back to rule_id."""
+    if isinstance(rule_data, dict):
+        rule_name = rule_data.get(name_field)
+        if isinstance(rule_name, str) and (stripped := rule_name.strip()):
+            return stripped
+    return rule_id
+
+
+def is_predefined_firewall_rule(rule_data: dict[str, Any]) -> bool:
+    """Return True when a firewall rule appears to be system-defined."""
+    metadata = rule_data.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("origin") == "SYSTEM_DEFINED":
+        return True
+    return bool(
+        rule_data.get("predefined")
+        or rule_data.get("isPredefined")
+        or rule_data.get("isSystem")
+    )
+
+
+async def async_fetch_site_rule_section(
+    coordinator: Any,
+    section: str,
+    site_id: str,
+    site_name: str | None,
+    fetch: Callable[[str], Awaitable[list[Any]]],
+    *,
+    failed_sections: set[tuple[str, str]],
+    outcomes: dict[tuple[str, str], str] | None = None,
+) -> dict[str, Any]:
+    """Fetch one rule section (port forwards, traffic rules, NAT, routes)."""
+    if site_name is None:
+        return {}
+    models = await coordinator._fetch_optional_section(
+        section, site_id, partial(fetch, site_name), outcomes=outcomes
+    )
+    if models is None:
+        failed_sections.add((section, site_id))
+        return dict(coordinator.data.get(section, {}).get(site_id, {}))
+    rules_dict: dict[str, Any] = {}
+    for model in models:
+        record = coordinator._model_to_dict(model)
+        rule_id = record.get("_id") or record.get("id")
+        if isinstance(rule_id, str) and rule_id:
+            rules_dict[rule_id] = record
+    return rules_dict
+
+
 async def async_fetch_site_routes(
     network_client: UniFiNetworkClient,
     model_to_dict: Callable[[Any], dict[str, Any]],
     site_id: str,
     legacy_name: str | None,
+    *,
+    outcomes: dict[tuple[str, str], str] | None = None,
 ) -> dict[str, Any]:
-    """Fetch policy-based routes (traffic routes) for a site."""
+    """
+    Fetch policy-based routes (traffic routes) for a site.
+
+    ``outcomes`` records whether this fetch was authoritative. The returned
+    data is unchanged by it: a failed fetch still yields ``{}``.
+    """
     if not legacy_name:
         return {}
     try:
@@ -294,7 +420,11 @@ async def async_fetch_site_routes(
             site_id,
             err,
         )
+        if outcomes is not None:
+            outcomes[("policy_based_routes", site_id)] = SECTION_OUTCOME_FAILED
         return {}
+    if outcomes is not None:
+        outcomes[("policy_based_routes", site_id)] = SECTION_OUTCOME_OK
     return routes_dict
 
 

@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """
 Classify what a console's Network and Protect APIs say about a set of credentials.
 
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from contextlib import AbstractAsyncContextManager
 
+    from .api.access import UniFiAccessClient
+    from .api.carrier_fabric import UniFiCarrierFabricClient
     from .api.innerspace import UniFiInnerSpaceClient
     from .api.network import UniFiNetworkClient
     from .api.protect import UniFiProtectClient
@@ -61,6 +64,8 @@ class ProbeResult:
     status: ProbeStatus
     error: Exception | None = None
     sites: list[Any] = field(default_factory=list)
+    org_id: str | None = None
+    missing_scope: bool = False
 
 
 def classify_error(err: Exception) -> ProbeStatus:
@@ -188,6 +193,28 @@ async def async_probe_innerspace(client: UniFiInnerSpaceClient) -> ProbeResult:
     return ProbeResult(ProbeStatus.EMPTY)
 
 
+async def async_probe_access(client: UniFiAccessClient) -> ProbeResult:
+    """
+    Probe the UniFi Access developer API by listing doors.
+
+    Access is optional and never gates setup, so every failure is a status
+    rather than an exception: a rejected token is AUTH_FAILED (401/403), a
+    missing console API or web page is UNSUPPORTED, and a connection or server
+    failure is UNREACHABLE. An empty door list is EMPTY, and any door means
+    AVAILABLE.
+    """
+    try:
+        doors = await client.doors.get_all()
+    except Exception as err:
+        status = classify_error(err)
+        _LOGGER.debug("Access API probe: %s (%r)", status, err)
+        return ProbeResult(status, err)
+    if not doors:
+        _LOGGER.debug("Access API probe: no doors")
+        return ProbeResult(ProbeStatus.EMPTY)
+    return ProbeResult(ProbeStatus.AVAILABLE)
+
+
 async def async_probe_with_client[ClientT](
     client_context: AbstractAsyncContextManager[ClientT],
     probe: Callable[[ClientT], Awaitable[ProbeResult]],
@@ -205,3 +232,53 @@ async def async_probe_with_client[ClientT](
         status = classify_error(err)
         _LOGGER.debug("API probe client error: %s (%r)", status, err)
         return ProbeResult(status, err)
+
+
+async def async_probe_carrier_fabric(
+    client: UniFiCarrierFabricClient,
+) -> ProbeResult:
+    """
+    Probe the Carrier Fabric application.
+
+    Queries service plans and a single subscriber page (limit=1) to verify
+    required API key scopes. Discovers and returns org_id if available.
+    """
+    try:
+        plans = await client.service_plans.get_all()
+    except Exception as err:
+        status = classify_error(err)
+        missing_scope = isinstance(err, UniFiAuthenticationError) and (
+            err.status_code == HTTPStatus.FORBIDDEN
+            or getattr(err, "api_error_code", None) == "insufficient_scope"
+        )
+        _LOGGER.debug("Carrier Fabric API probe (service plans): %s (%r)", status, err)
+        return ProbeResult(status, err, missing_scope=missing_scope)
+
+    org_id: str | None = None
+    for plan in plans:
+        if plan.org_id:
+            org_id = plan.org_id
+            break
+
+    try:
+        subscribers = await client.subscribers.get_all(limit=1)
+    except Exception as err:
+        status = classify_error(err)
+        missing_scope = isinstance(err, UniFiAuthenticationError) and (
+            err.status_code == HTTPStatus.FORBIDDEN
+            or getattr(err, "api_error_code", None) == "insufficient_scope"
+        )
+        _LOGGER.debug("Carrier Fabric API probe (subscribers): %s (%r)", status, err)
+        return ProbeResult(status, err, org_id=org_id, missing_scope=missing_scope)
+
+    if org_id is None:
+        for subscriber in subscribers:
+            if subscriber.org_id:
+                org_id = subscriber.org_id
+                break
+
+    if not plans and not subscribers:
+        _LOGGER.debug("Carrier Fabric API probe: no plans and no subscribers")
+        return ProbeResult(ProbeStatus.EMPTY, org_id=org_id)
+
+    return ProbeResult(ProbeStatus.AVAILABLE, org_id=org_id)

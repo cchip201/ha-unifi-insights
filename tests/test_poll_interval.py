@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """cmcore (backlog 663): the device and Protect coordinators' per-entry poll interval.
 
 A cloud entry is polled through UniFi's remote connector, which answered HTTP 408

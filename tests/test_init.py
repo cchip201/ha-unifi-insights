@@ -1,10 +1,13 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for the UniFi Insights integration initialization."""
 
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import CONF_API_KEY, CONF_HOST, Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -13,14 +16,17 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.entity_registry import EntityRegistry
     from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 
 from custom_components.unifi_insights import (
+    PLATFORMS,
     SETUP_PROBE_RETRIES,
     UnifiInsightsData,
-    _migrate_site_unique_ids,
+    _migrate_fork_site_unique_ids,
     _raise_for_setup_probes,
     async_remove_config_entry_device,
+    async_unload_entry,
 )
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
@@ -35,8 +41,11 @@ from custom_components.unifi_insights.api.innerspace import (
     InnerSpaceProject,
     InnerSpaceProjectIdentity,
 )
-from custom_components.unifi_insights.const import CONF_SITE_IDS, DOMAIN
-from custom_components.unifi_insights.entity import site_unique_id_prefix
+from custom_components.unifi_insights.const import (
+    CONF_CONSOLE_ID,
+    CONF_SITE_IDS,
+    DOMAIN,
+)
 from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
 
 
@@ -46,6 +55,7 @@ async def test_setup_entry_success(
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test successful setup of config entry."""
@@ -56,12 +66,77 @@ async def test_setup_entry_success(
     assert mock_config_entry.state == ConfigEntryState.LOADED
 
 
+@pytest.mark.parametrize(
+    ("site_id", "expected_identity"),
+    [
+        ("synthetic_site", "https://console.example.invalid"),
+        ("default", "https://console.example.invalid"),
+    ],
+)
+async def test_setup_legacy_credential_identity_without_console_mac(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_local_auth: MagicMock,
+    *,
+    enable_custom_integrations: None,
+    entity_registry: EntityRegistry,
+    site_id: str,
+    expected_identity: str,
+) -> None:
+    """Backfill a legacy credential identity before new site sensors are discovered."""
+    credential = "synthetic_setup_credential"
+    mock_config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        mock_config_entry,
+        data={
+            **mock_config_entry.data,
+            CONF_API_KEY: credential,
+            CONF_CONSOLE_ID: credential,
+            CONF_HOST: "https://Console.Example.Invalid",
+        },
+        unique_id=credential,
+    )
+    mock_network_client.sites.get_all.return_value = [
+        {"id": site_id, "name": "Synthetic site"}
+    ]
+    mock_network_client.devices.get_all.return_value = []
+    mock_protect_client.cameras.get_all.return_value = []
+    mock_protect_client.nvr.get.return_value = None
+
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state == ConfigEntryState.LOADED
+    assert mock_config_entry.data[CONF_CONSOLE_ID] == expected_identity
+    assert mock_config_entry.unique_id == expected_identity
+    expected_keys = {
+        "site_total_clients",
+        "site_wired_clients",
+        "site_wireless_clients",
+    }
+    rows = [
+        row
+        for row in entity_registry.entities.values()
+        if row.config_entry_id == mock_config_entry.entry_id
+        and row.translation_key in expected_keys
+    ]
+    assert len(rows) == 3
+    assert {row.translation_key for row in rows} == expected_keys
+    assert all(
+        row.unique_id.startswith(f"{expected_identity}_{site_id}_") for row in rows
+    )
+    assert all(credential not in row.unique_id for row in rows)
+
+
 async def test_setup_entry_auth_failed(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test setup fails with authentication error."""
@@ -85,6 +160,7 @@ async def test_setup_entry_connection_error(
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test setup fails with connection error."""
@@ -108,6 +184,7 @@ async def test_setup_entry_timeout_error(
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test setup fails with timeout error."""
@@ -131,6 +208,7 @@ async def test_setup_entry_protect_unavailable(
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test setup succeeds even if Protect is unavailable."""
@@ -149,6 +227,7 @@ async def test_setup_entry_protect_only_console(
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test setup succeeds on Protect-only console like UNVR (Issue 93)."""
@@ -271,6 +350,7 @@ async def test_setup_entry_no_sites_found(
     mock_network_client,
     mock_protect_client,
     mock_local_auth,
+    *,
     enable_custom_integrations,
 ) -> None:
     """Test setup fails when no sites and no protect NVR are found."""
@@ -480,6 +560,39 @@ async def test_unload_entry_network_close_error(
     assert init_integration.state == ConfigEntryState.NOT_LOADED
 
 
+async def test_unload_entry_network_only_skips_protect_stop_and_close(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_local_auth: MagicMock,
+    *,
+    enable_custom_integrations,
+) -> None:
+    """Test unload of a real Network-only setup skips Protect stop and close."""
+    mock_protect_client.cameras.get_all.side_effect = Exception("Protect unavailable")
+
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state == ConfigEntryState.LOADED
+    runtime_data = mock_config_entry.runtime_data
+    assert runtime_data.protect_coordinator is None
+    assert runtime_data.protect_client is None
+    assert runtime_data.network_client is mock_network_client
+
+    mock_network_client.close.reset_mock()
+    mock_protect_client.close.reset_mock()
+
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state == ConfigEntryState.NOT_LOADED
+    mock_protect_client.close.assert_not_called()
+    mock_network_client.close.assert_awaited_once()
+
+
 async def test_unifi_insights_data_coordinator_not_initialized(
     hass: HomeAssistant,
 ) -> None:
@@ -509,7 +622,7 @@ def _device_entry(*identifiers: str) -> MagicMock:
 def _hold_an_entity(
     hass: HomeAssistant, device: MagicMock, *, disabled: bool = False
 ) -> MagicMock:
-    """Register the stub's device with one entity, as a live client device holds its tracker."""
+    """Register the stub's device with one entity, as a live client device does."""
     config_entry = MockConfigEntry(domain=DOMAIN)
     config_entry.add_to_hass(hass)
     real = dr.async_get(hass).async_get_or_create(
@@ -617,7 +730,7 @@ async def test_remove_config_entry_device_for_ephemeral_client(
 async def test_remove_config_entry_device_for_empty_client_device(
     hass: HomeAssistant,
 ) -> None:
-    """A client device that holds no entity can be deleted (cmcore fork, backlog 643)."""
+    """A client device that holds no entity can be deleted (cmcore, backlog 643)."""
     entry = _entry_with_sites({"default": "Default"}, ["default"])
     named = _client_device("98:e2:55:40:0c:ad", "Kitchen tablet")
     named.id = "device-empty"
@@ -730,13 +843,22 @@ async def _remove_device_via_ui(
     device = dr.async_get(hass).async_get_or_create(
         config_entry_id=entry.entry_id, identifiers={(DOMAIN, identifier)}
     )
+    device_id = device.id
     client = await hass_ws_client(hass)
-    await client.send_json_auto_id(
-        {
+    ws_commands = hass.data.get(websocket_api.DOMAIN, {})
+    if "config/device_registry/remove" in ws_commands:
+        payload: dict[str, Any] = {
             "type": "config/device_registry/remove",
-            "device_id": device.id,
+            "device_id": device_id,
         }
-    )
+    else:
+        assert "config/device_registry/remove_config_entry" in ws_commands
+        payload = {
+            "type": "config/device_registry/remove_config_entry",
+            "config_entry_id": entry.entry_id,
+            "device_id": device_id,
+        }
+    await client.send_json_auto_id(payload)
     response: dict[str, Any] = await client.receive_json()
     return response
 
@@ -1228,6 +1350,7 @@ async def test_setup_entry_innerspace_only_console(
     mock_network_client: MagicMock,
     mock_protect_client: MagicMock,
     mock_innerspace_client: MagicMock,
+    *,
     mock_local_auth: MagicMock,
     enable_custom_integrations,
 ) -> None:
@@ -1264,86 +1387,394 @@ async def test_setup_entry_innerspace_only_console(
     mock_innerspace_client.close.assert_awaited()
 
 
-# ---- cmcore (backlog 648, 2026-10-01): site-level ids are per console ----------
+# ---- cmcore (backlog 648, carried into v2026.10.2 by 1015): fork site rows ----------
 SITE = "88f7af54-98f8-306a-a1c7-c9349722b1f6"  # every console's default site id
-CMCORE_GW = "e0:63:da:88:c0:bb"
-OFFSITE_GW = "aa:bb:cc:dd:ee:ff"
+CMCORE_NS = "e0:63:da:88:c0:bb"  # a local entry's console id: its MAC
+CMCORE_GW = "e0:63:da:88:c0:bb"  # the live CMCoreUDMP rows carry the MAC here too
+OFFSITE_CONSOLE_ID = "D021F96BFF0F0000000000000000:1234567"  # a cloud console id
+OFFSITE_NS = OFFSITE_CONSOLE_ID.lower()
+OFFSITE_GW = "b7f61bd0-0093-3616-bef4-a1acb2ad59f7"  # a v1 gateway device id
 
 
-def _console(hass: HomeAssistant, gateway: str) -> tuple[MockConfigEntry, str]:
-    """Register a config entry and its gateway device, as each console does."""
-    entry = MockConfigEntry(domain=DOMAIN, title=f"console {gateway}")
+def _fork_console(
+    hass: HomeAssistant, entry_id: str, console_id: str | None
+) -> MockConfigEntry:
+    """Register a config entry the way each console's entry is stored."""
+    data: dict[str, Any] = {CONF_API_KEY: "synthetic_credential"}
+    if console_id is not None:
+        data[CONF_CONSOLE_ID] = console_id
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=data, entry_id=entry_id, title=f"console {entry_id}"
+    )
     entry.add_to_hass(hass)
-    dev = dr.async_get(hass).async_get_or_create(
-        config_entry_id=entry.entry_id, identifiers={(DOMAIN, f"{SITE}_{gateway}")}
+    return entry
+
+
+def _fork_row(
+    reg: EntityRegistry,
+    entry: MockConfigEntry,
+    unique_id: str,
+    key: str | None,
+    object_id: str,
+) -> er.RegistryEntry:
+    """Create a registry row as the fork's site-level sensors left it."""
+    return reg.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        unique_id,
+        config_entry=entry,
+        translation_key=key,
+        suggested_object_id=object_id,
     )
-    return entry, dev.id
 
 
-def _data(gateway: str) -> dict:
-    return {"devices": {SITE: {gateway: {"model": "UDMPRO", "name": gateway}}}}
-
-
-async def test_site_rows_move_to_their_own_console_and_no_other(
-    hass: HomeAssistant,
-) -> None:
+async def test_fork_site_rows_move_to_console_scoped_ids(hass: HomeAssistant) -> None:
     """
-    Move each site row to the console whose gateway device holds it.
+    Each entry moves its own gateway-keyed rows to `<namespace>_<site>_<key>`.
 
-    CMCore's WAN usage sensors sat on the offsite console's device: the shared
-    site id made `<site>_<key>` one row for every console.
+    v2026.9.10-cmcore.5 keyed the site-level sensors `<site>_<gateway>_<key>`;
+    upstream v2026.10.2 keys them by the console namespace and migrates only
+    `<site>_<key>`. The rows keep their entity_id, so history and dashboards
+    stay, and a row another console owns is left for that console's entry.
     """
-    cmcore, cmcore_dev = _console(hass, CMCORE_GW)
-    offsite, offsite_dev = _console(hass, OFFSITE_GW)
     reg = er.async_get(hass)
-    # last claimed by the OFFSITE entry, but on CMCore's gateway: the 10-01 shape
-    row = reg.async_get_or_create(
-        "sensor",
-        DOMAIN,
-        f"{SITE}_internet_download_1h",
-        config_entry=offsite,
-        device_id=cmcore_dev,
-        suggested_object_id="network_cmcoreudmp_internet_download_last_hour",
+    cmcore = _fork_console(hass, "cmcore", CMCORE_NS)
+    offsite = _fork_console(hass, "offsite", OFFSITE_CONSOLE_ID)
+    total = _fork_row(
+        reg,
+        cmcore,
+        f"{SITE}_{CMCORE_GW}_site_total_clients",
+        "site_total_clients",
+        "network_cmcoreudmp_total_clients",
     )
-    stray = reg.async_get_or_create(
-        "sensor",
-        DOMAIN,
-        f"{SITE}_site_total_clients",
-        config_entry=offsite,
-        device_id=offsite_dev,
+    download = _fork_row(
+        reg,
+        cmcore,
+        f"{SITE}_{CMCORE_GW}_internet_download_1h",
+        "internet_download_1h",
+        "network_cmcoreudmp_internet_download_last_hour",
+    )
+    offsite_total = _fork_row(
+        reg,
+        offsite,
+        f"{SITE}_{OFFSITE_GW}_site_total_clients",
+        "site_total_clients",
+        "offsite_chipcityudmp_total_clients",
     )
 
-    # the offsite entry moves only the row on its own gateway
-    assert _migrate_site_unique_ids(hass, offsite, _data(OFFSITE_GW)) == 1
-    stray_now = reg.async_get(stray.entity_id)
-    assert stray_now.unique_id == f"{SITE}_{OFFSITE_GW}_site_total_clients"
-    row_now = reg.async_get(row.entity_id)
-    assert row_now.unique_id == f"{SITE}_internet_download_1h"
-
-    # CMCore's entry takes its row: same entity_id, so the history stays
-    assert _migrate_site_unique_ids(hass, cmcore, _data(CMCORE_GW)) == 1
-    moved = reg.async_get(row.entity_id)
-    assert moved.unique_id == f"{SITE}_{CMCORE_GW}_internet_download_1h"
+    assert _migrate_fork_site_unique_ids(hass, cmcore) == 2
+    moved = reg.async_get(total.entity_id)
+    assert moved.unique_id == f"{CMCORE_NS}_{SITE}_site_total_clients"
+    assert moved.entity_id == "sensor.network_cmcoreudmp_total_clients"
     assert moved.config_entry_id == cmcore.entry_id
-    assert moved.entity_id == row.entity_id
+    assert (
+        reg.async_get(download.entity_id).unique_id
+        == f"{CMCORE_NS}_{SITE}_internet_download_1h"
+    )
+    # the offsite console's row is its own entry's to move
+    assert (
+        reg.async_get(offsite_total.entity_id).unique_id
+        == f"{SITE}_{OFFSITE_GW}_site_total_clients"
+    )
 
-    # a second run is a no-op; a site with no gateway keeps the upstream id
-    assert _migrate_site_unique_ids(hass, cmcore, _data(CMCORE_GW)) == 0
-    no_gateway = {"devices": {SITE: {"sw1": {"model": "USW24"}}}}
-    assert _migrate_site_unique_ids(hass, cmcore, no_gateway) == 0
+    assert _migrate_fork_site_unique_ids(hass, offsite) == 1
+    assert (
+        reg.async_get(offsite_total.entity_id).unique_id
+        == f"{OFFSITE_NS}_{SITE}_site_total_clients"
+    )
+    # a second run moves nothing
+    assert _migrate_fork_site_unique_ids(hass, cmcore) == 0
+    assert _migrate_fork_site_unique_ids(hass, offsite) == 0
+    assert len(reg.entities) == 3
 
 
-def test_site_sensor_ids_carry_the_gateway_only_when_there_is_one() -> None:
-    assert site_unique_id_prefix(_data(CMCORE_GW), SITE) == f"{SITE}_{CMCORE_GW}"
-    no_gateway = {"devices": {SITE: {"sw1": {"model": "USW24"}}}}
-    assert site_unique_id_prefix(no_gateway, SITE) == SITE
-    assert site_unique_id_prefix(None, SITE) == SITE
-
-
-async def test_site_migration_and_ids_tolerate_malformed_device_data(
-    hass: HomeAssistant,
+async def test_fork_site_migration_leaves_every_other_row(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
-    entry, _ = _console(hass, CMCORE_GW)
-    for bad in ({"devices": "garbage"}, {"devices": None}, {}):
-        assert _migrate_site_unique_ids(hass, entry, bad) == 0
-        assert site_unique_id_prefix(bad, SITE) == SITE
+    """Only an owned, gateway-keyed site row with a free target moves."""
+    reg = er.async_get(hass)
+    entry = _fork_console(hass, "cmcore", CMCORE_NS)
+    rows = {
+        # upstream migrates its own legacy shape itself
+        "legacy": _fork_row(
+            reg, entry, f"{SITE}_site_wired_clients", "site_wired_clients", "legacy"
+        ),
+        # a gateway's own per-device sensor has the same shape and another key
+        "device": _fork_row(
+            reg, entry, f"{SITE}_{CMCORE_GW}_wired_clients", "wired_clients", "device"
+        ),
+        # no translation key: not provably a site sensor
+        "no_key": _fork_row(
+            reg, entry, f"{SITE}_{CMCORE_GW}_site_wireless_clients", None, "no_key"
+        ),
+        # already console-scoped
+        "upstream": _fork_row(
+            reg,
+            entry,
+            f"{CMCORE_NS}_{SITE}_internet_upload_1h",
+            "internet_upload_1h",
+            "upstream",
+        ),
+        # not a site id in front of the gateway
+        "not_site": _fork_row(
+            reg,
+            entry,
+            f"site_shared_{CMCORE_GW}_internet_upload_1d",
+            "internet_upload_1d",
+            "not_site",
+        ),
+        # the gateway part may not hold another separator
+        "two_parts": _fork_row(
+            reg,
+            entry,
+            f"{SITE}_a_b_internet_download_1d",
+            "internet_download_1d",
+            "two_parts",
+        ),
+        # its key is not the end of its unique id
+        "other_ending": _fork_row(
+            reg,
+            entry,
+            f"{SITE}_{CMCORE_GW}_site_total_clients_old",
+            "site_total_clients",
+            "other_ending",
+        ),
+    }
+    # its target is already registered
+    rows["occupied"] = _fork_row(
+        reg,
+        entry,
+        f"{SITE}_{CMCORE_GW}_internet_download_1w",
+        "internet_download_1w",
+        "occupied",
+    )
+    _fork_row(
+        reg,
+        entry,
+        f"{CMCORE_NS}_{SITE}_internet_download_1w",
+        "internet_download_1w",
+        "occupied_target",
+    )
+    # a legacy row of the same key exists: upstream's own migration takes that one
+    rows["legacy_twin"] = _fork_row(
+        reg,
+        entry,
+        f"{SITE}_{CMCORE_GW}_site_wired_clients",
+        "site_wired_clients",
+        "legacy_twin",
+    )
+    before = {name: row.unique_id for name, row in rows.items()}
+
+    assert _migrate_fork_site_unique_ids(hass, entry) == 0
+    assert {
+        name: reg.async_get(row.entity_id).unique_id for name, row in rows.items()
+    } == before
+    assert "sensor.occupied" in caplog.text
+    assert "sensor.legacy_twin" in caplog.text
+
+
+async def test_fork_site_migration_needs_a_namespace(hass: HomeAssistant) -> None:
+    """An entry with no console id yet keeps its rows until it has one."""
+    reg = er.async_get(hass)
+    entry = _fork_console(hass, "cmcore", None)
+    row = _fork_row(
+        reg,
+        entry,
+        f"{SITE}_{CMCORE_GW}_site_total_clients",
+        "site_total_clients",
+        "network_cmcoreudmp_total_clients",
+    )
+    assert _migrate_fork_site_unique_ids(hass, entry) == 0
+    assert reg.async_get(row.entity_id).unique_id == row.unique_id
+
+
+async def test_fork_site_migration_survives_a_registry_refusal(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A row the registry refuses to move is left, and the others still move."""
+    reg = er.async_get(hass)
+    entry = _fork_console(hass, "cmcore", CMCORE_NS)
+    first = _fork_row(
+        reg,
+        entry,
+        f"{SITE}_{CMCORE_GW}_site_total_clients",
+        "site_total_clients",
+        "first",
+    )
+    second = _fork_row(
+        reg,
+        entry,
+        f"{SITE}_{CMCORE_GW}_site_wired_clients",
+        "site_wired_clients",
+        "second",
+    )
+    real_update = reg.async_update_entity
+
+    def _refuse_first(entity_id: str, **kwargs: Any) -> er.RegistryEntry:
+        if entity_id == first.entity_id:
+            msg = "refused"
+            raise ValueError(msg)
+        return real_update(entity_id, **kwargs)
+
+    with patch.object(reg, "async_update_entity", side_effect=_refuse_first):
+        assert _migrate_fork_site_unique_ids(hass, entry) == 1
+    assert reg.async_get(first.entity_id).unique_id == first.unique_id
+    assert (
+        reg.async_get(second.entity_id).unique_id
+        == f"{CMCORE_NS}_{SITE}_site_wired_clients"
+    )
+    assert "Could not move sensor.first" in caplog.text
+
+
+async def test_fork_site_rows_are_the_rows_upstream_sensors_use(
+    hass: HomeAssistant, mock_coordinator: MagicMock
+) -> None:
+    """
+    After the move, the site sensors build on the existing rows: no new row.
+
+    The proof that the merge keeps the live entity_ids: every site-level sensor
+    the platform creates resolves to a moved row, and the dashboard lookup of
+    the internet-activity sensors finds the same entity_ids.
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from custom_components.unifi_insights import (  # noqa: PLC0415
+        sensor as sensor_platform,
+    )
+    from custom_components.unifi_insights.internet_activity_snapshot import (  # noqa: PLC0415
+        _resolve_entity_ids,
+    )
+    from custom_components.unifi_insights.sensor import (  # noqa: PLC0415
+        SITE_CLIENT_SENSOR_TYPES,
+    )
+    from custom_components.unifi_insights.site_internet_activity_sensor import (  # noqa: PLC0415
+        SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
+    )
+
+    reg = er.async_get(hass)
+    entry = _fork_console(hass, "cmcore", CMCORE_NS)
+    keys = [d.key for d in SITE_CLIENT_SENSOR_TYPES] + [
+        d.key for d in SITE_INTERNET_ACTIVITY_SENSOR_TYPES
+    ]
+    entity_ids = {
+        key: _fork_row(
+            reg, entry, f"{SITE}_{CMCORE_GW}_{key}", key, f"network_cmcoreudmp_{key}"
+        ).entity_id
+        for key in keys
+    }
+    assert _migrate_fork_site_unique_ids(hass, entry) == len(keys) == 11
+
+    mock_coordinator.protect_client = None
+    mock_coordinator.data = {
+        "sites": {SITE: {"id": SITE, "name": "Default"}},
+        "clients": {SITE: {}},
+        "internet_activity": {
+            SITE: {
+                window: {"rx_bytes": 1, "tx_bytes": 2}
+                for window in ("1h", "1d", "1w", "1m")
+            }
+        },
+    }
+    mock_coordinator.hass = hass
+    entry.runtime_data = SimpleNamespace(
+        coordinator=mock_coordinator, mobility_coordinator=None
+    )
+    entities: list[Any] = []
+    await sensor_platform.async_setup_entry(hass, entry, entities.extend)
+
+    site_entities = {
+        entity.translation_key: entity
+        for entity in entities
+        if entity.translation_key in entity_ids
+    }
+    assert set(site_entities) == set(keys)
+    for key, entity in site_entities.items():
+        assert entity.unique_id == f"{CMCORE_NS}_{SITE}_{key}"
+        row_entity_id = reg.async_get_entity_id("sensor", DOMAIN, entity.unique_id)
+        assert row_entity_id == entity_ids[key]
+    assert len(reg.entities) == len(keys)
+    activity = _resolve_entity_ids(
+        reg, site_id=SITE, entry_id=entry.entry_id, namespace=CMCORE_NS
+    )
+    assert sorted(activity.values()) == sorted(
+        entity_ids[d.key] for d in SITE_INTERNET_ACTIVITY_SENSOR_TYPES
+    )
+
+
+def test_platforms_include_media_player() -> None:
+    """Test that PLATFORMS includes Platform.MEDIA_PLAYER."""
+    assert Platform.MEDIA_PLAYER in PLATFORMS
+
+
+async def test_setup_entry_unused_innerspace_close_error(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_innerspace_client: MagicMock,
+    *,
+    mock_local_auth: MagicMock,
+    enable_custom_integrations,
+) -> None:
+    """Test that error closing unused InnerSpace client does not block setup."""
+    mock_innerspace_client.close = AsyncMock(
+        side_effect=Exception("InnerSpace close failed")
+    )
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state == ConfigEntryState.LOADED
+    mock_innerspace_client.close.assert_awaited_once()
+
+
+async def test_unload_entry_innerspace_close_error(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: MagicMock,
+    mock_protect_client: MagicMock,
+    mock_innerspace_client: MagicMock,
+    *,
+    mock_local_auth: MagicMock,
+    enable_custom_integrations,
+) -> None:
+    """Test unload entry handles innerspace client close error gracefully."""
+    mock_innerspace_client.get_project.return_value = InnerSpaceProject(
+        project=InnerSpaceProjectIdentity(id="proj-1"),
+    )
+    mock_innerspace_client.list_floor_plans.return_value = [
+        InnerSpaceFloorPlan(id="fp-1", name="Main")
+    ]
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state == ConfigEntryState.LOADED
+
+    mock_network_client.close.reset_mock()
+    mock_innerspace_client.close = AsyncMock(
+        side_effect=Exception("InnerSpace close error")
+    )
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state == ConfigEntryState.NOT_LOADED
+    mock_innerspace_client.close.assert_awaited_once()
+    mock_network_client.close.assert_awaited_once()
+
+
+async def test_unload_entry_platform_unload_fails_keeps_clients_open(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """When platform unload returns false, assert that clients stay open."""
+    runtime_data = init_integration.runtime_data
+    with patch.object(
+        hass.config_entries, "async_unload_platforms", return_value=False
+    ):
+        result = await async_unload_entry(hass, init_integration)
+        assert result is False
+        assert not runtime_data.network_client.close.called
+        assert not runtime_data.protect_client.close.called
+
+    # Clean up entry cleanly
+    assert await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()

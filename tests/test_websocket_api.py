@@ -4,21 +4,48 @@
 
 from __future__ import annotations
 
+import itertools
+import json
 import logging
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock, patch
 
+import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry as MockConfigEntryForTest,
 )
 
-from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights import CarrierFabricData
+from custom_components.unifi_insights.api import UniFiResponseError
+from custom_components.unifi_insights.console_identity import (
+    build_legacy_site_unique_id,
+    build_site_unique_id,
+)
+from custom_components.unifi_insights.const import (
+    CONF_CONNECTION_TYPE,
+    CONF_CONSOLE_ID,
+    CONNECTION_TYPE_CARRIER_FABRIC,
+    DOMAIN,
+)
+from custom_components.unifi_insights.device_tracker import UnifiClientTracker
 from custom_components.unifi_insights.helpers import async_get_device_entry
+from custom_components.unifi_insights.internet_activity_snapshot import WINDOWS
 from custom_components.unifi_insights.topology import build_site_topology
 from custom_components.unifi_insights.websocket_api import (
+    _UNLOAD_WATCHERS,
+    ERR_ENTRY_NOT_LOADED,
+    _device_in_entry,
+    _generic_site_payload,
+    _generic_site_unavailable,
+    _protect_change_signal,
+    _RequestError,
+    ws_protect_subscribe,
+    ws_site_health_subscribe,
     ws_topology_sources,
     ws_topology_subscribe,
 )
@@ -121,6 +148,48 @@ async def test_sources_skips_loaded_entry_without_runtime_data(
 
     (sources,) = connection.send_result.call_args.args[1:]
     assert [source["entry_id"] for source in sources] == [init_integration.entry_id]
+
+
+async def test_dashboard_commands_skip_loaded_carrier_fabric_entry(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A loaded Carrier Fabric entry has no topology or Protect data to offer."""
+    _seed(init_integration)
+    carrier_entry = MockConfigEntryForTest(
+        domain=DOMAIN,
+        entry_id="carrier_entry",
+        unique_id="carrier_org_1",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_CARRIER_FABRIC,
+            "api_key": "isp_key",
+        },
+    )
+    carrier_entry.add_to_hass(hass)
+    carrier_entry.runtime_data = CarrierFabricData(client=Mock(), coordinator=Mock())
+    carrier_entry.mock_state(hass, ConfigEntryState.LOADED)
+    client = await hass_ws_client(hass)
+
+    for msg_id, msg_type in (
+        (1, "unifi_insights/topology/sources"),
+        (2, "unifi_insights/protect/sources"),
+    ):
+        await client.send_json({"id": msg_id, "type": msg_type})
+        msg = await client.receive_json()
+        assert msg["success"], msg_type
+        assert [source["entry_id"] for source in msg["result"]] == [
+            init_integration.entry_id
+        ], msg_type
+
+    await client.send_json(
+        {
+            "id": 3,
+            "type": "unifi_insights/protect/get",
+            "entry_id": carrier_entry.entry_id,
+        }
+    )
+    msg = await client.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == ERR_ENTRY_NOT_LOADED
 
 
 async def test_get_returns_snapshot(
@@ -735,6 +804,158 @@ async def test_internet_activity_get_returns_snapshot(
     assert msg["result"]["windows"]["1h"]["upload_bytes"] == 500
 
 
+@pytest.fixture
+async def internet_activity_entries(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: Mock,
+    mock_protect_client: Mock,
+    mock_local_auth: Mock,
+    *,
+    enable_custom_integrations: None,
+) -> list[MockConfigEntry]:
+    """Load two synthetic consoles with independent totals for one shared site."""
+    entries = []
+    for index, namespace in enumerate(("console_a", "console_b"), start=1):
+        entry = MockConfigEntryForTest(
+            domain=DOMAIN,
+            entry_id=f"activity_entry_{namespace}",
+            unique_id=namespace,
+            data={**mock_config_entry.data, CONF_CONSOLE_ID: namespace},
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        data = _seed(entry)
+        data["internet_activity"] = {
+            SITE: {
+                window: {"rx_bytes": index * 1000, "tx_bytes": index * 500}
+                for window in WINDOWS
+            }
+        }
+        data["internet_activity_unavailable"] = set()
+        entries.append(entry)
+    return entries
+
+
+async def test_internet_activity_get_namespaces_shared_site_registry_rows(
+    hass: HomeAssistant,
+    internet_activity_entries: list[MockConfigEntry],
+    entity_registry: er.EntityRegistry,
+    hass_ws_client: Any,
+) -> None:
+    """The native WebSocket entrypoint forwards each console's namespace."""
+    expected_ids = []
+    for entry in internet_activity_entries:
+        owned_ids = {}
+        for direction in ("download", "upload"):
+            for window in WINDOWS:
+                key = f"internet_{direction}_{window}"
+                row = entity_registry.async_get_or_create(
+                    "sensor",
+                    DOMAIN,
+                    build_site_unique_id(entry.data[CONF_CONSOLE_ID], SITE, key),
+                    config_entry=entry,
+                    translation_key=key,
+                )
+                owned_ids[f"{direction}_{window}"] = row.entity_id
+        expected_ids.append(owned_ids)
+    registry_before = dict(entity_registry.entities)
+    client = await hass_ws_client(hass)
+    snapshots = []
+
+    for index, (entry, owned_ids) in enumerate(
+        zip(internet_activity_entries, expected_ids, strict=True), start=1
+    ):
+        await client.send_json(
+            {
+                "id": index,
+                "type": "unifi_insights/internet_activity/get",
+                "entry_id": entry.entry_id,
+                "site_id": SITE,
+            }
+        )
+        response = await client.receive_json()
+
+        assert response["success"]
+        snapshot = response["result"]
+        assert snapshot["entry_id"] == entry.entry_id
+        assert snapshot["site_id"] == SITE
+        assert snapshot["entity_ids"] == owned_ids
+        assert snapshot["windows"]["1h"]["download_bytes"] == index * 1000
+        assert all(
+            entity_registry.async_get(entity_id).config_entry_id == entry.entry_id
+            for entity_id in snapshot["entity_ids"].values()
+        )
+        snapshots.append(snapshot)
+
+    assert len(snapshots[0]["entity_ids"]) == len(snapshots[1]["entity_ids"]) == 8
+    assert set(snapshots[0]["entity_ids"].values()).isdisjoint(
+        snapshots[1]["entity_ids"].values()
+    )
+    assert dict(entity_registry.entities) == registry_before
+
+
+@pytest.mark.parametrize(
+    ("legacy_owner", "target_owner", "expected_candidate"),
+    [
+        ("own", "foreign", "legacy"),
+        ("own", "own", "legacy"),
+        ("foreign", "own", "target"),
+        ("foreign", "foreign", None),
+        (None, "foreign", None),
+        (None, "own", "target"),
+    ],
+)
+async def test_generic_internet_activity_payload_preserves_candidate_ownership(
+    hass: HomeAssistant,
+    internet_activity_entries: list[MockConfigEntry],
+    entity_registry: er.EntityRegistry,
+    legacy_owner: str | None,
+    target_owner: str,
+    *,
+    expected_candidate: str | None,
+) -> None:
+    """The generic payload follows owned legacy identities without takeover."""
+    entries = dict(zip(("own", "foreign"), internet_activity_entries, strict=True))
+    key = "internet_download_1h"
+    candidates = {}
+    if legacy_owner is not None:
+        candidates["legacy"] = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            build_legacy_site_unique_id(SITE, key),
+            config_entry=entries[legacy_owner],
+            translation_key=key,
+        )
+    candidates["target"] = entity_registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        build_site_unique_id("console_a", SITE, key),
+        config_entry=entries[target_owner],
+        translation_key=key,
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    candidates["target"] = entity_registry.async_update_entity(
+        candidates["target"].entity_id, name="Customized activity sensor"
+    )
+    registry_before = dict(entity_registry.entities)
+
+    snapshot = _generic_site_payload(hass, entries["own"], SITE, "internet_activity")
+
+    expected = (
+        {"download_1h": candidates[expected_candidate].entity_id}
+        if expected_candidate is not None
+        else {}
+    )
+    assert snapshot["entity_ids"] == expected
+    assert dict(entity_registry.entities) == registry_before
+    assert all(
+        entity_registry.async_get(entity_id).config_entry_id == entries["own"].entry_id
+        for entity_id in snapshot["entity_ids"].values()
+    )
+
+
 async def test_performance_get_returns_snapshot(
     hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
 ) -> None:
@@ -861,7 +1082,7 @@ async def test_protect_sources_and_get_and_subscribe(
 async def test_dashboard_site_subscriptions_and_errors(
     hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client, caplog
 ) -> None:
-    """Cover get/subscribe error codes, updates, and unload for site dashboard streams."""
+    """Cover get/subscribe error codes, updates, and unload for site streams."""
     data = _seed(init_integration)
     facade = init_integration.runtime_data.coordinator
     data["internet_activity"] = {
@@ -950,3 +1171,1109 @@ async def test_dashboard_site_subscriptions_and_errors(
 
     await hass.config_entries.async_unload(init_integration.entry_id)
     await hass.async_block_till_done()
+
+
+async def test_protect_payload_device_mapping(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Test Protect payload maps cameras and chimes to HA device registry IDs."""
+    data = _seed(init_integration)
+    dev_reg = dr.async_get(hass)
+    cam_device = dev_reg.async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, "protect_camera_cam-1")},
+        name="Front Camera",
+    )
+    chime_device = dev_reg.async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, "protect_chime_chime-1")},
+        name="Hall Chime",
+    )
+
+    data["protect"] = {
+        "cameras": {
+            "cam-1": {"name": "Front Camera", "state": "CONNECTED"},
+            "cam-unreg": {"name": "Unregistered Cam", "state": "CONNECTED"},
+        },
+        "chimes": {
+            "chime-1": {"name": "Hall Chime", "state": "CONNECTED"},
+            "chime-unreg": {"name": "Unregistered Chime", "state": "CONNECTED"},
+        },
+        "nvrs": {},
+    }
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 310,
+            "type": "unifi_insights/protect/get",
+            "entry_id": init_integration.entry_id,
+        }
+    )
+    msg = await client.receive_json()
+    assert msg["success"]
+    devices = msg["result"]["devices"]
+    cam_item = next(d for d in devices if d["id"] == "cam-1")
+    assert cam_item["ha_device_id"] == cam_device.id
+    cam_unreg = next(d for d in devices if d["id"] == "cam-unreg")
+    assert cam_unreg["ha_device_id"] is None
+
+    chime_item = next(d for d in devices if d["id"] == "chime-1")
+    assert chime_item["ha_device_id"] == chime_device.id
+    chime_unreg = next(d for d in devices if d["id"] == "chime-unreg")
+    assert chime_unreg["ha_device_id"] is None
+
+
+async def test_protect_payload_protect_coordinator_none(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_network_client: Any,
+    mock_protect_client: Any,
+    hass_ws_client: Any,
+    *,
+    mock_local_auth: Any,
+    enable_custom_integrations: Any,
+) -> None:
+    """Test Protect payload returns no_protect snapshot when Protect is disabled."""
+    mock_protect_client.cameras.get_all.side_effect = UniFiResponseError(
+        "Protect not supported", status_code=404
+    )
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.runtime_data.protect_coordinator is None
+    assert mock_config_entry.runtime_data.protect_client is None
+
+    client = await hass_ws_client(hass)
+    await client.send_json(
+        {
+            "id": 311,
+            "type": "unifi_insights/protect/get",
+            "entry_id": mock_config_entry.entry_id,
+        }
+    )
+    msg = await client.receive_json()
+    assert msg["success"]
+    assert msg["result"]["status"] == "no_protect"
+
+
+def test_protect_change_signal_non_dict() -> None:
+    """Test _protect_change_signal returns 0 for non-dict inputs."""
+    assert _protect_change_signal(None) == 0
+    assert _protect_change_signal("not_a_dict") == 0
+
+
+def test_generic_site_payload_unsupported_and_site_disabled(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Test _generic_site_payload rejects disabled site and unsupported payload type."""
+    _seed(init_integration)
+    with pytest.raises(_RequestError) as exc_info:
+        _generic_site_payload(
+            hass, init_integration, "disabled_site", payload_type="site_health"
+        )
+    assert exc_info.value.code == "site_not_selected"
+
+    with pytest.raises(_RequestError) as exc_info:
+        _generic_site_payload(
+            hass, init_integration, SITE, payload_type="unsupported_payload"
+        )
+    assert exc_info.value.code == "invalid_format"
+
+
+def test_generic_site_unavailable_branches(
+    init_integration: MockConfigEntry,
+) -> None:
+    """Test _generic_site_unavailable builds snapshots for performance and fallback."""
+    perf = _generic_site_unavailable(init_integration, SITE, "performance", "code_perf")
+    assert perf["status"] == "unavailable"
+    assert perf["issues"][0]["code"] == "code_perf"
+
+    tl = _generic_site_unavailable(init_integration, SITE, "timeline", "code_tl")
+    assert tl["status"] == "unavailable"
+    assert tl["issues"][0]["code"] == "code_tl"
+
+    unknown = _generic_site_unavailable(
+        init_integration, SITE, "unknown_type", "code_unknown"
+    )
+    assert unknown["status"] == "unavailable"
+    assert unknown["issues"][0]["code"] == "code_unknown"
+
+
+async def test_protect_subscription_forwarder_branches(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client, caplog
+) -> None:
+    """Test Protect subscription forwarder branches for rebuild and deduplication."""
+    data = _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    data["protect"] = {
+        "cameras": {},
+        "chimes": {},
+        "nvrs": {"nvr-1": {"storage": {"healthy": True, "used": 40.0}}},
+    }
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 320,
+            "type": "unifi_insights/protect/subscribe",
+            "entry_id": init_integration.entry_id,
+        }
+    )
+    assert (await client.receive_json())["success"]
+    initial = await client.receive_json()
+    assert initial["type"] == "event"
+
+    # 1. Skip when inputs unchanged (_same_inputs)
+    facade.async_update_listeners()
+    await _assert_no_event(client, 321)
+
+    # 2. Rebuild exception in _async_forward: fail at the snapshot-builder
+    # boundary so the real _protect_payload path still runs up to it.
+    data["protect"]["nvrs"]["nvr-1"]["storage"]["used"] = 45.0
+    with (
+        caplog.at_level(logging.ERROR),
+        patch(
+            "custom_components.unifi_insights.websocket_api.build_protect_snapshot",
+            side_effect=RuntimeError("protect rebuild boom"),
+        ),
+    ):
+        facade.async_update_listeners()
+    assert "Failed to rebuild protect snapshot" in caplog.text
+    await _assert_no_event(client, 322)
+
+    # 3. Revision unchanged in _async_forward: an unrelated device-registry
+    # entry changes the rebuild inputs but not the snapshot content.
+    data["protect"]["nvrs"]["nvr-1"]["storage"]["used"] = 45.0
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, "unrelated-device")},
+    )
+    facade.async_update_listeners()
+    await _assert_no_event(client, 323)
+
+
+async def test_protect_and_site_subscription_cleanup_idempotent(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Test idempotent unsubscribe and unload callbacks for Protect/site payloads."""
+    _seed(init_integration)
+    connection = Mock()
+    connection.subscriptions = {}
+
+    # Protect subscription cleanup
+    ws_protect_subscribe(
+        hass,
+        connection,
+        {"id": 401, "entry_id": init_integration.entry_id},
+    )
+    protect_watchers = hass.data[_UNLOAD_WATCHERS]
+    protect_cbs = list(protect_watchers[init_integration.entry_id])
+    protect_unsub = connection.subscriptions[401]
+    protect_unsub()
+    protect_unsub()
+    # Unsubscribing stops watching the entry, and a late unload is a no-op.
+    assert protect_watchers[init_integration.entry_id].isdisjoint(protect_cbs)
+    sent = connection.send_message.call_count
+    for cb in protect_cbs:
+        cb()
+        cb()
+    assert connection.send_message.call_count == sent
+
+    # Site health subscription cleanup
+    connection.subscriptions = {}
+    ws_site_health_subscribe(
+        hass,
+        connection,
+        {"id": 402, "entry_id": init_integration.entry_id, "site_id": SITE},
+    )
+    site_watchers = hass.data[_UNLOAD_WATCHERS]
+    site_cbs = list(site_watchers[init_integration.entry_id])
+    site_unsub = connection.subscriptions[402]
+    site_unsub()
+    site_unsub()
+    assert site_watchers[init_integration.entry_id].isdisjoint(site_cbs)
+    sent = connection.send_message.call_count
+    for cb in site_cbs:
+        cb()
+        cb()
+    assert connection.send_message.call_count == sent
+
+
+async def test_site_subscription_forwarder_branches(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Test site subscription forwarder skips unchanged inputs and handles error."""
+    _seed(init_integration)
+    facade = init_integration.runtime_data.coordinator
+    facade.async_update_listeners()
+    await hass.async_block_till_done()
+
+    client = await hass_ws_client(hass)
+
+    await client.send_json(
+        {
+            "id": 410,
+            "type": "unifi_insights/site_health/subscribe",
+            "entry_id": init_integration.entry_id,
+            "site_id": SITE,
+        }
+    )
+    assert (await client.receive_json())["success"]
+    initial = await client.receive_json()
+    assert initial["type"] == "event"
+
+    # Inputs unchanged: forwarder exits early on _same_inputs
+    facade.async_update_listeners()
+    await _assert_no_event(client, 411)
+
+    # RequestError during forwarder rebuild: the site leaves the selection, so
+    # the real _generic_site_payload raises and the forwarder reports it.
+    init_integration.runtime_data.config_coordinator.data["sites"].pop(SITE)
+    facade.async_update_listeners()
+
+    err_evt = await client.receive_json()
+    assert err_evt["type"] == "event"
+    assert err_evt["event"]["status"] == "unavailable"
+
+
+# --- unifi_insights/topology/node_details (admin-only identity lookup) --------
+
+GW_IP = "10.2.0.1"
+AP_MAC = "02:00:00:00:00:08"
+AP_IP = "10.2.0.2"
+# Devices and clients keyed by a MAC get a keyed-hash node id, not "dev:<id>".
+SWITCH_MAC = "02:00:00:00:00:30"
+SWITCH_IP = "10.2.0.3"
+PHONE_MAC = "12:ab:00:00:00:02"
+PHONE_IP = "10.2.0.9"
+LAPTOP_MAC = "12:cd:00:00:00:03"
+# The API may spell a MAC in upper case; trackers and their devices key on lower.
+LAPTOP_MAC_RAW = LAPTOP_MAC.upper()
+LAPTOP_IP = "10.2.0.10"
+PRINTER_MAC = "12:00:00:00:00:44"
+PRINTER_IP = "10.2.0.44"
+# Every address the seeded site holds; none may ever reach a snapshot.
+SENSITIVE_VALUES = (
+    GW_MAC,
+    GW_IP,
+    AP_MAC,
+    AP_IP,
+    SWITCH_MAC,
+    SWITCH_IP,
+    PHONE_MAC,
+    PHONE_IP,
+    LAPTOP_MAC,
+    LAPTOP_IP,
+    PRINTER_MAC,
+    PRINTER_IP,
+)
+
+
+def _seed_details(entry: MockConfigEntry) -> dict[str, Any]:
+    """
+    Extend the seeded site with addresses, MAC-keyed records and a standalone client.
+
+    Each record spells its address keys differently on purpose (camelCase,
+    snake_case, bare ``ip``/``mac``), as the coordinators' payloads do.
+    """
+    data = _seed(entry)
+    devices = data["devices"][SITE]
+    data["devices"][SITE] = {
+        **devices,
+        "uuid-gw": {**devices["uuid-gw"], "ipAddress": GW_IP},
+        "uuid-ap": {**devices["uuid-ap"], "ip_address": AP_IP},
+        SWITCH_MAC: {
+            "id": SWITCH_MAC,
+            "name": "Switch",
+            "model": "USW-24",
+            "mac": SWITCH_MAC,
+            "ip": SWITCH_IP,
+            "state": "ONLINE",
+            "topology": {
+                "legacy_type": "usw",
+                "uplink_mac": GW_MAC,
+                "uplink_type": "wire",
+            },
+        },
+    }
+    clients = data["clients"][SITE]
+    data["clients"][SITE] = {
+        **clients,
+        "cli-1": {**clients["cli-1"], "macAddress": PHONE_MAC, "ipAddress": PHONE_IP},
+        # No uplink: its tracker sits on a standalone ``client_<mac>`` device.
+        "cli-2": {
+            "id": "cli-2",
+            "name": "Laptop",
+            "type": "WIRED",
+            "mac_address": LAPTOP_MAC_RAW,
+            "ip_address": LAPTOP_IP,
+        },
+        PRINTER_MAC: {
+            "id": PRINTER_MAC,
+            "name": "Printer",
+            "type": "WIRED",
+            "mac": PRINTER_MAC,
+            "ip": PRINTER_IP,
+            "uplinkDeviceId": SWITCH_MAC,
+        },
+    }
+    return data
+
+
+async def _node_details(
+    client,
+    entry: MockConfigEntry,
+    node_id: str,
+    *,
+    msg_id: int = 1,
+    site_id: str = SITE,
+    entry_id: str | None = None,
+) -> dict[str, Any]:
+    """Send the node_details command and return the raw response."""
+    await client.send_json(
+        {
+            "id": msg_id,
+            "type": "unifi_insights/topology/node_details",
+            "entry_id": entry_id or entry.entry_id,
+            "site_id": site_id,
+            "node_id": node_id,
+        }
+    )
+    return await client.receive_json()
+
+
+async def _snapshot(client, entry: MockConfigEntry, msg_id: int = 1) -> dict[str, Any]:
+    """Return the seeded site's snapshot from topology/get."""
+    await client.send_json(
+        {
+            "id": msg_id,
+            "type": "unifi_insights/topology/get",
+            "entry_id": entry.entry_id,
+            "site_id": SITE,
+        }
+    )
+    msg = await client.receive_json()
+    assert msg["success"], msg
+    return msg["result"]  # type: ignore[no-any-return]
+
+
+def _real_tracker(entry: MockConfigEntry, mac: str) -> UnifiClientTracker:
+    """Build the platform's own tracker so ids and device come from its code."""
+    return UnifiClientTracker(
+        coordinator=entry.runtime_data.coordinator, mac=mac, site_id=SITE
+    )
+
+
+def _register_tracker(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    unique_id: str,
+    *,
+    device_id: str | None = None,
+) -> er.RegistryEntry:
+    """Register a device_tracker entity under ``entry``."""
+    return er.async_get(hass).async_get_or_create(
+        "device_tracker",
+        DOMAIN,
+        unique_id,
+        config_entry=entry,
+        device_id=device_id,
+    )
+
+
+def _foreign_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """Add a second UniFi Insights entry that owns look-alike registry rows."""
+    other = MockConfigEntryForTest(
+        domain=DOMAIN, entry_id="other_entry", unique_id="other_key", data={}
+    )
+    other.add_to_hass(hass)
+    return other
+
+
+async def test_node_details_infrastructure(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """An infrastructure node returns its addresses, device and connectivity entity."""
+    _seed_details(init_integration)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, f"{SITE}_uuid-gw")},
+    )
+    entity = er.async_get(hass).async_get_or_create(
+        "binary_sensor",
+        DOMAIN,
+        f"{SITE}_uuid-gw_device_status",
+        config_entry=init_integration,
+        device_id=device.id,
+    )
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "dev:uuid-gw")
+
+    assert msg["success"], msg
+    assert msg["result"] == {
+        "kind": "gateway",
+        "ip_address": GW_IP,
+        "mac_address": GW_MAC,
+        "device_id": device.id,
+        "entity_id": entity.entity_id,
+    }
+    # The targets are an HA device registry id and an entity_id, never a unique id
+    # or an entity registry id.
+    assert msg["result"]["entity_id"].startswith("binary_sensor.")
+    assert msg["result"]["entity_id"] not in {entity.id, entity.unique_id}
+
+
+async def test_node_details_resolves_every_snapshot_node(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """
+    Every node id a snapshot hands out resolves, hashed or not, to its own record.
+
+    The ids come from the snapshot command rather than being recomputed here, so
+    this proves the two commands agree on node identity and on ``kind``.
+    """
+    _seed_details(init_integration)
+    client = await hass_ws_client(hass)
+    nodes = (await _snapshot(client, init_integration))["nodes"]
+
+    hashed = {node["name"] for node in nodes if node["id"][4:5] == "h"}
+    assert hashed == {"Switch", "Printer"}
+    results: dict[str, dict[str, Any]] = {}
+    for index, node in enumerate(nodes, start=2):
+        msg = await _node_details(client, init_integration, node["id"], msg_id=index)
+        assert msg["success"], (node, msg)
+        assert msg["result"]["kind"] == node["kind"]
+        results[node["name"]] = msg["result"]
+
+    assert {name: result["kind"] for name, result in results.items()} == {
+        "Gateway": "gateway",
+        "AP": "access_point",
+        "Switch": "switch",
+        "Phone": "client",
+        "Laptop": "client",
+        "Printer": "client",
+    }
+    assert {name: result["ip_address"] for name, result in results.items()} == {
+        "Gateway": GW_IP,
+        "AP": AP_IP,
+        "Switch": SWITCH_IP,
+        "Phone": PHONE_IP,
+        "Laptop": LAPTOP_IP,
+        "Printer": PRINTER_IP,
+    }
+    assert {name: result["mac_address"] for name, result in results.items()} == {
+        "Gateway": GW_MAC,
+        "AP": AP_MAC,
+        "Switch": SWITCH_MAC,
+        "Phone": PHONE_MAC,
+        "Laptop": LAPTOP_MAC,
+        "Printer": PRINTER_MAC,
+    }
+    # Nothing is registered, so no target is guessed for any node.
+    assert all(
+        not {"device_id", "entity_id"} & result.keys() for result in results.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected_ip", "expected_mac"),
+    [
+        pytest.param(
+            {"ipAddress": "10.9.0.1", "macAddress": "aa:00:00:00:00:01"},
+            "10.9.0.1",
+            "aa:00:00:00:00:01",
+            id="camel-case",
+        ),
+        pytest.param(
+            {"ip_address": "10.9.0.2", "mac_address": "aa:00:00:00:00:02"},
+            "10.9.0.2",
+            "aa:00:00:00:00:02",
+            id="snake-case",
+        ),
+        pytest.param(
+            {"ipAddress": "10.9.0.6", "macAddress": "AA:BC:DE:00:00:06"},
+            "10.9.0.6",
+            "aa:bc:de:00:00:06",
+            id="uppercase-mac",
+        ),
+        pytest.param(
+            {"ip": "10.9.0.3", "mac": "aa:00:00:00:00:03"},
+            "10.9.0.3",
+            "aa:00:00:00:00:03",
+            id="bare",
+        ),
+        pytest.param(
+            {"ipAddress": "10.9.0.4", "ip": "10.9.9.9"},
+            "10.9.0.4",
+            None,
+            id="first-spelling-wins",
+        ),
+        pytest.param(
+            {"ipAddress": None, "ip": "10.9.0.5", "macAddress": None, "mac": "aa:5"},
+            "10.9.0.5",
+            "aa:5",
+            id="null-falls-through",
+        ),
+        pytest.param({}, None, None, id="absent"),
+        pytest.param({"ipAddress": None, "macAddress": None}, None, None, id="null"),
+        pytest.param({"ipAddress": "", "macAddress": ""}, None, None, id="empty"),
+        pytest.param({"ipAddress": "  ", "macAddress": " "}, None, None, id="blank"),
+        pytest.param(
+            {"ipAddress": 10, "macAddress": ["aa"]}, None, None, id="non-string"
+        ),
+    ],
+)
+async def test_node_details_values_follow_get_field_and_omit_absent(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    *,
+    fields: dict[str, Any],
+    expected_ip: str | None,
+    expected_mac: str | None,
+) -> None:
+    """Raw values come through get_field(); an absent value omits its key."""
+    data = _seed_details(init_integration)
+    devices = data["devices"][SITE]
+    spellings = {"ipAddress", "ip_address", "ip", "macAddress", "mac_address", "mac"}
+    record = {k: v for k, v in devices["uuid-gw"].items() if k not in spellings}
+    data["devices"][SITE] = {**devices, "uuid-gw": {**record, **fields}}
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "dev:uuid-gw")
+
+    assert msg["success"], msg
+    expected: dict[str, str] = {"kind": "gateway"}
+    if expected_ip is not None:
+        expected["ip_address"] = expected_ip
+    if expected_mac is not None:
+        expected["mac_address"] = expected_mac
+    assert msg["result"] == expected
+
+
+async def test_node_details_client_on_standalone_device(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """An HMAC client resolves its standalone device and tracker."""
+    data = _seed_details(init_integration)
+    laptop_record = data["clients"][SITE].pop("cli-2")
+    data["clients"][SITE][LAPTOP_MAC] = laptop_record
+    tracker = _real_tracker(init_integration, LAPTOP_MAC)
+    assert tracker.device_info["identifiers"] == {(DOMAIN, f"client_{LAPTOP_MAC}")}
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers=tracker.device_info["identifiers"],
+    )
+    registered = _register_tracker(
+        hass, init_integration, tracker.unique_id, device_id=device.id
+    )
+    client = await hass_ws_client(hass)
+    nodes = (await _snapshot(client, init_integration))["nodes"]
+    (laptop,) = [node for node in nodes if node["name"] == "Laptop"]
+    assert laptop["id"].startswith("cli:h")
+
+    msg = await _node_details(client, init_integration, laptop["id"], msg_id=2)
+
+    assert msg["success"], msg
+    assert msg["result"] == {
+        "kind": "client",
+        "ip_address": LAPTOP_IP,
+        "mac_address": LAPTOP_MAC,
+        "device_id": device.id,
+        "entity_id": registered.entity_id,
+    }
+
+
+async def test_node_details_grouped_client_tracker_has_no_device(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A tracker grouped under its uplink AP never reports the AP as the client."""
+    _seed_details(init_integration)
+    tracker = _real_tracker(init_integration, PHONE_MAC)
+    assert tracker.device_info["identifiers"] == {(DOMAIN, f"{SITE}_uuid-ap")}
+    ap_device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers=tracker.device_info["identifiers"],
+    )
+    registered = _register_tracker(
+        hass, init_integration, tracker.unique_id, device_id=ap_device.id
+    )
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert msg["result"] == {
+        "kind": "client",
+        "ip_address": PHONE_IP,
+        "mac_address": PHONE_MAC,
+        "entity_id": registered.entity_id,
+    }
+    assert ap_device.id not in json.dumps(msg["result"])
+
+
+@pytest.mark.parametrize(
+    "unique_id",
+    [
+        pytest.param(f"{DOMAIN}_{PHONE_MAC}", id="current"),
+        pytest.param(PHONE_MAC, id="legacy-bare-mac"),
+        pytest.param(PHONE_MAC.upper(), id="legacy-api-spelling"),
+    ],
+)
+async def test_node_details_client_tracker_unique_id_formats(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    unique_id: str,
+) -> None:
+    """Current and legacy tracker unique ids both resolve to the client's tracker."""
+    _seed_details(init_integration)
+    registered = _register_tracker(hass, init_integration, unique_id)
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert msg["result"]["entity_id"] == registered.entity_id
+    assert "device_id" not in msg["result"]
+
+
+async def test_node_details_omits_ambiguous_legacy_tracker_matches(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Case-insensitive legacy matches are ambiguous even within one entry."""
+    _seed_details(init_integration)
+    _register_tracker(hass, init_integration, PHONE_MAC)
+    _register_tracker(hass, init_integration, PHONE_MAC.upper())
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert "entity_id" not in msg["result"]
+
+
+async def test_node_details_client_current_unique_id_takes_precedence(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """The current unique ID wins even when a legacy bare-MAC tracker exists."""
+    _seed_details(init_integration)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, f"client_{PHONE_MAC}")},
+    )
+    current = _register_tracker(
+        hass, init_integration, f"{DOMAIN}_{PHONE_MAC}", device_id=device.id
+    )
+    _register_tracker(hass, init_integration, PHONE_MAC.upper(), device_id=device.id)
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert msg["result"] == {
+        "kind": "client",
+        "ip_address": PHONE_IP,
+        "mac_address": PHONE_MAC,
+        "device_id": device.id,
+        "entity_id": current.entity_id,
+    }
+
+
+async def test_node_details_client_ignores_other_clients_and_non_trackers(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Only this client's tracker counts, not other MACs or non-tracker entities."""
+    _seed_details(init_integration)
+    _register_tracker(hass, init_integration, f"{DOMAIN}_{LAPTOP_MAC}")
+    # Same unique id, wrong domain: a sensor must never be offered as the tracker.
+    er.async_get(hass).async_get_or_create(
+        "sensor", DOMAIN, f"{DOMAIN}_{PHONE_MAC}", config_entry=init_integration
+    )
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert "entity_id" not in msg["result"]
+    assert "device_id" not in msg["result"]
+
+
+async def test_node_details_client_without_mac_has_no_targets(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A client record with no MAC returns its other fields and no targets."""
+    data = _seed_details(init_integration)
+    clients = data["clients"][SITE]
+    data["clients"][SITE] = {
+        **clients,
+        "cli-1": {
+            key: value
+            for key, value in clients["cli-1"].items()
+            if key not in {"macAddress", "mac", "mac_address"}
+        },
+    }
+    _register_tracker(hass, init_integration, f"{DOMAIN}_{PHONE_MAC}")
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert msg["result"] == {"kind": "client", "ip_address": PHONE_IP}
+
+
+async def test_node_details_registry_rows_of_other_entries_are_not_returned(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Registry rows owned by another config entry are never a node's target."""
+    _seed_details(init_integration)
+    other = _foreign_entry(hass)
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+    foreign_gw = device_registry.async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={(DOMAIN, f"{SITE}_uuid-gw")}
+    )
+    entity_registry.async_get_or_create(
+        "binary_sensor",
+        DOMAIN,
+        f"{SITE}_uuid-gw_device_status",
+        config_entry=other,
+        device_id=foreign_gw.id,
+    )
+    foreign_client = device_registry.async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={(DOMAIN, f"client_{PHONE_MAC}")}
+    )
+    _register_tracker(hass, other, f"{DOMAIN}_{PHONE_MAC}", device_id=foreign_client.id)
+    client = await hass_ws_client(hass)
+    gateway_only = {"kind": "gateway", "ip_address": GW_IP, "mac_address": GW_MAC}
+    phone_only = {"kind": "client", "ip_address": PHONE_IP, "mac_address": PHONE_MAC}
+
+    gateway = await _node_details(client, init_integration, "dev:uuid-gw", msg_id=1)
+    phone = await _node_details(client, init_integration, "cli:cli-1", msg_id=2)
+
+    assert gateway["result"] == gateway_only
+    assert phone["result"] == phone_only
+
+
+async def test_node_details_checks_membership_of_every_device_lookup(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """
+    A device the lookup helper returns must still belong to this config entry.
+
+    The helper's fallback branches (older Home Assistant) match on identifier
+    alone, so they can hand back another entry's device. Simulate that by making
+    the lookup return foreign devices, and check neither node kind reports them.
+    """
+    _seed_details(init_integration)
+    other = _foreign_entry(hass)
+    device_registry = dr.async_get(hass)
+    foreign_gw = device_registry.async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={(DOMAIN, f"{SITE}_uuid-gw")}
+    )
+    foreign_client = device_registry.async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={(DOMAIN, f"client_{PHONE_MAC}")}
+    )
+    # This entry's own tracker points at the foreign device, so the lookup result
+    # and the tracker agree and only the membership check can reject it.
+    _register_tracker(
+        hass, init_integration, f"{DOMAIN}_{PHONE_MAC}", device_id=foreign_client.id
+    )
+    client = await hass_ws_client(hass)
+
+    with patch(
+        "custom_components.unifi_insights.websocket_api.async_get_device_entry",
+        side_effect=[foreign_gw, foreign_client],
+    ) as lookup:
+        gateway = await _node_details(client, init_integration, "dev:uuid-gw", msg_id=1)
+        phone = await _node_details(client, init_integration, "cli:cli-1", msg_id=2)
+
+    assert lookup.call_count == 2
+    assert "device_id" not in gateway["result"]
+    assert "device_id" not in phone["result"]
+    assert phone["result"]["entity_id"].startswith("device_tracker.")
+
+
+def test_device_in_entry_reads_whichever_ownership_the_device_has() -> None:
+    """Single-entry devices (HA 2026.9+) and multi-entry devices are both handled."""
+    single = SimpleNamespace(config_entry_id="entry-a")
+    multi = SimpleNamespace(config_entries={"entry-a", "entry-b"})
+
+    assert _device_in_entry(single, "entry-a")
+    assert not _device_in_entry(single, "entry-b")
+    assert _device_in_entry(multi, "entry-b")
+    assert not _device_in_entry(multi, "entry-c")
+
+
+@pytest.mark.parametrize("field", ["entry_id", "site_id", "node_id"])
+@pytest.mark.parametrize("invalid", [False, True])
+async def test_node_details_schema_rejects_missing_or_invalid_fields(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    field: str,
+    *,
+    invalid: bool,
+) -> None:
+    """Native HA schemas require each identity field to be a string."""
+    client = await hass_ws_client(hass)
+    request = {
+        "id": 1,
+        "type": "unifi_insights/topology/node_details",
+        "entry_id": init_integration.entry_id,
+        "site_id": SITE,
+        "node_id": "dev:uuid-gw",
+    }
+    if invalid:
+        request[field] = 42
+    else:
+        del request[field]
+    await client.send_json(request)
+    response = await client.receive_json()
+
+    assert not response["success"]
+    assert response["error"]["code"] == "invalid_format"
+    assert "result" not in response
+
+
+async def test_node_details_requires_admin(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    hass_read_only_access_token: str,
+) -> None:
+    """A non-admin gets Home Assistant's unauthorized error and no identity data."""
+    _seed_details(init_integration)
+    client = await hass_ws_client(hass, hass_read_only_access_token)
+
+    msg = await _node_details(client, init_integration, "dev:uuid-gw")
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "unauthorized"
+    assert "result" not in msg
+    assert GW_IP not in str(msg)
+    assert GW_MAC not in str(msg)
+
+
+async def test_node_details_errors(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Entry, site and node failures are reported by code."""
+    data = _seed_details(init_integration)
+    # Another site holds a device the requested site does not have.
+    data["devices"] = {
+        **data["devices"],
+        "site-2": {"uuid-other": {"id": "uuid-other", "name": "Elsewhere"}},
+    }
+    # Two ids that normalise to one MAC share a node id, so it names two nodes.
+    dup_a, dup_b = "aa:bb:cc:dd:ee:01", "AA-BB-CC-DD-EE-01"
+    data["devices"][SITE] = {
+        **data["devices"][SITE],
+        dup_a: {"id": dup_a, "name": "Twin A"},
+        dup_b: {"id": dup_b, "name": "Twin B"},
+        "junk": "not a device record",
+    }
+    client = await hass_ws_client(hass)
+    nodes = (await _snapshot(client, init_integration))["nodes"]
+    twin_ids = {node["id"] for node in nodes if node["name"].startswith("Twin")}
+    assert len(twin_ids) == 1
+    (twin_id,) = twin_ids
+    message_ids = itertools.count(2)
+
+    async def _error(node_id: str, **kwargs: str) -> str:
+        msg = await _node_details(
+            client, init_integration, node_id, msg_id=next(message_ids), **kwargs
+        )
+        assert not msg["success"], msg
+        assert "result" not in msg
+        return msg["error"]["code"]
+
+    other_domain = MockConfigEntryForTest(domain="other_domain")
+    other_domain.add_to_hass(hass)
+
+    assert await _error("dev:uuid-gw", entry_id="nope") == "entry_not_found"
+    foreign = await _error("dev:uuid-gw", entry_id=other_domain.entry_id)
+    assert foreign == "entry_not_found"
+    assert await _error("dev:uuid-gw", site_id="site-9") == "site_not_selected"
+    assert await _error("dev:does-not-exist") == "node_not_found"
+    assert await _error("uuid-gw") == "node_not_found"
+    assert await _error("dev:uuid-other") == "node_not_found"
+    assert await _error("cli:uuid-gw") == "node_not_found"
+    assert await _error("dev:cli-1") == "node_not_found"
+    assert await _error(twin_id) == "node_not_found"
+    assert await _error("dev:junk") == "node_not_found"
+
+    # A node that left the coordinator data after the card rendered is stale.
+    devices = data["devices"][SITE]
+    data["devices"][SITE] = {k: v for k, v in devices.items() if k != "uuid-ap"}
+    assert await _error("dev:uuid-ap") == "node_not_found"
+    ok = await _node_details(
+        client, init_integration, "dev:uuid-gw", msg_id=next(message_ids)
+    )
+    assert ok["success"], ok
+
+
+async def test_node_details_node_of_another_selected_site_is_not_found(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A node id of one selected site cannot be read through another site."""
+    data = _seed_details(init_integration)
+    runtime = init_integration.runtime_data
+    second = {"site-2": {"id": "site-2", "name": "Branch"}}
+    runtime.config_coordinator.data["sites"] = {
+        **runtime.config_coordinator.data["sites"],
+        **second,
+    }
+    data["sites"] = {**data["sites"], **second}
+    data["devices"] = {
+        **data["devices"],
+        "site-2": {"uuid-branch": {"id": "uuid-branch", "ipAddress": "10.7.0.1"}},
+    }
+    client = await hass_ws_client(hass)
+
+    own = await _node_details(
+        client, init_integration, "dev:uuid-branch", site_id="site-2"
+    )
+    crossed = await _node_details(
+        client, init_integration, "dev:uuid-branch", msg_id=2, site_id=SITE
+    )
+
+    assert own["success"], own
+    assert own["result"]["ip_address"] == "10.7.0.1"
+    assert not crossed["success"]
+    assert crossed["error"]["code"] == "node_not_found"
+
+
+async def test_node_details_handles_missing_sections(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """Missing or malformed device and client sections resolve to node_not_found."""
+    data = _seed_details(init_integration)
+    data["clients"] = None
+    data["devices"] = {SITE: None}
+    client = await hass_ws_client(hass)
+
+    for msg_id, node_id in ((1, "dev:uuid-gw"), (2, "cli:cli-1")):
+        msg = await _node_details(client, init_integration, node_id, msg_id=msg_id)
+        assert not msg["success"], msg
+        assert msg["error"]["code"] == "node_not_found"
+
+
+async def test_node_details_entry_not_loaded(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """An unloaded entry has no coordinator data to resolve nodes from."""
+    _seed_details(init_integration)
+    client = await hass_ws_client(hass)
+    await hass.config_entries.async_unload(init_integration.entry_id)
+    await hass.async_block_till_done()
+
+    msg = await _node_details(client, init_integration, "dev:uuid-gw")
+
+    assert not msg["success"]
+    assert msg["error"]["code"] == "entry_not_loaded"
+
+
+async def test_snapshot_commands_still_exclude_ip_and_mac(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """get and subscribe keep omitting addresses now that node_details serves them."""
+    _seed_details(init_integration)
+    client = await hass_ws_client(hass)
+    got = await _snapshot(client, init_integration)
+    # node_details is the only place an address may appear.
+    details = await _node_details(client, init_integration, "dev:uuid-gw", msg_id=2)
+    assert details["result"]["ip_address"] == GW_IP
+    event = await _subscribe(client, init_integration, msg_id=3)
+
+    for payload in (got, event):
+        assert len(payload["nodes"]) == 6
+        text = json.dumps(payload).lower()
+        for value in SENSITIVE_VALUES:
+            assert value.lower() not in text, value
+        assert all(
+            not {"ip_address", "mac_address"} & node.keys() for node in payload["nodes"]
+        )
+
+
+@pytest.mark.parametrize("tracker_on_uplink", [False, True])
+async def test_node_details_client_device_resolves_independently_of_tracker(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    *,
+    tracker_on_uplink: bool,
+) -> None:
+    """Only the standalone identifier determines the client device target."""
+    _seed_details(init_integration)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=init_integration.entry_id,
+        identifiers={(DOMAIN, f"client_{PHONE_MAC}")},
+    )
+    expected = {
+        "kind": "client",
+        "ip_address": PHONE_IP,
+        "mac_address": PHONE_MAC,
+        "device_id": device.id,
+    }
+    if tracker_on_uplink:
+        uplink = dr.async_get(hass).async_get_or_create(
+            config_entry_id=init_integration.entry_id,
+            identifiers={(DOMAIN, f"{SITE}_uuid-ap")},
+        )
+        tracker = _register_tracker(
+            hass, init_integration, f"{DOMAIN}_{PHONE_MAC}", device_id=uplink.id
+        )
+        expected["entity_id"] = tracker.entity_id
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert msg["result"] == expected
+
+
+async def test_node_details_foreign_current_tracker_falls_back_to_own_legacy(
+    hass: HomeAssistant, init_integration: MockConfigEntry, hass_ws_client
+) -> None:
+    """A foreign current tracker does not hide this entry's legacy tracker."""
+    _seed_details(init_integration)
+    other = _foreign_entry(hass)
+    _register_tracker(hass, other, f"{DOMAIN}_{PHONE_MAC}")
+    legacy = _register_tracker(hass, init_integration, PHONE_MAC)
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, "cli:cli-1")
+
+    assert msg["success"], msg
+    assert msg["result"] == {
+        "kind": "client",
+        "ip_address": PHONE_IP,
+        "mac_address": PHONE_MAC,
+        "entity_id": legacy.entity_id,
+    }
+
+
+@pytest.mark.parametrize(
+    "node_id", ["group:dev:uuid-ap", "group:root", "group:unconnected"]
+)
+async def test_node_details_group_ids_are_not_found(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    hass_ws_client,
+    node_id: str,
+) -> None:
+    """Synthetic frontend group IDs never resolve to source records."""
+    _seed_details(init_integration)
+    client = await hass_ws_client(hass)
+
+    msg = await _node_details(client, init_integration, node_id)
+
+    assert not msg["success"], msg
+    assert msg["error"]["code"] == "node_not_found"
+    assert "result" not in msg

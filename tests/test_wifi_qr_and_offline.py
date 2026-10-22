@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Unit tests for WiFi QR payloads and per-SSID counts.
 
 Covers the pure-logic helpers behind issues #49 and #52, none of which
@@ -60,7 +61,7 @@ class TestEnrichWifi:
 
         wifi = wifi_dict["w1"]
         assert wifi["num_connected_clients"] == 2
-        assert wifi["passphrase"] == "secret"
+        assert wifi["passphrase"] == legacy[0]["x_passphrase"]
         assert wifi["qr_code"] == "WIFI:T:WPA;S:Home;P:secret;;"
 
     def test_enrich_without_matching_config(self) -> None:

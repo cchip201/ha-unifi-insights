@@ -9,15 +9,29 @@ from .chime import Chime
 from .doorlock import DoorLock
 from .event import Event, EventType
 from .files import ApplicationInfo, DeviceFile, FileType, RTSPSStream, TalkbackSession
-from .fob import Fob
+from .fob import Fob, FobArmControlSettings, FobKeypadSettings
 from .light import Light, LightMode
-from .link_station import AlarmHub, LinkStation
+from .link_station import (
+    AlarmHub,
+    LinkStation,
+    LinkStationThreadNetwork,
+    LinkStationThreadState,
+)
 from .liveview import LiveView
 from .nvr import NVR
+from .pos import (
+    PosLineItem,
+    PosLocation,
+    PosTransactionRequest,
+    PosTransactionResponse,
+    PosTransactionType,
+)
 from .relay import Relay
 from .sensor import BatteryStatus, Sensor, SensorType
 from .siren import Siren
 from .speaker import Speaker
+from .ulp_user import UlpUser, UlpUserStatus
+from .user import User
 from .viewer import Viewer, ViewerState
 from .viewport import Viewport
 
@@ -48,15 +62,25 @@ __all__ = [
     "EventType",
     # Fob
     "Fob",
+    "FobArmControlSettings",
+    "FobKeypadSettings",
     # Light
     "Light",
     "LightMode",
     # Link station
     "LinkStation",
+    "LinkStationThreadNetwork",
+    "LinkStationThreadState",
     # LiveView
     "LiveView",
     # NVR
     "NVR",
+    # POS
+    "PosLineItem",
+    "PosLocation",
+    "PosTransactionRequest",
+    "PosTransactionResponse",
+    "PosTransactionType",
     # Relay
     "Relay",
     # Sensor
@@ -67,6 +91,10 @@ __all__ = [
     "Siren",
     # Speaker
     "Speaker",
+    # User / UlpUser
+    "UlpUser",
+    "UlpUserStatus",
+    "User",
     # Viewer
     "Viewer",
     "ViewerState",

@@ -1,5 +1,21 @@
 # AI Agent Instructions
 
+## Mandatory Development Workflow for AI Agents
+
+All AI coding assistants (Claude Code, Gemini, GitHub Copilot, Cursor, Roo, Devin, etc.) MUST strictly adhere to the following workflow when working on this repository:
+
+1. Issue-First Requirement: Never start writing code or creating pull requests without an existing GitHub Issue.
+2. Issue Template: Issues must be created using the official Issue Forms (`01-bug-report.yml` for bugs or `02-enhancement-request.yml` for enhancements).
+3. CodeRabbit AI Plan: Every issue must have a generated Coding Plan from CodeRabbit AI (`@coderabbitai plan`). AI agents must read and implement strictly according to the approved plan.
+4. Branch Discipline: Always create and work on a dedicated branch (`feat/<issue-id>-<description>` or `fix/<issue-id>-<description>`). NEVER commit directly to `main`.
+5. Documentation & Changelog: Update `CHANGELOG.md` under `## [Unreleased]` for any user-facing or architectural changes.
+6. Local Verification: Run all test, lint, format, and typecheck commands locally before committing. All tests must pass with zero errors and zero warnings.
+7. PR Template Completion: Always use `.github/pull_request_template.md`. Complete all fields, link the issue using `Closes #<id>` or `Fixes #<id>` when the PR fully resolves it, or `Part of #<id>` for partial work (only maintainers with write access may write `None`, for housekeeping), and check all Pre-Submission Governance boxes with real terminal output.
+8. Draft PR First: ALWAYS open pull requests as DRAFT (`gh pr create --draft`).
+9. CI Verification: Wait for CI workflows to run on the draft PR and verify that all status checks pass.
+10. Ready for Review: Only mark the PR as ready for review (`gh pr ready`) once all checks pass and all due diligence is verified.
+11. Review Clearance: Review and resolve all CodeRabbit AI and GitHub Copilot comments. Ensure Codecov reports show zero errors, zero warnings, and no coverage drop.
+
 This document provides guidance for AI coding agents working on this Home Assistant custom integration project.
 
 ## Project Overview
@@ -11,7 +27,7 @@ This is **UniFi Insights**, a Home Assistant custom integration that provides mo
 - **Domain:** `unifi_insights`
 - **Title:** UniFi Insights
 - **Class prefix:** `UnifiInsights`
-- **Repository:** ruaan-deysel/ha-unifi-insights
+- **Repository:** tinkerologie/ha-unifi-insights
 
 **Key directories:**
 
@@ -151,7 +167,7 @@ pre-commit run --all-files
 ruff check .          # Linting
 ruff format .         # Formatting
 mypy custom_components/unifi_insights   # Type checking
-pytest                # Tests (90% minimum coverage)
+pytest                # Tests (95% total coverage enforced locally)
 ```
 
 **Shortcut scripts:**
@@ -343,7 +359,7 @@ See `.github/instructions/repairs.instructions.md` for comprehensive patterns.
 ```bash
 pre-commit run --all-files   # Full validation
 script/lint                   # Auto-format and fix linting
-pytest                        # Run unit tests (90% minimum coverage)
+pytest                        # Run unit tests (95% total coverage enforced locally)
 cd frontend && npm ci          # Topology card: install (Node 22)
 npm run lint && npm run typecheck && npm test -- --coverage
 npm run build                  # Rebuild custom_components/unifi_insights/frontend/topology-card.js — commit it
@@ -382,7 +398,9 @@ Aim for zero validation errors in generated code.
 - `tests/` mirrors `custom_components/unifi_insights/` structure
 - Use fixtures for common setup (Home Assistant mock, coordinator, etc.)
 - Mock external API calls
-- 90% minimum coverage required (branch coverage enabled)
+- Every module, including the vendored `api/` client, must be ≥95% (branch coverage enabled, checked per file in CI with `python script/check_coverage_per_file.py coverage.xml --fail-under 95`)
+
+Local `pytest` enforces only the 95% total coverage threshold. To check per-file coverage locally, run `pytest --cov-report=xml`, then `python script/check_coverage_per_file.py coverage.xml --fail-under 95`.
 
 **Running tests:**
 
@@ -499,3 +517,41 @@ See `.github/instructions/tests.instructions.md` for comprehensive testing patte
 - [Ruff Rules](https://docs.astral.sh/ruff/rules/) — Linter documentation
 - [pytest Documentation](https://docs.pytest.org/) — Testing framework
 - See `CONTRIBUTING.md` for contribution guidelines
+
+## Issue and Pull Request Governance
+
+These rules apply to every contributor, including AI coding agents. The full org-wide rules are in
+[GOVERNANCE.md](https://github.com/tinkerologie/.github/blob/main/GOVERNANCE.md).
+
+1. **Issue first.** Open an issue with the bug or enhancement template before opening a pull
+   request. Keep the title prefix `[Bug]:` or `[Enhancement]:`, followed by a space and the title.
+   Automation applies the `bug` or `enhancement` label when it can tell the type, and CodeRabbit
+   then posts a Coding Plan on the issue. Implement from that plan. The labeler skips issues labeled
+   `question`, `duplicate`, `invalid`, `wontfix`, or `no-type`, and never re-adds a type label that
+   a maintainer removed.
+2. **Link the issue.** In the PR's **Related Issues** section, write `Closes #<number>` (or `Fixes`
+   or `Resolves`) when the PR completely resolves the issue; these keywords close it on merge. Use
+   `Part of #<number>` or `Related to #<number>` for partial work. The linked issue must exist; an
+   issue in another public repository (`owner/repo#123`) is fine. Only authors with write access or
+   higher (maintainers) may write `None`, for housekeeping such as CI,
+   documentation, or dependency updates; PR governance rejects `None` from everyone else.
+3. **One change at a time.** Contributors without write access can have at most 2 open, non-draft
+   pull requests here. GitHub enforces this limit, and draft pull requests do not count toward it.
+   Do not open PRs that edit the same files as another open PR, such as `CHANGELOG.md`,
+   translations, `README.md`, or generated bundles. Wait for the first to merge, rebase, then
+   continue.
+4. **Act on the Tinkerologie-Bot report.** When PR governance fails, Tinkerologie-Bot posts one comment
+   listing every problem as a numbered item. Fix each item by editing the PR description or pushing
+   the missing change; the check re-runs and the comment updates to passed.
+5. **Rebase before review.** Rebase on `main` before marking a PR ready for review.
+6. **Resolve conflicts first.** When a PR gets the `conflicts` label, rebase on `main`,
+   resolve the conflicts (keep every `CHANGELOG.md` entry under `[Unreleased]`), re-run the tests,
+   and force-push before doing any other work.
+7. **Coverage.** `codecov/patch` must pass: at least 90% of added or changed lines must be
+   covered by tests. The gate is the percentage; still, add tests for the uncovered lines the
+   Codecov PR comment lists, and explain in the PR description any line you leave uncovered. Do
+   not lower coverage targets or add coverage ignore rules to make it pass.
+8. **Stale items.** Issues and PRs with no activity for 14 days are labeled `stale` and closed 30
+   days later unless there is new activity. These labels are exempt:
+   - Issues: `pinned`, `security`, `confirmed`, `work-in-progress`, `priority: critical`, `priority: high`.
+   - Pull requests: `pinned`, `security`, `work-in-progress`.

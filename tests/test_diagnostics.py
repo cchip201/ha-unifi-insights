@@ -1,26 +1,48 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for the UniFi Insights diagnostics."""
 
 from __future__ import annotations
 
+import copy
+import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
 
 import pytest
 from homeassistant.components.diagnostics.const import REDACTED
+from homeassistant.const import CONF_API_KEY
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.unifi_insights.api import __version__
+from custom_components.unifi_insights.api.const import SENSITIVE_CREDENTIAL_KEYS
 from custom_components.unifi_insights.api.network.models.client import Client
+from custom_components.unifi_insights.const import (
+    CONF_ACCESS_WEBHOOK_ENDPOINT_ID,
+    CONF_ACCESS_WEBHOOK_ID,
+    CONF_ACCESS_WEBHOOK_SECRET,
+)
 from custom_components.unifi_insights.coordinators.config import (
     UnifiConfigCoordinator,
 )
 from custom_components.unifi_insights.diagnostics import (
+    TO_REDACT,
     _redact_coordinator_data,
     async_get_config_entry_diagnostics,
+)
+from tests.fixtures.library_responses import (
+    SAMPLE_ALARM_HUB,
+    SAMPLE_ALARM_HUB_TAMPER_EVENT,
+    SAMPLE_SIREN,
+    SAMPLE_THREAD_LINK_STATION,
+)
+from tests.fixtures.network_rule_responses import (
+    nat_rule_record,
+    port_forward_record,
+    static_route_record,
+    traffic_rule_record,
 )
 
 
@@ -408,6 +430,58 @@ async def test_diagnostics_redacts_wifi_ssid(
     assert "Sarah and Tom 5G" not in _strings(diagnostics)
 
 
+async def test_diagnostics_redacts_voucher_codes_and_notes(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test voucher codes and notes are redacted in vouchers and latest_vouchers."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["vouchers"] = {
+        "site-1": {
+            "v-1": {
+                "id": "v-1",
+                "code": "secret-code-123",
+                "name": "Guest John",
+                "note": "Secret Guest Note",
+                "timeLimitMinutes": 480,
+                "expired": False,
+            }
+        }
+    }
+    coordinator.data["latest_vouchers"] = {
+        "site-1": {
+            "id": "v-1",
+            "code": "secret-code-123",
+            "name": "Guest John",
+            "note": "Secret Guest Note",
+            "timeLimitMinutes": 480,
+            "expired": False,
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+    voucher = diagnostics["data"]["vouchers"]["site-1"]["v-1"]
+    latest = diagnostics["data"]["latest_vouchers"]["site-1"]
+
+    assert voucher["code"] == REDACTED
+    assert voucher["name"] == REDACTED
+    assert voucher["note"] == REDACTED
+    assert voucher["timeLimitMinutes"] == 480
+    assert voucher["expired"] is False
+
+    assert latest["code"] == REDACTED
+    assert latest["name"] == REDACTED
+    assert latest["note"] == REDACTED
+    assert latest["timeLimitMinutes"] == 480
+    assert latest["expired"] is False
+
+    all_diag_strings = _strings(diagnostics)
+    assert "secret-code-123" not in all_diag_strings
+    assert "Guest John" not in all_diag_strings
+    assert "Secret Guest Note" not in all_diag_strings
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -416,6 +490,8 @@ async def test_diagnostics_redacts_wifi_ssid(
         {"clients": "not-a-mapping", "wifi": None},
         {"stats": {"site-1": None}},
         {"stats": {"site-1": {"device-1": {"uptime": 42}}}},
+        {"vouchers": "x", "latest_vouchers": None},
+        {"latest_vouchers": {"s": None}},
     ],
 )
 def test_redact_coordinator_data_tolerates_unexpected_shapes(data: Any) -> None:
@@ -425,6 +501,71 @@ def test_redact_coordinator_data_tolerates_unexpected_shapes(data: Any) -> None:
     has not loaded yet, or when a section is missing or shaped unexpectedly.
     """
     assert _redact_coordinator_data(data) == data
+
+
+def test_redact_coordinator_data_hides_thread_ids_and_tamper_user() -> None:
+    """Thread network ids identify the network; userName names a person."""
+    hub = {**copy.deepcopy(SAMPLE_ALARM_HUB), "_lastTamperUser": "Installer"}
+    data = {
+        "protect": {
+            "link_stations": {"ls": copy.deepcopy(SAMPLE_THREAD_LINK_STATION)},
+            "alarm_hubs": {"hub": hub},
+            "events": {
+                "alarmHubDeviceTamper": {
+                    "e1": copy.deepcopy(SAMPLE_ALARM_HUB_TAMPER_EVENT)
+                }
+            },
+        }
+    }
+
+    redacted = _redact_coordinator_data(data)
+
+    network = redacted["protect"]["link_stations"]["ls"]["threadState"]["network"]
+    for key in ("networkName", "panId", "extendedPanId"):
+        assert network[key] == REDACTED
+    assert network["role"] == "leader"
+    assert network["channel"] == 15
+    assert redacted["protect"]["alarm_hubs"]["hub"]["_lastTamperUser"] == REDACTED
+    event = redacted["protect"]["events"]["alarmHubDeviceTamper"]["e1"]
+    assert event["metadata"]["userName"] == REDACTED
+    text = str(redacted)
+    for secret in ("Installer", "Home Thread", "0011223344556677", "1a2b"):
+        assert secret not in text
+
+
+def test_redact_coordinator_data_keeps_siren_state_and_hides_ids() -> None:
+    """A siren record keeps the state worth debugging and loses its identifier."""
+    data = {"protect": {"sirens": {"siren_1": copy.deepcopy(SAMPLE_SIREN)}}}
+
+    redacted = _redact_coordinator_data(data)
+
+    siren = redacted["protect"]["sirens"]["siren_1"]
+    assert siren["id"] == REDACTED
+    assert siren["sirenStatus"] == {
+        "isActive": False,
+        "activatedAt": None,
+        "duration": None,
+    }
+    assert siren["volume"] == 50
+    assert siren["name"] == "Garage Siren"
+    assert siren["state"] == "CONNECTED"
+
+
+async def test_diagnostics_pseudonymizes_siren_mac(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """A siren's MAC reaches the report only as a placeholder."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["protect"]["sirens"] = {"siren_1": copy.deepcopy(SAMPLE_SIREN)}
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    siren = diagnostics["data"]["protect"]["sirens"]["siren_1"]
+    assert siren["mac"].startswith("**REDACTED-MAC-")
+    assert siren["id"] == REDACTED
+    assert "AABBCC000005" not in _strings(diagnostics)
 
 
 async def test_diagnostics_redacts_unpunctuated_macs_anywhere(
@@ -560,3 +701,317 @@ async def test_diagnostics_placeholders_client_links(
     assert link["network_name"] == "Cameras"
     for raw in ("8c:ed:e1:00:00:01", "28:70:4e:00:00:01"):
         assert raw not in _strings(diagnostics)
+
+
+def test_redact_coordinator_data_keeps_nvr_arm_mode_status() -> None:
+    """An NVR record keeps the arm mode worth debugging and loses its identifier."""
+    data = {
+        "protect": {
+            "nvrs": {
+                "nvr_1": {
+                    "id": "nvr_1",
+                    "name": "UniFi Protect",
+                    "armMode": {
+                        "status": "breach",
+                        "armProfileId": "arm_profile_away",
+                        "armedAt": 1755916908659,
+                        "willBeArmedAt": None,
+                        "breachDetectedAt": 1755916999000,
+                        "breachEventCount": 2,
+                    },
+                }
+            }
+        }
+    }
+
+    redacted = _redact_coordinator_data(data)
+
+    nvr = redacted["protect"]["nvrs"]["nvr_1"]
+    assert nvr["id"] == REDACTED
+    assert nvr["armMode"] == data["protect"]["nvrs"]["nvr_1"]["armMode"]
+
+
+@pytest.mark.parametrize("enabled", [True, False, None])
+async def test_diagnostics_show_whether_the_global_alarm_manager_is_enabled(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+    *,
+    enabled: bool | None,
+) -> None:
+    """The flag that hides the alarm panel is in the report, so it can be checked."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["protect"]["global_alarm_manager"] = enabled
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    assert diagnostics["data"]["protect"]["global_alarm_manager"] is enabled
+
+
+async def test_diagnostics_redacts_port_forward_addresses(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics redacts port forward IP addresses but preserves rule info."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["port_forwards"] = {
+        "site-1": {
+            "pf-plex": port_forward_record(destination_ips=["203.0.113.8"]),
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "192.168.1.50" not in dumped
+    assert "198.51.100.0/24" not in dumped
+    assert "203.0.113.7" not in dumped
+    assert "203.0.113.8" not in dumped
+    assert "Plex" in dumped
+    assert "32400" in dumped
+    assert "tcp_udp" in dumped
+
+
+async def test_diagnostics_redacts_traffic_rule_targets(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics redacts traffic rule target domains, IPs and MACs."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["traffic_rules"] = {
+        "site-1": {
+            "tr-bedtime": traffic_rule_record(
+                ip_addresses=[
+                    {
+                        "ip_or_subnet": "203.0.113.9/32",
+                        "ip_version": "v4",
+                        "port_ranges": [],
+                        "ports": [],
+                    }
+                ]
+            ),
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "blocked.example" not in dumped
+    assert "192.168.1.100" not in dumped
+    assert "203.0.113.9" not in dumped
+    assert "aa:bb:cc:dd:ee:01" not in dumped
+    assert "Bedtime" in dumped
+    assert "BLOCK" in dumped
+
+
+async def test_diagnostics_redacts_nat_rule_addresses(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics redacts NAT rule translated and filter addresses."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["nat_rules"] = {
+        "site-1": {
+            "nat-dns": nat_rule_record(),
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "192.0.2.53" not in dumped
+    assert "192.0.2.54" not in dumped
+    assert "All DNS to resolver" in dumped
+    assert "DNAT" in dumped
+    assert "tcp_udp" in dumped
+
+
+async def test_diagnostics_redacts_static_route_targets(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics redacts static route networks, next hops and gateway MACs."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["static_routes"] = {
+        "site-1": {
+            "route-lab": static_route_record(**{"static-route_nexthop": "192.0.2.1"}),
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "192.168.2.0/24" not in dumped
+    assert "192.0.2.1" not in dumped
+    assert "aa:bb:cc:dd:ee:ff" not in dumped
+    assert "Lab" in dumped
+    assert "interface-route" in dumped
+
+
+async def test_diagnostics_redacts_firewall_policy_filters(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics redacts the nested address, domain and MAC filters."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["firewall_rules"] = {
+        "site-1": {
+            "f1": {
+                "id": "f1",
+                "name": "Block cameras",
+                "enabled": True,
+                "source": {
+                    "ipAddressFilter": {"items": [{"value": "10.3.3.3"}]},
+                    "macAddressFilter": {"macAddresses": ["aa:bb:cc:dd:ee:01"]},
+                },
+                "destination": {
+                    "domainFilter": {"domains": ["blocked.example"]},
+                    "portFilter": {"items": [{"value": 443}]},
+                },
+            }
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "10.3.3.3" not in dumped
+    assert "aa:bb:cc:dd:ee:01" not in dumped
+    assert "blocked.example" not in dumped
+    assert "Block cameras" in dumped
+    assert "443" in dumped
+
+
+async def test_diagnostics_redacts_policy_based_route_targets(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics redacts policy-based route domains, ranges and next hop."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["policy_based_routes"] = {
+        "site-1": {
+            "p1": {
+                "_id": "p1",
+                "description": "VPN",
+                "enabled": True,
+                "domains": [{"domain": "routed.example"}],
+                "ipRanges": [{"ip_start": "10.5.5.1"}],
+                "nextHop": "10.4.4.4",
+            }
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "routed.example" not in dumped
+    assert "10.5.5.1" not in dumped
+    assert "10.4.4.4" not in dumped
+    assert "VPN" in dumped
+
+
+async def test_diagnostics_anonymizes_dotted_client_mac(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations: None,
+) -> None:
+    """Test diagnostics anonymizes dotted client_mac in MAC_KEYS."""
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["traffic_rules"] = {
+        "site-1": {
+            "tr-1": {
+                "_id": "tr-1",
+                "target_devices": [{"client_mac": "aabb.ccdd.eeff", "type": "CLIENT"}],
+            }
+        }
+    }
+
+    result = await async_get_config_entry_diagnostics(hass, init_integration)
+    dumped = json.dumps(result, default=str)
+    assert "aabb.ccdd.eeff" not in dumped
+    rule = result["data"]["traffic_rules"]["site-1"]["tr-1"]
+    assert rule["target_devices"][0]["client_mac"].startswith("**REDACTED-MAC-")
+
+
+async def test_diagnostics_keeps_storage_mounts_readable(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    enable_custom_integrations,
+) -> None:
+    """Test storage_mounts on console devices remain readable in diagnostics."""
+    udm_storage = [
+        {
+            "mount_point": "/data",
+            "name": "eMMC",
+            "type": "eMMC",
+            "size": 4143677440,
+            "used": 1700257792,
+        },
+        {
+            "mount_point": "/persistent",
+            "name": "Backup",
+            "type": "eMMC",
+            "size": 2046640128,
+            "used": 318767104,
+        },
+        {
+            "mount_point": "/" + "tmp",
+            "name": "Temporary",
+            "type": "other",
+            "size": 1073741824,
+            "used": 1748992,
+        },
+    ]
+    coordinator = init_integration.runtime_data.coordinator
+    coordinator.data["devices"] = {
+        "site-1": {
+            "device-1": {
+                "id": "device-1",
+                "name": "Dream Machine Pro SE",
+                "model": "UDMPROSE",
+                "macAddress": "AA:BB:CC:77:88:99",
+                "storage_mounts": copy.deepcopy(udm_storage),
+            }
+        }
+    }
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, init_integration)
+
+    device = diagnostics["data"]["devices"]["site-1"]["device-1"]
+    assert device["storage_mounts"] == udm_storage
+
+
+def test_diagnostics_shared_credentials_policy_invariants() -> None:
+    """Verify shared credentials subset, aliases, x_* keys, and webhooks."""
+    # Shared credentials must be a subset of TO_REDACT
+    assert SENSITIVE_CREDENTIAL_KEYS.issubset(TO_REDACT)
+
+    # Token aliases
+    for key in ("accessToken", "access_token", "refreshToken", "refresh_token"):
+        assert key in TO_REDACT
+
+    # qr_code
+    assert "qr_code" in TO_REDACT
+
+    # Classic API x_* keys
+    for key in (
+        "x_passphrase",
+        "x_authkey",
+        "x_fingerprint",
+        "x_iapp_key",
+        "x_ssh_hostkey_fingerprint",
+        "x_vwirekey",
+    ):
+        assert key in TO_REDACT
+
+    # HA config and Access webhook constants
+    assert CONF_API_KEY in TO_REDACT
+    assert CONF_ACCESS_WEBHOOK_ID in TO_REDACT
+    assert CONF_ACCESS_WEBHOOK_ENDPOINT_ID in TO_REDACT
+    assert CONF_ACCESS_WEBHOOK_SECRET in TO_REDACT
+
+    # Transport-only keys must NOT be globally in TO_REDACT (code/pin contextual)
+    assert "code" not in TO_REDACT
+    assert "pin" not in TO_REDACT
+    assert "pin_code" not in TO_REDACT
+    assert "pin_codes" not in TO_REDACT

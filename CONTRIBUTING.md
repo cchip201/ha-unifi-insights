@@ -1,118 +1,177 @@
-# Contribution guidelines
+# Contributing to Home Assistant UniFi Insights Integration
 
-Contributing to this project should be as easy and transparent as possible, whether it's:
+Thank you for your interest in contributing to Home Assistant UniFi Insights Integration. This project welcomes contributions from human developers and autonomous AI coding agents alike.
 
-- Reporting a bug
-- Discussing the current state of the code
-- Submitting a fix
-- Proposing new features
+Home Assistant integration for UniFi Network and Protect telemetry, analytics, and device controls.
 
-## GitHub is used for everything
+To maintain code quality, protect maintainer capacity, and prevent maintainer burnout, all contributors must follow the standardized development and governance workflow outlined below.
 
-GitHub is used to host code, to track issues and feature requests, as well as accept pull requests.
+---
 
-Pull requests are the best way to propose changes to the codebase.
+## Code of Conduct and Standards
 
-1. Fork the repo and create your branch from `main`.
-2. Run `./script/setup/bootstrap` to install dependencies.
-3. If you've changed something, update the documentation.
-4. Make sure your code passes all checks (`pre-commit run --all-files`).
-5. Test your contribution (`pytest`).
-6. Issue that pull request!
+- Be respectful, constructive, and collaborative.
+- Zero secrets policy: Never commit passwords, tokens, API keys, private certificates, or personal data.
+- Anti-burnout principle: Perform full due diligence locally before opening pull requests or requesting review.
 
-## Any contributions you make will be under the Apache 2.0 License
+---
 
-In short, when you submit code changes, your submissions are understood to be under the same [Apache 2.0 License](http://www.apache.org/licenses/LICENSE-2.0) that covers the project. Feel free to contact the maintainers if that's a concern.
+## Development Workflow
 
-## Report bugs using GitHub's [issues](../../issues)
+All contributions—whether submitted by humans or AI agents—must adhere to this step-by-step workflow:
 
-GitHub issues are used to track public bugs.
-Report a bug by [opening a new issue](../../issues/new/choose); it's that easy!
+### 1. Open a GitHub Issue First
 
-## Write bug reports with detail, background, and sample code
+- Every bug fix, feature, or enhancement must start with an issue.
+- Use the appropriate GitHub Issue Form:
+  - Bug Report (`01-bug-report.yml`)
+  - Enhancement Request (`02-enhancement-request.yml`)
+- Blank or unstructured issues are disabled. Pull requests without a corresponding issue will be closed.
 
-**Great Bug Reports** tend to have:
+### 2. CodeRabbit AI Plan Generation
 
-- A quick summary and/or background
-- Steps to reproduce
-  - Be specific!
-  - Give sample code if you can.
-- What you expected would happen
-- What actually happens
-- Notes (possibly including why you think this might be happening, or stuff you tried that didn't work)
+- Once the issue is created, CodeRabbit AI is triggered to generate an implementation plan (either automatically via the `bug` or `enhancement` label, or by commenting `@coderabbitai plan` on the issue).
+- CodeRabbit analyzes the codebase and posts a comprehensive Coding Plan containing:
+  - Codebase research and affected components
+  - Architectural design choices
+  - Phased task breakdowns
+  - Machine-readable agent prompts and verifiable acceptance criteria
+- Contributors must review, refine, and confirm the plan before writing code. Do not start implementation without an approved plan.
 
-People _love_ thorough bug reports. I'm not even kidding.
+### 3. Create a Dedicated Branch
 
-## Use a Consistent Coding Style
+- Create a feature or bugfix branch off `main`:
+  - Features: `git checkout -b feat/<issue-number>-<short-description>`
+  - Fixes: `git checkout -b fix/<issue-number>-<short-description>`
+  - Documentation: `git checkout -b docs/<issue-number>-<short-description>`
+- Never commit directly to the default branch (`main`).
 
-This project uses:
+### 4. Implementation and Local Validation
 
-- [Ruff](https://github.com/astral-sh/ruff) for linting and formatting
-- [mypy](https://mypy.readthedocs.io/) for type checking (strict mode)
-- [Bandit](https://bandit.readthedocs.io/) for security scanning
+- Implement changes following project conventions and the approved plan.
+- Update `CHANGELOG.md` under `## [Unreleased]` describing what changed and why.
+- Run all required local validation checks (tests with coverage, linters, type checkers, and formatters). Ensure all checks pass with zero errors and zero warnings.
 
-Run `pre-commit run --all-files` to lint, format, and type-check your code before submitting, or `./script/lint` to auto-format and fix linting issues.
+### 5. Follow the Pull Request Template
 
-## AI Agent Support
+- Open a Pull Request using `.github/pull_request_template.md`.
+- Complete all sections in the template:
+  - Summary of changes
+  - Linked issue keywords (`Fixes #<issue>`, `Closes #<issue>`, `Addresses #<issue>`)
+  - Verification steps and pasted terminal output
+  - Mandatory Pre-Submission Governance checklist (every box must be checked)
 
-This project is **AI agents ready**. Whether you use GitHub Copilot, Claude Code, Gemini, or other AI coding assistants, the repository includes structured instructions to help you work efficiently.
+### 6. Open PR as DRAFT First
 
-### Agent instruction files
+- Pull requests MUST be opened in Draft mode (`gh pr create --draft` or choose "Create draft pull request" in GitHub).
+- Draft PRs allow CI workflows to run in isolation without triggering premature reviewer notifications or consuming unnecessary review capacity.
+- Verify that all CI checks pass in draft mode and confirm that everything is working as expected from your end.
 
-- **[`AGENTS.md`](AGENTS.md)** — Master instruction file (single source of truth for all AI agents)
-- **[`CLAUDE.md`](CLAUDE.md)** — Quick reference for Claude Code
-- **[`GEMINI.md`](GEMINI.md)** — Quick reference for Gemini
-- **[`.github/copilot-instructions.md`](.github/copilot-instructions.md)** — Auto-loaded by GitHub Copilot
+### 7. Mark Ready for Review
 
-### Path-specific instructions
+- Only after all local and draft CI checks have succeeded, convert the pull request to "Ready for Review".
+- Pull requests marked ready for review with failing checks, incomplete templates, or unverified changes will be converted back to draft or closed.
 
-The `.github/instructions/` directory contains context-aware instruction files that GitHub Copilot automatically loads based on the file you're editing. Other AI agents can reference these files manually for domain-specific guidance on Python patterns, entity platforms, coordinators, config flows, and more.
+### 8. Automated Quality Gates and Merge Criteria
 
-### Reusable prompt templates
+Before a pull request can be merged, it must satisfy all automated quality gates:
 
-The `.github/prompts/` directory contains reusable templates for common tasks:
+- CodeRabbit AI Review: All review comments and suggestions must be resolved or addressed.
+- GitHub Copilot Code Review: Must pass with no blocking feedback.
+- Codecov Coverage Reports: Must pass with zero errors, zero warnings, and no coverage regressions below the repository target.
+- Branch Ruleset Checks: All required status checks defined in the default branch ruleset must pass.
 
-- **Add New Sensor** — Create sensors with proper structure
-- **Add Action** — Implement service actions with validation
-- **Add Config Option** — Add configuration options to flows
-- **Add Entity to Device** — Expand device capabilities
-- **Debug Coordinator Issue** — Diagnose data update problems
-- **Update Translations** — Manage multilingual strings
-- **Review Integration** — Comprehensive quality review
+---
 
-**Example usage in Copilot Chat:**
+## Local Development and Verification
 
-```text
-#file:Add New Sensor.prompt.md Add a CPU temperature sensor for UniFi devices
+### Prerequisites and Setup
+
+- Python 3.14.2 or later
+- Virtual environment with dependencies installed (`script/setup/bootstrap` or `pip install -e ".[dev]" homeassistant`)
+- Pre-commit (`pre-commit install`)
+
+### Validation Commands
+
+```bash
+# Run tests with pytest and coverage
+pytest
+pytest --cov=custom_components --cov-report=term-missing
+
+# Linting and formatting with ruff
+ruff check .
+ruff format --check .
+
+# Static type checking
+mypy custom_components/unifi_insights
+
+# Run all pre-commit hooks across all files
+pre-commit run --all-files
 ```
 
-## Code Quality
+The mypy hook runs `./script/mypy`, which checks the full integration package
+with the project's installed Home Assistant dependencies. It uses `.venv`,
+`.local/ha-venv`, or the active virtual environment. Run the setup script first;
+an isolated mypy environment without HA cannot check its entity and schema types.
+Spelling and formatting hooks exclude the generated frontend bundles; validate
+their editable sources with the frontend checks and rebuild with `npm run build`.
 
-This integration follows Home Assistant's [integration quality standards](https://developers.home-assistant.io/docs/core/integration-quality-scale/) as best practices:
+---
 
-- Comprehensive type hints (mypy strict mode)
-- Full async patterns for all I/O
-- Config flow with reauth and reconfigure support
-- Multi-coordinator architecture for efficient data fetching
-- 90% minimum test coverage
+## Commit Message Guidelines
 
-## Pull Request Process
+We follow Conventional Commits:
 
-When submitting a pull request:
+- `feat(<scope>): <description>` — New feature
+- `fix(<scope>): <description>` — Bug fix
+- `docs(<scope>): <description>` — Documentation changes
+- `test(<scope>): <description>` — Adding or updating tests
+- `refactor(<scope>): <description>` — Code restructuring without functional change
+- `chore(<scope>): <description>` — Tooling, dependencies, or repository maintenance
 
-1. Create a descriptive feature/bugfix branch from `main`.
-2. Check the [UniFi Developer Portal](https://developer.ui.com/) for official API documentation, specifications, and latest capabilities offered to developers. The portal's HTML pages are JavaScript-rendered, so if you (or a coding agent) are fetching them programmatically, use the machine-readable endpoints instead: [`llms.txt`](https://developer.ui.com/llms.txt) for the API/version index, `https://developer.ui.com/{service}/{version}/openapi.json` for schemas, and [the Network AI primer](https://developer.ui.com/network/v10.4.57/ai-gettingstarted.md).
-3. Follow the checklist provided in the [Pull Request Template](.github/pull_request_template.md).
-4. Ensure all automated validation steps pass:
-   ```bash
-   script/lint                               # Linting & code formatting
-   mypy custom_components/unifi_insights     # Strict type checking
-   bandit -r custom_components/unifi_insights # Security scanning
-   pytest                                    # Unit tests (90% minimum coverage)
-   ```
-5. Verify your changes against a live Home Assistant instance (`./script/develop`).
-6. Update `CHANGELOG.md` under `[Unreleased]` with a clear, user-facing summary of your changes.
+---
 
-## License
+## Pull Request Governance Summary
 
-By contributing, you agree that your contributions will be licensed under its Apache 2.0 License.
+- No spam or back-to-back PRs: Batch related changes into a single PR.
+- AI-assisted PRs require human verification and local testing before submission.
+- All template checkboxes must be confirmed.
+- PRs must remain in Draft until verified.
+
+## Issue and Pull Request Governance
+
+These rules apply to every contributor, including AI coding agents. The full org-wide rules are in
+[GOVERNANCE.md](https://github.com/tinkerologie/.github/blob/main/GOVERNANCE.md).
+
+1. **Issue first.** Open an issue with the bug or enhancement template before opening a pull
+   request. Keep the title prefix `[Bug]:` or `[Enhancement]:`, followed by a space and the title.
+   Automation applies the `bug` or `enhancement` label when it can tell the type, and CodeRabbit
+   then posts a Coding Plan on the issue. Implement from that plan. The labeler skips issues labeled
+   `question`, `duplicate`, `invalid`, `wontfix`, or `no-type`, and never re-adds a type label that
+   a maintainer removed.
+2. **Link the issue.** In the PR's **Related Issues** section, write `Closes #<number>` (or `Fixes`
+   or `Resolves`) when the PR completely resolves the issue; these keywords close it on merge. Use
+   `Part of #<number>` or `Related to #<number>` for partial work. The linked issue must exist; an
+   issue in another public repository (`owner/repo#123`) is fine. Only authors with write access or
+   higher (maintainers) may write `None`, for housekeeping such as CI,
+   documentation, or dependency updates; PR governance rejects `None` from everyone else.
+3. **One change at a time.** Contributors without write access can have at most 2 open, non-draft
+   pull requests here. GitHub enforces this limit, and draft pull requests do not count toward it.
+   Do not open PRs that edit the same files as another open PR, such as `CHANGELOG.md`,
+   translations, `README.md`, or generated bundles. Wait for the first to merge, rebase, then
+   continue.
+4. **Act on the Tinkerologie-Bot report.** When PR governance fails, Tinkerologie-Bot posts one comment
+   listing every problem as a numbered item. Fix each item by editing the PR description or pushing
+   the missing change; the check re-runs and the comment updates to passed.
+5. **Rebase before review.** Rebase on `main` before marking a PR ready for review.
+6. **Resolve conflicts first.** When a PR gets the `conflicts` label, rebase on `main`,
+   resolve the conflicts (keep every `CHANGELOG.md` entry under `[Unreleased]`), re-run the tests,
+   and force-push before doing any other work.
+7. **Coverage.** `codecov/patch` must pass: at least 90% of added or changed lines must be
+   covered by tests. The gate is the percentage; still, add tests for the uncovered lines the
+   Codecov PR comment lists, and explain in the PR description any line you leave uncovered. Do
+   not lower coverage targets or add coverage ignore rules to make it pass.
+8. **Stale items.** Issues and PRs with no activity for 14 days are labeled `stale` and closed 30
+   days later unless there is new activity. These labels are exempt:
+   - Issues: `pinned`, `security`, `confirmed`, `work-in-progress`, `priority: critical`, `priority: high`.
+   - Pull requests: `pinned`, `security`, `work-in-progress`.

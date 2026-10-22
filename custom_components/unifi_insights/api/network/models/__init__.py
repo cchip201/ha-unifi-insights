@@ -50,7 +50,9 @@ from .lag import (
     McLagPeer,
     McLagRole,
 )
+from .nat_rule import NatRule, is_predefined_nat_rule
 from .network import Network, NetworkPurpose, NetworkType
+from .port_forward import PortForward
 from .report import (
     DEFAULT_SITE_REPORT_ATTRS,
     SITE_REPORT_INTERVALS,
@@ -69,6 +71,7 @@ from .resources import (
 from .routes import PolicyBasedRoute
 from .site import Site, SiteHealth
 from .stack import SwitchStack, SwitchStackLag, SwitchStackMember
+from .static_route import StaticRoute
 from .traffic import (
     Country,
     DPIApplication,
@@ -76,6 +79,7 @@ from .traffic import (
     TrafficMatchingList,
     TrafficMatchingType,
 )
+from .traffic_rule import TrafficRule
 from .voucher import Voucher, VoucherCreateRequest
 from .vpn_client import VpnClient
 from .wifi import WifiNetwork, WifiSecurity
@@ -151,17 +155,26 @@ __all__ = [
     "VPNTunnelStatus",
     "WANInterface",
     "WANStatus",
+    # NAT Rule
+    "NatRule",
+    "is_predefined_nat_rule",
+    # Port Forward
+    "PortForward",
     # Routes
     "PolicyBasedRoute",
     # Site
     "Site",
     "SiteHealth",
+    # Static Route
+    "StaticRoute",
     # Traffic
     "Country",
     "DPIApplication",
     "DPICategory",
     "TrafficMatchingList",
     "TrafficMatchingType",
+    # Traffic Rule
+    "TrafficRule",
     # Voucher
     "Voucher",
     "VoucherCreateRequest",

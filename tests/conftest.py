@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Test fixtures for ha-unifi-insights integration tests."""
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.unifi_insights.api.exceptions import UniFiUnsupportedError
 from custom_components.unifi_insights.api.innerspace import InnerSpaceProject
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
@@ -78,6 +80,7 @@ def _create_mock_network_client() -> MagicMock:
 
     # Setup vouchers namespace
     client.vouchers = MagicMock()
+    client.vouchers.get_all_pages = AsyncMock(return_value=[])
     client.vouchers.create = AsyncMock(return_value=[MagicMock(id="voucher1")])
     client.vouchers.delete = AsyncMock(return_value=True)
 
@@ -119,7 +122,6 @@ def _create_mock_protect_client() -> MagicMock:
     client.cameras.create_rtsps_stream = AsyncMock(
         return_value=MagicMock(url="rtsps://192.168.1.1/stream")
     )
-    client.cameras.set_recording_mode = AsyncMock(return_value=True)
     client.cameras.set_hdr_mode = AsyncMock(return_value=True)
     client.cameras.set_video_mode = AsyncMock(return_value=True)
     client.cameras.set_microphone_volume = AsyncMock(return_value=True)
@@ -137,7 +139,9 @@ def _create_mock_protect_client() -> MagicMock:
     # Setup chimes namespace
     client.chimes = MagicMock()
     client.chimes.get_all = AsyncMock(return_value=[])
-    client.chimes.play = AsyncMock(return_value=True)
+    client.chimes.play = AsyncMock(
+        side_effect=UniFiUnsupportedError("Synthetic unsupported playback")
+    )
     client.chimes.set_volume = AsyncMock(return_value=True)
     client.chimes.set_ringtone = AsyncMock(return_value=True)
     client.chimes.set_repeat = AsyncMock(return_value=True)
@@ -157,7 +161,6 @@ def _create_mock_protect_client() -> MagicMock:
     client.nvr.get = AsyncMock(
         return_value=MagicMock(id="nvr1", name="NVR", type="UNVR")
     )
-    client.nvr.restart = AsyncMock(return_value=True)
 
     # Legacy methods (keeping for backwards compatibility)
     client.update_camera = AsyncMock(return_value=True)
@@ -170,12 +173,18 @@ def _create_mock_protect_client() -> MagicMock:
     client.ptz_start_patrol = AsyncMock(return_value=True)
     client.ptz_stop_patrol = AsyncMock(return_value=True)
     client.set_chime_volume = AsyncMock(return_value=True)
-    client.play_chime = AsyncMock(return_value=True)
     client.set_chime_ringtone = AsyncMock(return_value=True)
     client.set_chime_repeat = AsyncMock(return_value=True)
     client.trigger_alarm = AsyncMock(return_value=True)
     client.create_liveview = AsyncMock(return_value={"id": "liveview1"})
     client.update_viewer = AsyncMock(return_value=True)
+
+    # Protect 7.3.70 security device families (empty by default)
+    for family in ("fobs", "link_stations", "alarm_hubs", "sirens"):
+        endpoint = MagicMock()
+        endpoint.get_all = AsyncMock(return_value=[])
+        endpoint.last_result_complete = True
+        setattr(client, family, endpoint)
 
     # WebSocket support (real-time device updates, additive to polling)
     client.get_host_id = AsyncMock(return_value="nvr1")
@@ -211,6 +220,42 @@ def mock_innerspace_client() -> Generator[MagicMock]:
         "custom_components.unifi_insights.UniFiInnerSpaceClient",
         MagicMock(return_value=client),
     ):
+        yield client
+
+
+@pytest.fixture(autouse=True)
+def mock_mobility_client() -> Generator[MagicMock]:
+    """Keep remote entries off the Mobility cloud API: an account without routers."""
+    client = MagicMock()
+    client.list_workspaces = AsyncMock(return_value=[])
+    client.list_devices = AsyncMock(return_value=[])
+    client.get_device = AsyncMock(return_value={})
+    client.close = AsyncMock()
+
+    with patch(
+        "custom_components.unifi_insights.coordinators.mobility.UniFiMobilityClient",
+        MagicMock(return_value=client),
+    ):
+        yield client
+
+
+@pytest.fixture
+def mock_site_manager_client() -> Generator[MagicMock]:
+    """Keep the account-wide Site Manager poller of remote entries off the network."""
+    with patch(
+        "custom_components.unifi_insights.coordinators.site_manager."
+        "UniFiSiteManagerClient"
+    ) as client_class:
+        client = client_class.return_value
+        for method in (
+            "list_hosts",
+            "list_sites",
+            "list_devices",
+            "get_isp_metrics",
+            "list_sd_wan_configs",
+        ):
+            setattr(client, method, AsyncMock(return_value=[]))
+        client.close = AsyncMock()
         yield client
 
 
@@ -377,6 +422,7 @@ async def init_integration(
     mock_network_client: MagicMock,
     mock_protect_client: MagicMock,
     mock_local_auth: MagicMock,
+    *,
     enable_custom_integrations,
 ) -> MockConfigEntry:
     """Set up the integration for testing."""
@@ -432,3 +478,28 @@ def assert_mock_device_lookup(
         lookup.assert_any_call(identifier, config_entry_id)
     else:
         lookup.assert_any_call(identifiers={identifier})
+
+
+def get_device_by_identifier(
+    device_registry: dr.DeviceRegistry,
+    identifier: tuple[str, str],
+    config_entry_id: str,
+) -> dr.DeviceEntry | None:
+    """Look up a device in a real registry across Home Assistant releases."""
+    if hasattr(device_registry, "async_get_device_by_identifier"):
+        return device_registry.async_get_device_by_identifier(
+            identifier, config_entry_id
+        )
+    return device_registry.async_get_device(identifiers={identifier})
+
+
+def device_config_entry_ids(device: dr.DeviceEntry) -> set[str]:
+    """Return the set of config entry IDs owning this device.
+
+    Normalizes ownership across Home Assistant releases where devices moved
+    from config_entries: set[str] to a single config_entry_id: str | None.
+    """
+    if hasattr(device, "config_entry_id"):
+        entry_id = device.config_entry_id
+        return {entry_id} if entry_id else set()
+    return set(device.config_entries)

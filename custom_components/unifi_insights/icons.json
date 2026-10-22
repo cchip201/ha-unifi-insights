@@ -72,6 +72,124 @@
       },
       "outlet_power_factor": {
         "default": "mdi:angle-acute"
+      },
+      "total_subscribers": {
+        "default": "mdi:account-group"
+      },
+      "suspended_subscribers": {
+        "default": "mdi:account-cancel"
+      },
+      "subscribers_pending_assignment": {
+        "default": "mdi:account-clock"
+      },
+      "subscribers_provisioned": {
+        "default": "mdi:account-cog"
+      },
+      "subscribers_installed": {
+        "default": "mdi:account-check"
+      },
+      "unassigned_subscribers": {
+        "default": "mdi:account-question"
+      },
+      "active_service_plans": {
+        "default": "mdi:format-list-bulleted-type"
+      },
+      "plan_subscribers": {
+        "default": "mdi:account-multiple"
+      },
+      "subscriber_state": {
+        "default": "mdi:account-badge"
+      },
+      "subscriber_service_plan": {
+        "default": "mdi:tag-outline"
+      },
+      "mobility_state": {
+        "default": "mdi:router-wireless"
+      },
+      "mobility_clients": {
+        "default": "mdi:account-multiple"
+      },
+      "mobility_wan_source": {
+        "default": "mdi:wan",
+        "state": {
+          "lte": "mdi:signal-cellular-3",
+          "wifiwan": "mdi:wifi"
+        }
+      },
+      "mobility_lte_signal": {
+        "default": "mdi:signal-cellular-2",
+        "state": {
+          "no_signal": "mdi:signal-cellular-outline",
+          "poor": "mdi:signal-cellular-1",
+          "fair": "mdi:signal-cellular-2",
+          "strong": "mdi:signal-cellular-3"
+        }
+      },
+      "mobility_cellular_data_usage": {
+        "default": "mdi:sim"
+      },
+      "mobility_vpn_status": {
+        "default": "mdi:vpn"
+      },
+      "mobility_subscription_status": {
+        "default": "mdi:card-account-details-outline"
+      },
+      "mobility_memory_usage": {
+        "default": "mdi:memory"
+      },
+      "mobility_uptime": {
+        "default": "mdi:clock-start"
+      },
+      "mobility_firmware": {
+        "default": "mdi:text-box-check"
+      },
+      "mobility_cellular_data_limit": {
+        "default": "mdi:sim-alert"
+      },
+      "mobility_subscription_plan": {
+        "default": "mdi:sim"
+      },
+      "mobility_wan_ip": {
+        "default": "mdi:ip-network"
+      },
+      "mobility_isp": {
+        "default": "mdi:web"
+      },
+      "mobility_workspace_devices": {
+        "default": "mdi:router-wireless"
+      },
+      "mobility_workspace_online_devices": {
+        "default": "mdi:router-wireless-settings"
+      },
+      "thread_role": {
+        "default": "mdi:access-point-network"
+      },
+      "thread_joined_devices": {
+        "default": "mdi:devices"
+      },
+      "fob_keypad_beep_volume": {
+        "default": "mdi:volume-high"
+      },
+      "fob_arm_control": {
+        "default": "mdi:shield-key"
+      },
+      "latest_voucher_code": {
+        "default": "mdi:ticket"
+      },
+      "latest_voucher_expiration": {
+        "default": "mdi:calendar-clock"
+      },
+      "active_vouchers": {
+        "default": "mdi:ticket-confirmation-outline"
+      },
+      "storage_mount_used_percent": {
+        "default": "mdi:harddisk"
+      },
+      "storage_mount_used": {
+        "default": "mdi:harddisk"
+      },
+      "storage_mount_total": {
+        "default": "mdi:harddisk"
       }
     },
     "binary_sensor": {
@@ -134,6 +252,39 @@
         "state": {
           "off": "mdi:door-closed"
         }
+      },
+      "alarm_hub_device_tamper": {
+        "default": "mdi:shield-alert",
+        "state": {
+          "off": "mdi:shield-check"
+        }
+      },
+      "thread_network_problem": {
+        "default": "mdi:access-point-network",
+        "state": {
+          "on": "mdi:access-point-network-off"
+        }
+      },
+      "fob_keypad_beep": {
+        "default": "mdi:dialpad",
+        "state": {
+          "off": "mdi:volume-off"
+        }
+      },
+      "camera_microphone": {
+        "default": "mdi:microphone",
+        "state": {
+          "off": "mdi:microphone-off"
+        }
+      },
+      "storage_nearly_full": {
+        "default": "mdi:harddisk",
+        "state": {
+          "on": "mdi:harddisk-remove"
+        }
+      },
+      "storage_degraded": {
+        "default": "mdi:harddisk"
       }
     },
     "button": {
@@ -142,23 +293,76 @@
       },
       "play_chime": {
         "default": "mdi:bell-ring"
+      },
+      "poe_power_cycle": {
+        "default": "mdi:power-cycle"
+      },
+      "generate_voucher": {
+        "default": "mdi:ticket-confirmation"
+      },
+      "client_wake": {
+        "default": "mdi:power"
       }
     },
     "switch": {
-      "microphone": {
-        "default": "mdi:microphone",
-        "state": {
-          "off": "mdi:microphone-off"
-        }
-      },
       "outlet": {
         "default": "mdi:power-socket-us"
+      },
+      "port_forward": {
+        "default": "mdi:lan-connect",
+        "state": {
+          "off": "mdi:lan-disconnect"
+        }
+      },
+      "port_forward_unnamed": {
+        "default": "mdi:lan-connect",
+        "state": {
+          "off": "mdi:lan-disconnect"
+        }
+      },
+      "traffic_rule": {
+        "default": "mdi:filter",
+        "state": {
+          "off": "mdi:filter-off"
+        }
+      },
+      "traffic_rule_unnamed": {
+        "default": "mdi:filter",
+        "state": {
+          "off": "mdi:filter-off"
+        }
+      },
+      "nat_rule": {
+        "default": "mdi:swap-horizontal",
+        "state": {
+          "off": "mdi:swap-horizontal-hidden"
+        }
+      },
+      "nat_rule_unnamed": {
+        "default": "mdi:swap-horizontal",
+        "state": {
+          "off": "mdi:swap-horizontal-hidden"
+        }
+      },
+      "static_route": {
+        "default": "mdi:sign-direction",
+        "state": {
+          "off": "mdi:sign-direction-remove"
+        }
+      },
+      "static_route_unnamed": {
+        "default": "mdi:sign-direction",
+        "state": {
+          "off": "mdi:sign-direction-remove"
+        }
+      }
+    },
+    "event": {
+      "network_rule_changes": {
+        "default": "mdi:shield-search"
       }
     },
     "select": {
-      "recording_mode": {
-        "default": "mdi:record-rec"
-      },
       "hdr_mode": {
         "default": "mdi:hdr"
       },
@@ -181,13 +385,42 @@
       },
       "repeat_times": {
         "default": "mdi:repeat"
+      },
+      "voucher_duration": {
+        "default": "mdi:timer-outline"
+      },
+      "voucher_guest_limit": {
+        "default": "mdi:account-multiple"
+      },
+      "voucher_download_limit": {
+        "default": "mdi:download"
+      },
+      "voucher_upload_limit": {
+        "default": "mdi:upload"
+      },
+      "voucher_data_limit": {
+        "default": "mdi:database"
+      }
+    },
+    "device_tracker": {
+      "mobility_location": {
+        "default": "mdi:map-marker"
+      }
+    },
+    "image": {
+      "voucher_qr_code": {
+        "default": "mdi:qrcode"
+      }
+    },
+    "media_player": {
+      "speaker": {
+        "default": "mdi:speaker"
       }
     }
   },
   "services": {
     "refresh_data": "mdi:refresh",
     "restart_device": "mdi:restart",
-    "set_recording_mode": "mdi:record-rec",
     "set_hdr_mode": "mdi:hdr",
     "set_video_mode": "mdi:video",
     "set_mic_volume": "mdi:microphone",
@@ -199,11 +432,16 @@
     "play_chime_ringtone": "mdi:bell-ring",
     "set_chime_ringtone": "mdi:music",
     "set_chime_repeat_times": "mdi:repeat",
+    "set_chime_paired_doorbells": "mdi:bell-ring",
     "authorize_guest": "mdi:account-check",
     "generate_voucher": "mdi:ticket",
     "delete_voucher": "mdi:ticket-outline",
+    "export_network_rules": "mdi:database-export",
     "trigger_alarm": "mdi:alarm-light",
     "create_liveview": "mdi:view-grid",
-    "set_liveview": "mdi:view-grid-plus"
+    "set_liveview": "mdi:view-grid-plus",
+    "carrier_suspend_subscriber": "mdi:account-cancel",
+    "carrier_resume_subscriber": "mdi:account-check",
+    "power_cycle_port": "mdi:power-cycle"
   }
 }

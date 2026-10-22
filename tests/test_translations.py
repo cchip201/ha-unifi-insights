@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for translation key completeness.
 
 `translations/en.json` is the file Home Assistant actually loads at
@@ -14,14 +15,36 @@ import json
 from pathlib import Path
 from string import Formatter
 
+import yaml
+
 from custom_components.unifi_insights.binary_sensor import BINARY_SENSOR_TYPES
+from custom_components.unifi_insights.coordinators.rule_audit import (
+    RULE_CHANGE_TYPES,
+)
+from custom_components.unifi_insights.mobility_entity import (
+    LOCATION_DESCRIPTION,
+    ROUTER_SENSORS,
+    WORKSPACE_SENSORS,
+)
+from custom_components.unifi_insights.network_rule_switch import (
+    NETWORK_RULE_SWITCH_TYPES,
+)
+from custom_components.unifi_insights.protect_security_entity import (
+    SECURITY_BINARY_SENSOR_TYPES,
+    SECURITY_SENSOR_TYPES,
+)
 from custom_components.unifi_insights.site_internet_activity_sensor import (
     SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
+)
+from custom_components.unifi_insights.storage_entity import (
+    STORAGE_NEARLY_FULL_DESCRIPTION,
+    STORAGE_SENSOR_TYPES,
 )
 
 _INTEGRATION_DIR = Path(__file__).parent.parent / "custom_components" / "unifi_insights"
 _EN_JSON = _INTEGRATION_DIR / "translations" / "en.json"
 _STRINGS_JSON = _INTEGRATION_DIR / "strings.json"
+_ICONS_JSON = _INTEGRATION_DIR / "icons.json"
 
 
 def test_binary_sensor_camera_and_sensor_translation_keys_present_in_en_json() -> None:
@@ -154,3 +177,306 @@ def test_site_internet_activity_sensor_translations_resolve_in_both_files() -> N
             f"{key} differs between strings.json and translations/en.json"
         )
         assert desc.name == strings_sensor[key]["name"]
+
+
+def test_mobility_translations_and_icons_resolve_in_every_file() -> None:
+    """Every Mobility entity has a name, enum state names and an icon."""
+    files = {
+        "strings.json": json.loads(_STRINGS_JSON.read_text())["entity"],
+        "translations/en.json": json.loads(_EN_JSON.read_text())["entity"],
+    }
+    icons = json.loads(_ICONS_JSON.read_text())["entity"]
+    descriptions = [
+        ("sensor", desc) for desc in (*ROUTER_SENSORS, *WORKSPACE_SENSORS)
+    ] + [("device_tracker", LOCATION_DESCRIPTION)]
+
+    for platform, desc in descriptions:
+        key = desc.translation_key
+        assert key is not None, desc.key
+        assert key.startswith("mobility_"), key
+        for name, entity in files.items():
+            translation = entity.get(platform, {}).get(key)
+            assert translation, f"{platform}.{key} missing from {name}"
+            assert translation["name"], f"{platform}.{key} has no name in {name}"
+            for option in getattr(desc, "options", None) or []:
+                assert translation.get("state", {}).get(option), (
+                    f"{platform}.{key} state {option} missing from {name}"
+                )
+        assert (
+            files["strings.json"][platform][key]
+            == (files["translations/en.json"][platform][key])
+        )
+        assert icons.get(platform, {}).get(key, {}).get("default"), (
+            f"{platform}.{key} has no icon"
+        )
+
+
+def test_protect_security_entity_translations_resolve_in_both_files() -> None:
+    """Alarm hub/Thread/fob entities resolve, ENUM states included."""
+    en = json.loads(_EN_JSON.read_text())["entity"]
+    strings = json.loads(_STRINGS_JSON.read_text())["entity"]
+
+    for platform, descriptions in (
+        ("binary_sensor", SECURITY_BINARY_SENSOR_TYPES),
+        ("sensor", SECURITY_SENSOR_TYPES),
+    ):
+        for desc in descriptions:
+            key = desc.translation_key
+            assert key is not None
+            assert key in strings[platform], f"{key} missing from strings.json"
+            assert key in en[platform], f"{key} missing from translations/en.json"
+            assert en[platform][key] == strings[platform][key], (
+                f"{key} differs between strings.json and translations/en.json"
+            )
+            assert strings[platform][key]["name"]
+            options = getattr(desc, "options", None)
+            if options:
+                assert set(strings[platform][key]["state"]) == set(options), key
+
+
+def test_protect_security_entity_icons_defined() -> None:
+    """Every alarm hub/Thread/fob entity has an icon in icons.json."""
+    icons = json.loads(_ICONS_JSON.read_text())["entity"]
+
+    for platform, descriptions in (
+        ("binary_sensor", SECURITY_BINARY_SENSOR_TYPES),
+        ("sensor", SECURITY_SENSOR_TYPES),
+    ):
+        for desc in descriptions:
+            entry = icons.get(platform, {}).get(desc.translation_key)
+            assert entry is not None, f"{desc.translation_key} has no icon"
+            assert entry["default"].startswith("mdi:")
+
+
+def test_voucher_translation_and_icon_keys_present() -> None:
+    """Hotspot voucher entity keys exist in strings.json, en.json, and icons.json."""
+    strings_data = json.loads(_STRINGS_JSON.read_text())["entity"]
+    en_data = json.loads(_EN_JSON.read_text())["entity"]
+    icons_data = json.loads(_ICONS_JSON.read_text())["entity"]
+
+    expected_keys = {
+        "number": [
+            "voucher_duration",
+            "voucher_guest_limit",
+            "voucher_download_limit",
+            "voucher_upload_limit",
+            "voucher_data_limit",
+        ],
+        "button": [
+            "generate_voucher",
+        ],
+        "sensor": [
+            "latest_voucher_code",
+            "latest_voucher_expiration",
+            "active_vouchers",
+        ],
+        "image": [
+            "voucher_qr_code",
+        ],
+    }
+
+    for platform, keys in expected_keys.items():
+        for key in keys:
+            assert key in strings_data[platform], (
+                f"{platform}.{key} missing from strings.json"
+            )
+            assert key in en_data[platform], (
+                f"{platform}.{key} missing from translations/en.json"
+            )
+            assert strings_data[platform][key] == en_data[platform][key], (
+                f"{platform}.{key} mismatch between strings.json and en.json"
+            )
+            assert key in icons_data[platform], (
+                f"{platform}.{key} missing from icons.json"
+            )
+            icon_entry = icons_data[platform][key]
+            assert "default" in icon_entry, f"{platform}.{key} missing default icon"
+            assert icon_entry["default"].startswith("mdi:"), (
+                f"{platform}.{key} invalid icon"
+            )
+
+
+def test_network_rule_switch_translations_resolve_in_both_files() -> None:
+    """Network rule switch translations match in both files with placeholders."""
+    en_switch = json.loads(_EN_JSON.read_text())["entity"]["switch"]
+    strings_switch = json.loads(_STRINGS_JSON.read_text())["entity"]["switch"]
+
+    for desc in NETWORK_RULE_SWITCH_TYPES:
+        for key, placeholder in (
+            (desc.translation_key, "{rule_name}"),
+            (desc.unnamed_translation_key, "{rule_id}"),
+        ):
+            assert key in strings_switch, f"{key} missing from strings.json"
+            assert key in en_switch, f"{key} missing from translations/en.json"
+            assert en_switch[key] == strings_switch[key], (
+                f"{key} differs between strings.json and translations/en.json"
+            )
+            assert placeholder in strings_switch[key]["name"], (
+                f"{key} name must contain {placeholder}"
+            )
+
+
+def test_network_rule_switch_icons_defined() -> None:
+    """Network rule switch icons are defined with default and state.off."""
+    icons = json.loads(_ICONS_JSON.read_text())["entity"]["switch"]
+
+    for desc in NETWORK_RULE_SWITCH_TYPES:
+        for key in (desc.translation_key, desc.unnamed_translation_key):
+            entry = icons.get(key)
+            assert entry is not None, f"{key} has no icon entry in icons.json"
+            assert entry.get("default", "").startswith("mdi:"), (
+                f"{key} default icon missing or not mdi:"
+            )
+            assert entry.get("state", {}).get("off", "").startswith("mdi:"), (
+                f"{key} state.off icon missing or not mdi:"
+            )
+
+
+def test_wake_exception_translations_match_in_both_files() -> None:
+    """wake_on_lan_unavailable and wake_failed match in both translations files."""
+    en_exc = json.loads(_EN_JSON.read_text())["exceptions"]
+    strings_exc = json.loads(_STRINGS_JSON.read_text())["exceptions"]
+
+    for key in ("wake_on_lan_unavailable", "wake_failed"):
+        assert key in strings_exc, f"{key} missing from strings.json"
+        assert key in en_exc, f"{key} missing from translations/en.json"
+        assert en_exc[key] == strings_exc[key], (
+            f"{key} differs between strings.json and translations/en.json"
+        )
+    assert "{client_name}" in strings_exc["wake_failed"]["message"]
+    assert "{error}" in strings_exc["wake_failed"]["message"]
+
+
+def test_chime_playback_error_and_action_metadata_match_in_both_files() -> None:
+    """The retained action reports its unsupported behavior consistently."""
+    strings = json.loads(_STRINGS_JSON.read_text())
+    english = json.loads(_EN_JSON.read_text())
+    key = "chime_playback_unsupported"
+    assert strings["exceptions"][key] == english["exceptions"][key]
+    assert "You cannot play" in strings["exceptions"][key]["message"]
+    action = "play_chime_ringtone"
+    assert strings["services"][action] == english["services"][action]
+    assert "always raises" in strings["services"][action]["description"]
+    field = strings["services"][action]["fields"]["ringtone_id"]
+    assert "with or without" in field["description"]
+    assert "automations stay valid" in field["description"]
+
+
+def test_wake_button_translations_and_icon_resolve_in_both_files() -> None:
+    """Wake button translation and icon exist in all files and options match."""
+    en_btn = json.loads(_EN_JSON.read_text())["entity"]["button"]
+    strings_btn = json.loads(_STRINGS_JSON.read_text())["entity"]["button"]
+    icons_btn = json.loads(_ICONS_JSON.read_text())["entity"]["button"]
+
+    assert "client_wake" in strings_btn
+    assert "client_wake" in en_btn
+    assert strings_btn["client_wake"]["name"] == "Wake {client_name}"
+    assert en_btn["client_wake"]["name"] == "Wake {client_name}"
+    assert icons_btn.get("client_wake", {}).get("default") == "mdi:power"
+
+    en_opt = json.loads(_EN_JSON.read_text())["options"]["step"]["init"][
+        "data_description"
+    ]["client_control"]
+    strings_opt = json.loads(_STRINGS_JSON.read_text())["options"]["step"]["init"][
+        "data_description"
+    ]["client_control"]
+    assert en_opt == strings_opt
+    assert "Wake-on-LAN" in en_opt
+
+
+def test_storage_translations_and_icons_resolve_in_every_file() -> None:
+    """Storage entities have matching translations, valid placeholders, and icons."""
+    strings = json.loads(_STRINGS_JSON.read_text())["entity"]
+    en = json.loads(_EN_JSON.read_text())["entity"]
+    icons = json.loads(_ICONS_JSON.read_text())["entity"]
+
+    items = [("sensor", desc.translation_key) for desc in STORAGE_SENSOR_TYPES] + [
+        ("binary_sensor", STORAGE_NEARLY_FULL_DESCRIPTION.translation_key)
+    ]
+
+    for platform, key in items:
+        assert key is not None
+        assert key in strings[platform], f"{key} missing from strings.json"
+        assert key in en[platform], f"{key} missing from translations/en.json"
+        assert en[platform][key] == strings[platform][key], (
+            f"{key} differs between strings.json and translations/en.json"
+        )
+        name = strings[platform][key]["name"]
+        assert name
+        placeholders = {field for _, field, _, _ in Formatter().parse(name) if field}
+        assert placeholders <= {"mount_name"}, f"Unexpected placeholder in {name}"
+        icon = icons.get(platform, {}).get(key, {}).get("default")
+        assert icon is not None, f"{key} has no icon"
+        assert icon.startswith("mdi:"), f"{key} icon invalid: {icon}"
+
+
+def test_network_rule_change_event_translations_and_icon() -> None:
+    """Network rule change events have matching translations and a valid icon."""
+    strings_event = json.loads(_STRINGS_JSON.read_text())["entity"]["event"][
+        "network_rule_changes"
+    ]
+    en_event = json.loads(_EN_JSON.read_text())["entity"]["event"][
+        "network_rule_changes"
+    ]
+    icons_event = json.loads(_ICONS_JSON.read_text())["entity"]["event"][
+        "network_rule_changes"
+    ]
+
+    assert strings_event == en_event
+    assert set(strings_event["state_attributes"]["event_type"]["state"].keys()) == set(
+        RULE_CHANGE_TYPES
+    )
+    assert icons_event["default"].startswith("mdi:")
+
+
+def test_export_network_rules_action_strings_and_icon() -> None:
+    """The export action has matching strings, exceptions and a valid icon."""
+    strings = json.loads(_STRINGS_JSON.read_text())
+    en = json.loads(_EN_JSON.read_text())
+    services_yaml = yaml.safe_load((_INTEGRATION_DIR / "services.yaml").read_text())
+
+    action = strings["services"]["export_network_rules"]
+    assert action == en["services"]["export_network_rules"]
+    assert set(action["fields"]) == {"site_id", "console_id", "rule_types", "redact"}
+    assert set(action["fields"]) == set(services_yaml["export_network_rules"]["fields"])
+
+    for key in (
+        "export_console_required",
+        "export_site_not_on_console",
+        "export_no_sites",
+        "export_network_rules_failed",
+    ):
+        assert strings["exceptions"][key]["message"]
+        assert strings["exceptions"][key] == en["exceptions"][key]
+
+    icons = json.loads(_ICONS_JSON.read_text())
+    assert icons["services"]["export_network_rules"].startswith("mdi:")
+
+
+def test_media_player_speaker_translations_and_icon() -> None:
+    """The media_player speaker entity has matching translations and icons."""
+    strings_data = json.loads(_STRINGS_JSON.read_text())
+    en_data = json.loads(_EN_JSON.read_text())
+    icons = json.loads(_ICONS_JSON.read_text())["entity"]
+
+    strings = strings_data["entity"]
+    en = en_data["entity"]
+
+    assert "media_player" in strings
+    assert "speaker" in strings["media_player"]
+    assert strings["media_player"]["speaker"]["name"] == "Speaker"
+    assert strings["media_player"] == en["media_player"]
+    assert "media_player" in icons
+    assert icons["media_player"]["speaker"]["default"].startswith("mdi:")
+
+    for exc_key in (
+        "media_not_audio",
+        "talkback_session_invalid",
+        "talkback_unsupported_codec_or_scheme",
+        "talkback_stream_failure",
+        "protect_not_available_for_talkback",
+    ):
+        assert exc_key in strings_data["exceptions"]
+        assert exc_key in en_data["exceptions"]
+        assert strings_data["exceptions"][exc_key] == en_data["exceptions"][exc_key]
+        assert strings_data["exceptions"][exc_key]["message"]

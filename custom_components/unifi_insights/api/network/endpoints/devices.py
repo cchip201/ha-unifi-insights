@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from ...exceptions import UniFiValidationError
 from ..models import (
@@ -58,6 +58,10 @@ def _seed_outlet_overrides(device_dict: dict[str, Any]) -> list[dict[str, Any]]:
         overrides.append(override)
 
     return overrides
+
+
+DEVICE_ACTIONS: Final = frozenset({"RESTART"})
+PORT_ACTIONS: Final = frozenset({"POWER_CYCLE"})
 
 
 class DevicesEndpoint:
@@ -153,27 +157,63 @@ class DevicesEndpoint:
         raise ValueError(f"Device {device_id} not found")
 
     async def restart(self, site_id: str, device_id: str) -> bool:
+        """Restart a device via the documented device-actions endpoint."""
+        return await self.execute_action(site_id, device_id, "RESTART")
+
+    async def execute_action(self, site_id: str, device_id: str, action: str) -> bool:
         """
-        Restart a device.
+        Execute an adopted-device action.
 
-        Args:
-            site_id: The site ID.
-            device_id: The device ID.
-
-        Returns:
-            True if successful.
-
+        Spec: ``POST /v1/sites/{siteId}/devices/{deviceId}/actions`` with
+        ``{"action": ...}``; Network v10.6.106 defines only ``RESTART``.
         """
+        if action not in DEVICE_ACTIONS:
+            msg = f"Action must be one of: {', '.join(sorted(DEVICE_ACTIONS))}"
+            raise ValueError(msg)
         path = self._client.build_api_path(
-            f"/sites/{site_id}/devices/{device_id}/restart"
+            f"/sites/{site_id}/devices/{device_id}/actions"
         )
-        await self._client._post(path)
+        await self._client._post(path, json_data={"action": action})
+        return True
+
+    async def power_cycle_port(
+        self, site_id: str, device_id: str, port_idx: int
+    ) -> bool:
+        """Power cycle a port via the documented port-actions endpoint."""
+        return await self.execute_port_action(
+            site_id, device_id, port_idx, "POWER_CYCLE"
+        )
+
+    async def execute_port_action(
+        self,
+        site_id: str,
+        device_id: str,
+        port_idx: int,
+        action: str,
+    ) -> bool:
+        """
+        Execute an adopted-device port action.
+
+        Spec:
+        ``POST /v1/sites/{siteId}/devices/{deviceId}/interfaces/ports/``
+        ``{portIdx}/actions`` with ``{"action": ...}``; Network v10.6.106
+        defines only ``POWER_CYCLE``.
+        """
+        if action not in PORT_ACTIONS:
+            msg = f"Action must be one of: {', '.join(sorted(PORT_ACTIONS))}"
+            raise ValueError(msg)
+        path = self._client.build_api_path(
+            f"/sites/{site_id}/devices/{device_id}/interfaces/ports/{port_idx}/actions"
+        )
+        await self._client._post(path, json_data={"action": action})
         return True
 
     async def adopt(
         self,
         site_id: str,
         mac: str,
+        *,
+        ignore_device_limit: bool = False,
     ) -> bool:
         """
         Adopt a device.
@@ -181,13 +221,20 @@ class DevicesEndpoint:
         Args:
             site_id: The site ID.
             mac: The device MAC address.
+            ignore_device_limit: Whether to ignore device adoption limit.
 
         Returns:
             True if successful.
 
         """
-        path = self._client.build_api_path(f"/sites/{site_id}/devices/adopt")
-        await self._client._post(path, json_data={"macAddress": mac})
+        path = self._client.build_api_path(f"/sites/{site_id}/devices")
+        await self._client._post(
+            path,
+            json_data={
+                "macAddress": mac,
+                "ignoreDeviceLimit": ignore_device_limit,
+            },
+        )
         return True
 
     async def forget(self, site_id: str, device_id: str) -> bool:
@@ -204,25 +251,6 @@ class DevicesEndpoint:
         """
         path = self._client.build_api_path(f"/sites/{site_id}/devices/{device_id}")
         await self._client._delete(path)
-        return True
-
-    async def locate(self, site_id: str, device_id: str, enabled: bool = True) -> bool:
-        """
-        Enable or disable locate mode (LED blinking) on a device.
-
-        Args:
-            site_id: The site ID.
-            device_id: The device ID.
-            enabled: Whether to enable or disable locate mode.
-
-        Returns:
-            True if successful.
-
-        """
-        path = self._client.build_api_path(
-            f"/sites/{site_id}/devices/{device_id}/locate"
-        )
-        await self._client._post(path, json_data={"enabled": enabled})
         return True
 
     async def get_pending_adoption(
@@ -492,34 +520,6 @@ class DevicesEndpoint:
             memory_utilization_pct=memory_utilization_pct,
             uptime_sec=uptime_sec,
         )
-
-    async def execute_action(
-        self,
-        site_id: str,
-        device_id: str,
-        action: str,
-    ) -> bool:
-        """
-        Execute an action on a device.
-
-        Args:
-            site_id: The site ID.
-            device_id: The device ID.
-            action: The action to execute (restart, locate, provision, upgrade).
-
-        Returns:
-            True if successful.
-
-        """
-        valid_actions = {"restart", "locate", "provision", "upgrade"}
-        if action not in valid_actions:
-            raise ValueError(f"Action must be one of: {', '.join(valid_actions)}")
-
-        path = self._client.build_api_path(
-            f"/sites/{site_id}/devices/{device_id}/{action}"
-        )
-        await self._client._post(path)
-        return True
 
     async def get_outlet_metrics(
         self,

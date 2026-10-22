@@ -25,7 +25,11 @@ class UniFiAuthenticationError(UniFiError):
     """Raised when authentication fails."""
 
     def __init__(
-        self, message: str, *args: Any, status_code: int | None = None
+        self,
+        message: str,
+        *args: Any,
+        status_code: int | None = None,
+        api_error_code: str | None = None,
     ) -> None:
         """
         Initialize the exception.
@@ -34,14 +38,20 @@ class UniFiAuthenticationError(UniFiError):
             message: The error message.
             *args: Additional arguments.
             status_code: The HTTP status code (401 or 403) if known.
+            api_error_code: Machine-readable API error code if available.
 
         """
         super().__init__(message, *args)
         self.status_code = status_code
+        self.api_error_code = api_error_code
 
 
 class UniFiConnectionError(UniFiError):
     """Raised when connection to the UniFi API fails."""
+
+
+class UniFiUnsupportedError(UniFiError):
+    """Raised when the official API does not support an operation."""
 
 
 class UniFiResponseError(UniFiError):
@@ -52,6 +62,8 @@ class UniFiResponseError(UniFiError):
         message: str,
         status_code: int,
         response_body: str | None = None,
+        *,
+        api_error_code: str | None = None,
     ) -> None:
         """
         Initialize the exception.
@@ -60,11 +72,13 @@ class UniFiResponseError(UniFiError):
             message: The error message.
             status_code: The HTTP status code.
             response_body: The response body if available.
+            api_error_code: Machine-readable API error code if available.
 
         """
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.api_error_code = api_error_code
 
     def __str__(self) -> str:
         """Return safe string representation with status only."""
@@ -73,6 +87,14 @@ class UniFiResponseError(UniFiError):
 
 class UniFiNotFoundError(UniFiResponseError):
     """Raised when a resource is not found (404)."""
+
+
+class UniFiRuleNotEditableError(UniFiError):
+    """Raised when a rule is managed by the console and must not be written."""
+
+
+class UniFiGlobalAlarmManagerError(UniFiResponseError):
+    """Raised when arming or disarming is refused (400) by the global alarm manager."""
 
 
 class UniFiRateLimitError(UniFiResponseError):
@@ -84,6 +106,8 @@ class UniFiRateLimitError(UniFiResponseError):
         status_code: int,
         response_body: str | None = None,
         retry_after: int | None = None,
+        *,
+        api_error_code: str | None = None,
     ) -> None:
         """
         Initialize the exception.
@@ -93,9 +117,15 @@ class UniFiRateLimitError(UniFiResponseError):
             status_code: The HTTP status code.
             response_body: The response body if available.
             retry_after: Seconds to wait before retrying.
+            api_error_code: Machine-readable API error code if available.
 
         """
-        super().__init__(message, status_code, response_body)
+        super().__init__(
+            message,
+            status_code,
+            response_body,
+            api_error_code=api_error_code,
+        )
         self.retry_after = retry_after
 
 

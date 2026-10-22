@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for UniFi Insights device tracker platform."""
 
 from __future__ import annotations
@@ -14,13 +15,17 @@ from custom_components.unifi_insights.const import CONF_TRACK_WIFI_CLIENTS, DOMA
 from custom_components.unifi_insights.device_tracker import (
     PARALLEL_UPDATES,
     UnifiClientTracker,
+    _client_should_be_tracked,
     _get_client_type,
+    _partition_connected_clients,
+    _uplink_identifiers,
     async_setup_entry,
 )
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
-    from homeassistant.helpers import device_registry as dr, entity_registry as er
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
 
 
 class TestParallelUpdates:
@@ -70,6 +75,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Tracking disabled by default (options is empty dict)
@@ -90,6 +96,7 @@ class TestAsyncSetupEntry:
         """Test setup when no clients present but tracking is enabled."""
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable WiFi client tracking with new option
@@ -122,6 +129,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable wired client tracking with new option
@@ -163,6 +171,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable WiFi only tracking
@@ -205,6 +214,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable wired only tracking
@@ -245,6 +255,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable both tracking options
@@ -286,6 +297,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Use old option - should track all clients as fallback
@@ -331,6 +343,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable both client tracking options
@@ -371,6 +384,7 @@ class TestAsyncSetupEntry:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         # Enable wired tracking
@@ -643,6 +657,46 @@ class TestGetClientType:
         result = _get_client_type({})
         assert result == ""
 
+    def test_client_should_be_tracked_unknown_client_type(self) -> None:
+        """Test _client_should_be_tracked for unknown client type."""
+        client = {"type": "UNKNOWN"}
+        assert (
+            _client_should_be_tracked(client, track_wifi=True, track_wired=False)
+            is True
+        )
+        assert (
+            _client_should_be_tracked(client, track_wifi=False, track_wired=True)
+            is True
+        )
+        assert (
+            _client_should_be_tracked(client, track_wifi=False, track_wired=False)
+            is False
+        )
+
+    def test_partition_connected_clients_skips_non_dict_site_clients(self) -> None:
+        """Test _partition_connected_clients skips non-dict site entries."""
+        coordinator = MagicMock()
+        coordinator.data = {
+            "clients": {
+                "site1": None,
+                "site2": "invalid",
+                "site3": [1, 2, 3],
+                "site4": {
+                    "client1": {
+                        # A global (burned-in) MAC: the cmcore fork skips a
+                        # randomized, unnamed client (backlog 529).
+                        "mac": "A8:BB:CC:DD:EE:FF",
+                        "type": "WIRELESS",
+                    }
+                },
+            }
+        }
+        wanted, untracked = _partition_connected_clients(
+            coordinator, track_wifi=True, track_wired=True
+        )
+        assert wanted == {"a8:bb:cc:dd:ee:ff": "site4"}
+        assert untracked == set()
+
 
 class TestUnifiClientTrackerEdgeCases:
     """Test edge cases for UnifiClientTracker."""
@@ -765,6 +819,7 @@ class TestUnifiClientTrackerEdgeCases:
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.mobility_coordinator = None
         mock_entry.runtime_data.coordinator = mock_coordinator
         mock_entry.async_on_unload = MagicMock()
         mock_entry.options = {"track_wired_clients": True}
@@ -836,8 +891,33 @@ class TestUnifiClientTrackerEdgeCases:
 
         client_data = tracker._get_client_data()
         assert client_data is not None
+
         assert client_data["id"] == "valid_client"
         assert tracker.is_connected is True
+
+    def test_find_in_site_non_dict_clients(self, mock_coordinator) -> None:
+        """Test _find_in_site returns None when clients argument is not a dict."""
+        tracker = UnifiClientTracker(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            mac="aa:bb:cc:dd:ee:ff",
+        )
+        assert tracker._find_in_site(None) is None
+        assert tracker._find_in_site("invalid") is None
+        assert tracker._find_in_site([1, 2, 3]) is None
+
+    def test_get_client_data_all_clients_not_dict(self, mock_coordinator) -> None:
+        """Test _get_client_data returns None when clients in data is not a dict."""
+        tracker = UnifiClientTracker(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            mac="aa:bb:cc:dd:ee:ff",
+        )
+        mock_coordinator.data["clients"] = None
+        assert tracker._get_client_data() is None
+
+        mock_coordinator.data["clients"] = "not_a_dict"
+        assert tracker._get_client_data() is None
 
 
 class TestRegistryReconciliation:
@@ -849,7 +929,8 @@ class TestRegistryReconciliation:
     """
 
     OFFLINE_MAC: str = "aa:bb:cc:dd:ee:01"
-    # A global MAC: the cmcore fork leaves a randomized, unnamed client alone (test below).
+    # A global MAC: the cmcore fork leaves a randomized, unnamed client alone
+    # (test below).
     WIRED_MAC: str = "a8:bb:cc:dd:ee:02"
     WIFI_MAC: str = "aa:bb:cc:dd:ee:03"
 
@@ -873,6 +954,7 @@ class TestRegistryReconciliation:
         )
         entry.add_to_hass(hass)
         entry.runtime_data = MagicMock()
+        entry.runtime_data.mobility_coordinator = None
         entry.runtime_data.coordinator = coordinator
         return entry
 
@@ -949,8 +1031,9 @@ class TestRegistryReconciliation:
         entity_registry: er.EntityRegistry,
         mock_coordinator: MagicMock,
     ) -> None:
-        """cmcore fork (backlog 529): a randomized, unnamed client is neither tracked nor removed."""
-        mac = "aa:bb:cc:dd:ee:04"  # locally administered, and the payload carries no name
+        """cmcore fork (529): a randomized, unnamed client is not tracked or removed."""
+        # locally administered, and the payload carries no name
+        mac = "aa:bb:cc:dd:ee:04"
         mock_coordinator.data["clients"]["site1"] = {"c1": self._client(mac, "WIRED")}
 
         entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
@@ -1277,6 +1360,7 @@ class TestEntityPlatformRestoration:
         mock_config_entry: MockConfigEntry,
         mock_network_client: MagicMock,
         mock_protect_client: MagicMock,
+        *,
         mock_local_auth: MagicMock,
         enable_custom_integrations: None,
     ) -> None:
@@ -1350,6 +1434,7 @@ class TestEntityPlatformRestoration:
         mock_config_entry: MockConfigEntry,
         mock_network_client: MagicMock,
         mock_protect_client: MagicMock,
+        *,
         mock_local_auth: MagicMock,
         enable_custom_integrations: None,
     ) -> None:
@@ -1480,6 +1565,7 @@ class TestOfflineTrackerKeepsItsUplink:
         entity_registry: er.EntityRegistry,
         device_registry: dr.DeviceRegistry,
         mock_coordinator: MagicMock,
+        *,
         identifier: str,
         expect: str,
     ) -> None:
@@ -1525,3 +1611,9 @@ class TestOfflineTrackerKeepsItsUplink:
         tracker = await self._tracker(hass, entry)
         placeholder = {(DOMAIN, f"client_{self.MAC}")}
         assert tracker.device_info["identifiers"] == placeholder
+
+    def test_a_device_that_is_gone_gives_no_uplink(self) -> None:
+        """A registry entry naming a deleted device keeps the placeholder."""
+        device_registry = MagicMock()
+        device_registry.async_get.return_value = None
+        assert _uplink_identifiers(device_registry, MagicMock(device_id="gone")) is None

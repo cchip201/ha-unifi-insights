@@ -1,10 +1,11 @@
+# Copyright 2026 UniFi Insights contributors
 """Data update coordinator for UniFi Insights."""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.exceptions import ConfigEntryAuthFailed
@@ -360,9 +361,8 @@ class UnifiInsightsDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             devices_dict = {}
             stats_dict = {}
             for device_id, device, stats in results:
-                if device_id:
-                    devices_dict[device_id] = device
-                    stats_dict[device_id] = stats
+                devices_dict[device_id] = device
+                stats_dict[device_id] = stats
 
             clients_dict: dict[str, dict[str, Any]] = {
                 str(client.get("id")): client for client in clients if client.get("id")

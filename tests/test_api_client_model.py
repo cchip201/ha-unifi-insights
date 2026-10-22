@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Tests for vendored UniFi API client model parsing."""
 
 import pytest
@@ -10,7 +11,10 @@ from custom_components.unifi_insights.api.innerspace import (
     InnerSpaceProject,
     InnerSpaceSwitch,
 )
-from custom_components.unifi_insights.api.network.models.client import Client
+from custom_components.unifi_insights.api.network.models.client import (
+    Client,
+    ClientType,
+)
 from custom_components.unifi_insights.api.network.models.device import (
     Device,
     DeviceState,
@@ -24,13 +28,30 @@ from custom_components.unifi_insights.api.network.models.resources import (
 )
 from custom_components.unifi_insights.api.network.models.site import Site, SiteHealth
 from custom_components.unifi_insights.api.network.models.wifi import WifiNetwork
+from custom_components.unifi_insights.api.protect.models import (
+    FobArmControlSettings,
+    FobKeypadSettings,
+    LinkStationThreadNetwork,
+    LinkStationThreadState,
+)
 from custom_components.unifi_insights.api.protect.models.arm_profile import ArmProfile
+from custom_components.unifi_insights.api.protect.models.camera import Camera
+from custom_components.unifi_insights.api.protect.models.chime import Chime
 from custom_components.unifi_insights.api.protect.models.doorlock import DoorLock
+from custom_components.unifi_insights.api.protect.models.files import RTSPSStream
+from custom_components.unifi_insights.api.protect.models.fob import Fob
+from custom_components.unifi_insights.api.protect.models.light import Light
 from custom_components.unifi_insights.api.protect.models.link_station import (
     AlarmHub,
     LinkStation,
 )
 from custom_components.unifi_insights.api.protect.models.viewport import Viewport
+from tests.fixtures.library_responses import (
+    SAMPLE_ALARM_HUB,
+    SAMPLE_KEYPAD_FOB,
+    SAMPLE_LINK_STATION,
+    SAMPLE_THREAD_LINK_STATION,
+)
 
 
 def test_client_model_accepts_vpn_type() -> None:
@@ -388,3 +409,209 @@ def test_innerspace_models_parse_openapi_payloads() -> None:
     )
     assert inv.id == "inv-1"
     assert inv.model == "U6-Mesh"
+
+
+def test_link_station_parses_thread_state() -> None:
+    """A Thread gateway's threadState.network parses into typed fields."""
+    station = LinkStation.model_validate(SAMPLE_THREAD_LINK_STATION)
+
+    assert isinstance(station.thread_state, LinkStationThreadState)
+    network = station.thread_state.network
+    assert isinstance(network, LinkStationThreadNetwork)
+    assert network.status == "ready"
+    assert network.role == "leader"
+    assert network.network_name == "Home Thread"
+    assert network.channel == 15
+    assert network.pan_id == "1a2b"
+    assert network.extended_pan_id == "0011223344556677"
+    assert network.joined_device_count == 4
+    assert network.error_reason is None
+    assert network.last_updated_at == 1759628000000
+
+
+def test_link_station_thread_tolerates_values_outside_the_spec() -> None:
+    """New firmware enum values or out-of-range numbers must not drop the device.
+
+    `ProtectDeviceEndpoint.get_all` skips a whole device on ValidationError, so
+    a strict model would make a link station vanish from HA the day Protect
+    adds a Thread role.
+    """
+    station = LinkStation.model_validate(
+        {
+            "id": "ls-1",
+            "threadState": {
+                "network": {
+                    "status": "degraded",
+                    "role": "commissioner",
+                    "channel": 99,
+                    "joinedDeviceCount": -1,
+                }
+            },
+        }
+    )
+
+    assert station.thread_state is not None
+    network = station.thread_state.network
+    assert network is not None
+    assert network.status == "degraded"
+    assert network.role == "commissioner"
+    assert network.channel == 99
+    assert network.joined_device_count == -1
+
+
+def test_link_station_without_thread_network() -> None:
+    """A null network and an absent threadState both parse."""
+    hub = LinkStation.model_validate(SAMPLE_ALARM_HUB)
+    assert hub.thread_state is not None
+    assert hub.thread_state.network is None
+
+    # Real 7.3.70 SuperLink capture: no threadState key at all.
+    station = LinkStation.model_validate(SAMPLE_LINK_STATION)
+    assert station.thread_state is None
+
+
+def test_link_station_accepts_numeric_last_event() -> None:
+    """The spec types lastEvent as epoch milliseconds, not an object."""
+    station = LinkStation.model_validate(SAMPLE_THREAD_LINK_STATION)
+
+    assert station.last_event == 1759628000000
+
+
+def test_link_station_dump_keeps_unknown_nested_keys() -> None:
+    """Unknown nested keys survive the camelCase dump the coordinator stores."""
+    payload = {
+        "id": "ls-1",
+        "threadState": {
+            "futureState": "x",
+            "network": {"status": "ready", "futureKey": 1},
+        },
+    }
+
+    dumped = LinkStation.model_validate(payload).model_dump(by_alias=True)
+
+    assert dumped["threadState"]["futureState"] == "x"
+    assert dumped["threadState"]["network"]["futureKey"] == 1
+    assert dumped["threadState"]["network"]["status"] == "ready"
+
+
+def test_fob_parses_keypad_and_arm_control_settings() -> None:
+    """A keypad fob parses keypad and arm-control settings."""
+    fob = Fob.model_validate(SAMPLE_KEYPAD_FOB)
+
+    assert isinstance(fob.keypad_settings, FobKeypadSettings)
+    assert fob.keypad_settings.beep_enabled is True
+    assert fob.keypad_settings.beep_volume == 60
+    assert isinstance(fob.arm_control_settings, FobArmControlSettings)
+    assert fob.arm_control_settings.enabled is True
+    assert fob.arm_control_settings.arm_profile_id == "arm_profile_away"
+    assert fob.arm_control_settings.night_profile_id is None
+    assert fob.feature_flags == {
+        "buttons": ["arm", "disarm", "night"],
+        "hasKeypad": True,
+    }
+
+
+def test_fob_accepts_string_button_labels() -> None:
+    """The spec types buttonLabels as a string enum ("securityActions")."""
+    fob = Fob.model_validate({"id": "fob-1", "buttonLabels": "securityActions"})
+
+    assert fob.button_labels == "securityActions"
+
+
+def test_fob_tolerates_keypad_values_outside_the_spec() -> None:
+    """An out-of-range volume or missing keys must not drop the fob."""
+    fob = Fob.model_validate(
+        {
+            "id": "fob-1",
+            "keypadSettings": {"beepVolume": 150, "chime": "soft"},
+            "armControlSettings": {},
+        }
+    )
+
+    assert fob.keypad_settings is not None
+    assert fob.keypad_settings.beep_volume == 150
+    assert fob.keypad_settings.beep_enabled is None
+    assert fob.arm_control_settings is not None
+    assert fob.arm_control_settings.enabled is None
+    dumped = fob.model_dump(by_alias=True)
+    assert dumped["keypadSettings"]["chime"] == "soft"
+    assert dumped["keypadSettings"]["beepVolume"] == 150
+    assert dumped["armControlSettings"]["armProfileId"] is None
+
+
+def test_client_type_missing_case_insensitive() -> None:
+    """Test ClientType enum case-insensitive lookup."""
+    assert ClientType("wired") == ClientType.WIRED
+    assert ClientType("WIRELESS") == ClientType.WIRELESS
+    with pytest.raises(ValueError, match="is not a valid ClientType"):
+        ClientType("nonexistent")
+
+
+def test_client_display_name_fallbacks() -> None:
+    """Test Client display_name property across name, hostname, and mac fallbacks."""
+    assert Client(id="1", name="Explicit Name").display_name == "Explicit Name"
+    assert Client(id="2", hostname="my-host").display_name == "my-host"
+    assert (
+        Client(id="3", macAddress="00:11:22:33:44:55").display_name
+        == "00:11:22:33:44:55"
+    )
+    assert Client(id="4").display_name == "Unknown"
+
+
+def test_camera_display_name_and_construct_rtsp_url() -> None:
+    """Test Camera display_name and construct_rtsp_url methods."""
+    cam1 = Camera(id="cam1", name="Front Door", mac="aa:bb:cc:dd:ee:01")
+    assert cam1.display_name == "Front Door"
+    cam2 = Camera(id="cam2", mac="aa:bb:cc:dd:ee:02")
+    assert cam2.display_name == "aa:bb:cc:dd:ee:02"
+
+    url_srtp = cam1.construct_rtsp_url(
+        "192.168.1.1", port=7441, channel=0, use_srtp=True
+    )
+    assert url_srtp == "rtsps://192.168.1.1:7441/cam1_0?enableSrtp"
+
+    url_no_srtp = cam1.construct_rtsp_url(
+        "192.168.1.1", port=7441, channel=0, use_srtp=False
+    )
+    assert url_no_srtp == "rtsp://192.168.1.1:7441/cam1_0"
+
+
+def test_chime_display_name() -> None:
+    """Test Chime display_name property."""
+    assert Chime(id="ch1", name="Entryway", mac="aa:bb").display_name == "Entryway"
+    assert Chime(id="ch2", mac="aa:bb").display_name == "aa:bb"
+
+
+def test_rtsps_stream_get_url() -> None:
+    """Test RTSPSStream get_url method."""
+    stream = RTSPSStream(
+        url=None,
+        channel=None,
+        high="rtsps://host/high",
+        medium="rtsps://host/medium",
+        low=None,
+    )
+    assert stream.get_url("high") == "rtsps://host/high"
+    assert stream.get_url("medium") == "rtsps://host/medium"
+    assert stream.get_url("low") is None
+    assert stream.get_url("nonexistent") is None
+
+
+def test_fob_display_name() -> None:
+    """Test Fob display_name property with name, mac, and id fallbacks."""
+    assert Fob(id="fob1", name="Key", mac="aa:bb").display_name == "Key"
+    assert Fob(id="fob2", mac="aa:bb").display_name == "aa:bb"
+    assert Fob(id="fob3").display_name == "fob3"
+
+
+def test_light_display_name() -> None:
+    """Test Light display_name property."""
+    assert Light(id="l1", name="Floodlight", mac="aa:bb").display_name == "Floodlight"
+    assert Light(id="l2", mac="aa:bb").display_name == "aa:bb"
+
+
+def test_link_station_display_name() -> None:
+    """Test LinkStation display_name property."""
+    assert LinkStation(id="ls1", name="Hub", mac="aa:bb").display_name == "Hub"
+    assert LinkStation(id="ls2", mac="aa:bb").display_name == "aa:bb"
+    assert LinkStation(id="ls3").display_name == "ls3"

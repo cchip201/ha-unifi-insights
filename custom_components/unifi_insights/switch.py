@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Support for UniFi switches (Network and Protect)."""
 
 from __future__ import annotations
@@ -12,12 +13,17 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .access_entity import (
+    UnifiAccessEntity,
+    access_coordinator_for,
+    access_unique_id,
+    async_discover_access_entities,
+    console_device_info,
+)
 from .const import (
     ATTR_CAMERA_ID,
     ATTR_CAMERA_NAME,
     ATTR_HIGH_FPS_MODE,
-    ATTR_MIC_ENABLED,
-    ATTR_PRIVACY_MODE,
     ATTR_STATUS_LIGHT,
     CONF_CLIENT_CONTROL,
     DEFAULT_CLIENT_CONTROL,
@@ -27,6 +33,12 @@ from .const import (
     VIDEO_MODE_DEFAULT,
     VIDEO_MODE_HIGH_FPS,
 )
+from .coordinators.config_sections import (
+    is_predefined_firewall_rule as _is_predefined_firewall_rule,
+)
+from .coordinators.config_sections import (
+    is_predefined_nat_rule,
+)
 from .entity import (
     UnifiProtectEntity,
     async_call_coordinator_action,
@@ -35,6 +47,7 @@ from .entity import (
     is_ephemeral_client,
     is_gateway_device,
 )
+from .network_rule_switch import discover_network_rule_switches
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,6 +57,7 @@ if TYPE_CHECKING:
 
     from . import UnifiInsightsConfigEntry
     from .coordinators import UnifiFacadeCoordinator
+    from .coordinators.access import UnifiInsightsAccessCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,18 +72,6 @@ def _get_firewall_rule_action(rule_data: dict[str, Any]) -> str | None:
         action_type = action.get("type")
         return str(action_type) if action_type is not None else None
     return str(action) if action is not None else None
-
-
-def _is_predefined_firewall_rule(rule_data: dict[str, Any]) -> bool:
-    """Return True when a firewall rule appears to be system-defined."""
-    metadata = rule_data.get("metadata")
-    if isinstance(metadata, dict) and metadata.get("origin") == "SYSTEM_DEFINED":
-        return True
-    return bool(
-        rule_data.get("predefined")
-        or rule_data.get("isPredefined")
-        or rule_data.get("isSystem")
-    )
 
 
 def _is_derived_firewall_rule(rule_data: Any) -> bool:
@@ -126,16 +128,16 @@ def _stale_switch_unique_ids(
     unique_id_suffix: str,
     data_key: str,
     availability_fn: Callable[[str], bool],
-    gets_switch: Callable[[Any], bool] | None = None,
+    is_hidden_fn: Callable[[Any], bool] | None = None,
 ) -> set[str]:
     """
     Return unique_ids of switches whose backing object no longer exists.
 
-    ``gets_switch`` (cmcore) narrows "exists" to the objects that still get a
-    switch: an object it rejects counts as gone, so a switch the integration no
-    longer creates for it - a derived "(Return)" firewall policy - is pruned
-    like a deleted one. The empty-collection guard below still looks at the
-    raw collection.
+    ``is_hidden_fn`` narrows "exists" to the objects that still get a switch:
+    an object it accepts counts as gone, so a switch the integration no longer
+    creates for it - a console-managed NAT rule, or (cmcore) a derived
+    "(Return)" firewall policy - is pruned like a deleted one. The
+    empty-collection guard below still looks at the raw collection.
 
     Policy-based-route, firewall-rule, and VPN-client switches have no
     cleanup: deleting the underlying object on the console leaves ``available``
@@ -199,7 +201,7 @@ def _stale_switch_unique_ids(
             continue
         qualified_site_ids.add(site_id)
         for object_id, object_data in site_objects.items():
-            if gets_switch is not None and not gets_switch(object_data):
+            if is_hidden_fn is not None and is_hidden_fn(object_data):
                 continue
             live_unique_ids.add(f"{site_id}_{object_id}{unique_id_suffix}")
 
@@ -235,7 +237,7 @@ def _prune_orphaned_switch_entities(
     coordinator: UnifiFacadeCoordinator,
 ) -> None:
     """
-    Remove registry rows for deleted routes, rules, and VPN clients.
+    Remove registry rows for rule switches whose rule no longer exists.
 
     Runs once, after the first discovery pass in ``async_setup_entry`` --
     NOT on every coordinator update -- following the ``sensor.py`` stale
@@ -268,7 +270,7 @@ def _prune_orphaned_switch_entities(
             "_firewall_rule",
             "firewall_rules",
             coordinator.firewall_available,
-            lambda rule_data: not _is_derived_firewall_rule(rule_data),
+            _is_derived_firewall_rule,
         ),
         (
             "_vpn_client",
@@ -276,17 +278,41 @@ def _prune_orphaned_switch_entities(
             lambda _site_id: coordinator.config_available,
             None,
         ),
+        (
+            "_port_forward",
+            "port_forwards",
+            coordinator.port_forwards_available,
+            None,
+        ),
+        (
+            "_traffic_rule",
+            "traffic_rules",
+            coordinator.traffic_rules_available,
+            None,
+        ),
+        (
+            "_nat_rule",
+            "nat_rules",
+            coordinator.nat_rules_available,
+            is_predefined_nat_rule,
+        ),
+        (
+            "_static_route",
+            "static_routes",
+            coordinator.static_routes_available,
+            None,
+        ),
     )
 
     stale_unique_ids: set[str] = set()
-    for unique_id_suffix, data_key, availability_fn, gets_switch in specs:
+    for unique_id_suffix, data_key, availability_fn, is_hidden_fn in specs:
         stale_unique_ids |= _stale_switch_unique_ids(
             coordinator,
             reg_entries,
             unique_id_suffix=unique_id_suffix,
             data_key=data_key,
             availability_fn=availability_fn,
-            gets_switch=gets_switch,
+            is_hidden_fn=is_hidden_fn,
         )
 
     for reg_entry in reg_entries:
@@ -295,12 +321,85 @@ def _prune_orphaned_switch_entities(
             registry.async_remove(reg_entry.entity_id)
 
 
+EMERGENCY_MODES = ("lockdown", "evacuation")
+
+
+class UnifiAccessEmergencySwitch(UnifiAccessEntity, SwitchEntity):
+    """One console-wide emergency mode. Lockdown and Evacuation exclude each other."""
+
+    _feature = "emergency"
+
+    def __init__(self, coordinator: UnifiInsightsAccessCoordinator, mode: str) -> None:
+        """Create the switch for one emergency mode on the console device."""
+        super().__init__(coordinator)
+        self._mode = mode
+        self._attr_translation_key = f"access_emergency_{mode}"
+        self._attr_unique_id = access_unique_id(self._namespace, "emergency", mode)
+        self._attr_device_info = console_device_info(self._namespace)
+
+    def _is_present(self) -> bool:
+        """Return True once the console has reported its emergency state."""
+        return self.coordinator.data["emergency"] is not None
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return the mode as the console last reported it, or None when unknown."""
+        emergency = self.coordinator.data["emergency"]
+        if emergency is None:
+            return None
+        value: bool | None = emergency[self._mode]
+        return value
+
+    async def async_turn_on(self, **kwargs: object) -> None:  # noqa: ARG002
+        """Turn this mode on; the coordinator clears the other mode."""
+        await async_call_coordinator_action(
+            self.coordinator,
+            "async_set_emergency_mode",
+            "Could not change the Access emergency mode",
+            self._mode,
+            enabled=True,
+        )
+
+    async def async_turn_off(self, **kwargs: object) -> None:  # noqa: ARG002
+        """Turn this mode off and keep the other mode as the console reports it."""
+        await async_call_coordinator_action(
+            self.coordinator,
+            "async_set_emergency_mode",
+            "Could not change the Access emergency mode",
+            self._mode,
+            enabled=False,
+        )
+
+
+@callback
+def async_setup_access_switches(
+    entry: UnifiInsightsConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    """Create the Lockdown and Evacuation switches when the console supports them."""
+    coordinator = access_coordinator_for(entry)
+    if coordinator is None:
+        return
+
+    async_discover_access_entities(
+        entry,
+        coordinator,
+        async_add_entities,
+        known_ids=set(),
+        keys=lambda: (
+            EMERGENCY_MODES if coordinator.feature_available("emergency") else ()
+        ),
+        make=lambda mode: UnifiAccessEmergencySwitch(coordinator, mode),
+    )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up switches for UniFi integration."""
+    """Set up switches for UniFi Insights integration."""
+    # Access is set up before the Protect-dependent switches below.
+    async_setup_access_switches(entry, async_add_entities)
     coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
     client_control = entry.options.get(CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL)
 
@@ -320,6 +419,34 @@ async def async_setup_entry(
                     reg_entry.entity_id,
                 )
                 registry.async_remove(reg_entry.entity_id)
+
+    # Remove obsolete camera microphone switches (#269).
+    for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if (
+            reg_entry.domain == "switch"
+            and reg_entry.platform == DOMAIN
+            and reg_entry.unique_id.startswith(f"{DOMAIN}_{DEVICE_TYPE_CAMERA}_")
+            and reg_entry.unique_id.endswith("_microphone")
+        ):
+            _LOGGER.debug(
+                "Removing obsolete camera microphone switch %s",
+                reg_entry.entity_id,
+            )
+            registry.async_remove(reg_entry.entity_id)
+
+    # Remove obsolete camera privacy mode switches (#271).
+    for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if (
+            reg_entry.domain == "switch"
+            and reg_entry.platform == DOMAIN
+            and reg_entry.unique_id.startswith(f"{DOMAIN}_{DEVICE_TYPE_CAMERA}_")
+            and reg_entry.unique_id.endswith("_privacy_mode")
+        ):
+            _LOGGER.debug(
+                "Removing obsolete camera privacy mode switch %s",
+                reg_entry.entity_id,
+            )
+            registry.async_remove(reg_entry.entity_id)
 
     known_switch_keys: set[tuple[Any, ...]] = set()
     first_setup = True
@@ -345,26 +472,6 @@ async def async_setup_entry(
                     for camera_id, camera_data in cameras.items():
                         if not isinstance(camera_data, dict):
                             continue
-                        # Microphone switch
-                        mic_key = (camera_id, "mic")
-                        if mic_key not in known_switch_keys:
-                            known_switch_keys.add(mic_key)
-                            entities.append(
-                                UnifiProtectMicrophoneSwitch(
-                                    coordinator=coordinator,
-                                    camera_id=camera_id,
-                                )
-                            )
-                        # Privacy mode switch
-                        privacy_key = (camera_id, "privacy")
-                        if privacy_key not in known_switch_keys:
-                            known_switch_keys.add(privacy_key)
-                            entities.append(
-                                UnifiProtectPrivacySwitch(
-                                    coordinator=coordinator,
-                                    camera_id=camera_id,
-                                )
-                            )
                         # Status light switch
                         status_light_key = (camera_id, "status_light")
                         if status_light_key not in known_switch_keys:
@@ -402,7 +509,8 @@ async def async_setup_entry(
                         if not isinstance(client_data, dict):
                             continue
                         if is_ephemeral_client(client_data):
-                            continue  # cmcore fork (backlog 529): randomized MAC, no name
+                            # cmcore fork (backlog 529): randomized MAC, no name
+                            continue
                         key = (site_id, client_id, "block_switch")
                         if key in known_switch_keys:
                             continue
@@ -560,6 +668,8 @@ async def async_setup_entry(
                             client_id=client_id,
                         )
                     )
+
+        entities.extend(discover_network_rule_switches(coordinator, known_switch_keys))
 
         if entities or first_setup:
             _LOGGER.info("Adding %d UniFi switches", len(entities))
@@ -1040,169 +1150,6 @@ UnifiPolicyBasedRouteSwitch = UnifiInsightsPolicyBasedRouteSwitch
 UnifiVpnClientSwitch = UnifiInsightsVpnClientSwitch
 
 
-class UnifiProtectMicrophoneSwitch(UnifiProtectEntity, SwitchEntity):
-    """Representation of a UniFi Protect Camera Microphone Switch."""
-
-    _attr_has_entity_name = True
-    _attr_translation_key = "microphone"
-
-    def __init__(
-        self,
-        coordinator: UnifiFacadeCoordinator,
-        camera_id: str,
-    ) -> None:
-        """Initialize the switch."""
-        super().__init__(coordinator, DEVICE_TYPE_CAMERA, camera_id, "microphone")
-
-        # Set entity category
-        self._attr_entity_category = EntityCategory.CONFIG
-
-        # Set initial state
-        self._update_from_data()
-
-    def _update_from_data(self) -> None:
-        """Update entity from data."""
-        camera_data = self.coordinator.data["protect"]["cameras"].get(
-            self._device_id, {}
-        )
-
-        # Protect v7.1+ renamed the field from micEnabled to isMicEnabled.
-        # Try the new name first so both firmware generations work correctly.
-        mic_val = camera_data.get("isMicEnabled")
-        if mic_val is None:
-            mic_val = camera_data.get("micEnabled", False)
-        self._attr_is_on = bool(mic_val)
-
-        # Set attributes
-        self._attr_extra_state_attributes = {
-            ATTR_CAMERA_ID: self._device_id,
-            ATTR_CAMERA_NAME: camera_data.get("name"),
-            ATTR_MIC_ENABLED: self._attr_is_on,
-        }
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the microphone on."""
-        _ = kwargs
-        _LOGGER.debug("Turning on microphone for camera %s", self._device_id)
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera",
-            f"Unable to turn on microphone for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                isMicEnabled=True,
-            ),
-            isMicEnabled=True,
-        )
-        self._attr_is_on = True
-        self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the microphone off."""
-        _ = kwargs
-        _LOGGER.debug("Turning off microphone for camera %s", self._device_id)
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera",
-            f"Unable to turn off microphone for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                isMicEnabled=False,
-            ),
-            isMicEnabled=False,
-        )
-        self._attr_is_on = False
-        self.async_write_ha_state()
-
-
-class UnifiProtectPrivacySwitch(UnifiProtectEntity, SwitchEntity):
-    """Representation of a UniFi Protect Camera Privacy Mode Switch."""
-
-    _attr_has_entity_name = True
-    _attr_translation_key = "privacy_mode"
-    _attr_icon = "mdi:eye-off"
-
-    def __init__(
-        self,
-        coordinator: UnifiFacadeCoordinator,
-        camera_id: str,
-    ) -> None:
-        """Initialize the switch."""
-        super().__init__(coordinator, DEVICE_TYPE_CAMERA, camera_id, "privacy_mode")
-
-        # Set entity category
-        self._attr_entity_category = EntityCategory.CONFIG
-
-        # Set initial state
-        self._update_from_data()
-
-    def _update_from_data(self) -> None:
-        """Update entity from data."""
-        camera_data = self.coordinator.data["protect"]["cameras"].get(
-            self._device_id, {}
-        )
-
-        # Privacy mode is stored in privacyZones - if any exist with non-empty points,
-        # privacy mode is on. The isPrivacyModeEnabled flag may also be available.
-        privacy_zones = camera_data.get("privacyZones", [])
-        is_privacy_enabled = camera_data.get("isPrivacyModeEnabled", False)
-
-        # Privacy is on if explicitly enabled or if privacy zones are configured
-        self._attr_is_on = is_privacy_enabled or (
-            len(privacy_zones) > 0
-            and any(zone.get("points", []) for zone in privacy_zones)
-        )
-
-        # Set attributes
-        self._attr_extra_state_attributes = {
-            ATTR_CAMERA_ID: self._device_id,
-            ATTR_CAMERA_NAME: camera_data.get("name"),
-            ATTR_PRIVACY_MODE: self._attr_is_on,
-        }
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn privacy mode on."""
-        _ = kwargs
-        _LOGGER.debug("Enabling privacy mode for camera %s", self._device_id)
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera_settings",
-            f"Unable to enable privacy mode for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                is_privacy_mode_enabled=True,
-            ),
-            is_privacy_mode_enabled=True,
-        )
-        self._attr_is_on = True
-        self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn privacy mode off."""
-        _ = kwargs
-        _LOGGER.debug("Disabling privacy mode for camera %s", self._device_id)
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_update_camera_settings",
-            f"Unable to disable privacy mode for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
-                self._device_id,
-                is_privacy_mode_enabled=False,
-            ),
-            is_privacy_mode_enabled=False,
-        )
-        self._attr_is_on = False
-        self.async_write_ha_state()
-
-
 class UnifiProtectStatusLightSwitch(UnifiProtectEntity, SwitchEntity):
     """Representation of a UniFi Protect Camera Status Light Switch."""
 
@@ -1254,9 +1201,9 @@ class UnifiProtectStatusLightSwitch(UnifiProtectEntity, SwitchEntity):
             self._device_id,
             fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
                 self._device_id,
-                led_settings={"isEnabled": True},
+                ledSettings={"isEnabled": True},
             ),
-            led_settings={"isEnabled": True},
+            ledSettings={"isEnabled": True},
         )
         self._attr_is_on = True
         self.async_write_ha_state()
@@ -1273,9 +1220,9 @@ class UnifiProtectStatusLightSwitch(UnifiProtectEntity, SwitchEntity):
             self._device_id,
             fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
                 self._device_id,
-                led_settings={"isEnabled": False},
+                ledSettings={"isEnabled": False},
             ),
-            led_settings={"isEnabled": False},
+            ledSettings={"isEnabled": False},
         )
         self._attr_is_on = False
         self.async_write_ha_state()
@@ -1331,9 +1278,9 @@ class UnifiProtectHighFPSSwitch(UnifiProtectEntity, SwitchEntity):
             self._device_id,
             fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
                 self._device_id,
-                video_mode=VIDEO_MODE_HIGH_FPS,
+                videoMode=VIDEO_MODE_HIGH_FPS,
             ),
-            video_mode=VIDEO_MODE_HIGH_FPS,
+            videoMode=VIDEO_MODE_HIGH_FPS,
         )
         self._attr_is_on = True
         self.async_write_ha_state()
@@ -1350,9 +1297,9 @@ class UnifiProtectHighFPSSwitch(UnifiProtectEntity, SwitchEntity):
             self._device_id,
             fallback_factory=lambda: self.coordinator.protect_client.cameras.update(  # type: ignore[union-attr]
                 self._device_id,
-                video_mode=VIDEO_MODE_DEFAULT,
+                videoMode=VIDEO_MODE_DEFAULT,
             ),
-            video_mode=VIDEO_MODE_DEFAULT,
+            videoMode=VIDEO_MODE_DEFAULT,
         )
         self._attr_is_on = False
         self.async_write_ha_state()

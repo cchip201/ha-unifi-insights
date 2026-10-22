@@ -34,32 +34,35 @@ restart_device:
       selector:
         text:
 
-# UniFi Protect Camera services
-set_recording_mode:
-  name: Set Recording Mode
-  description: Set the recording mode for a UniFi Protect camera.
+power_cycle_port:
+  name: Power Cycle PoE Port
+  description: Power-cycle a PoE-enabled port on a UniFi network device.
   target:
     entity:
       integration: unifi_insights
-      domain: camera
   fields:
-    camera_id:
-      name: Camera ID
-      description: The ID of the camera
+    site_id:
+      name: Site ID
+      description: The site ID where the device is located (optional when targeting a device).
       required: false
       selector:
         text:
-    mode:
-      name: Recording Mode
-      description: The recording mode to set
+    device_id:
+      name: Device ID
+      description: The ID of the device to power-cycle a port on.
+      required: false
+      selector:
+        text:
+    port_idx:
+      name: Port Index
+      description: The 1-based port index to power-cycle.
       required: true
       selector:
-        select:
-          options:
-            - "always"
-            - "never"
-            - "detections"
+        number:
+          min: 1
+          mode: box
 
+# UniFi Protect Camera services
 set_hdr_mode:
   name: Set HDR Mode
   description: Set the HDR mode for a UniFi Protect camera.
@@ -127,11 +130,11 @@ set_mic_volume:
         text:
     volume:
       name: Volume
-      description: Microphone volume level (0-100)
+      description: Microphone volume level (1-100)
       required: true
       selector:
         number:
-          min: 0
+          min: 1
           max: 100
           step: 1
 
@@ -283,7 +286,9 @@ set_chime_volume:
 
 play_chime_ringtone:
   name: Play Chime Ringtone
-  description: Play a ringtone on a UniFi Protect chime.
+  description: >-
+    This action always raises a not supported error because the official
+    Protect API has no chime playback route.
   target:
     entity:
       integration: unifi_insights
@@ -298,19 +303,12 @@ play_chime_ringtone:
     ringtone_id:
       name: Ringtone ID
       description: >-
-        Optional ringtone ID to play (uses current setting if not specified)
+        Kept only so existing automations stay valid. The action raises the
+        same not supported error with or without this field.
       required: false
-      example: "default"
+      example: "example-ringtone-id"
       selector:
-        select:
-          options:
-            - "default"
-            - "mechanical"
-            - "digital"
-            - "christmas"
-            - "traditional"
-            - "custom1"
-            - "custom2"
+        text:
 
 set_chime_ringtone:
   name: Set Chime Ringtone
@@ -328,19 +326,14 @@ set_chime_ringtone:
         text:
     ringtone_id:
       name: Ringtone ID
-      description: Ringtone to set
+      description: >-
+        Protect ringtone ID to set for every paired doorbell. Read IDs from
+        the Ringtone select or its chime_ringtone_id attribute. The select
+        lists only IDs already used by this console's chimes.
       required: true
-      example: "default"
+      example: "example-ringtone-id"
       selector:
-        select:
-          options:
-            - "default"
-            - "mechanical"
-            - "digital"
-            - "christmas"
-            - "traditional"
-            - "custom1"
-            - "custom2"
+        text:
     camera_id:
       name: Camera ID
       description: >-
@@ -393,7 +386,56 @@ set_chime_repeat_times:
       selector:
         text:
 
+set_chime_paired_doorbells:
+  name: Set Chime Paired Doorbells
+  description: >-
+    Choose which doorbells ring a UniFi Protect chime. The selection replaces
+    the chime's current pairing. Leave Doorbells empty to unpair every
+    doorbell.
+  target:
+    entity:
+      integration: unifi_insights
+  fields:
+    chime_id:
+      name: Chime ID
+      description: >-
+        ID of the chime. Not needed when the chime is picked as the target.
+      required: false
+      example: "60e9c8c0e3e4b8001a123456"
+      selector:
+        text:
+    doorbells:
+      name: Doorbells
+      description: >-
+        Doorbell ring sensors of this integration, or the doorbell devices or
+        areas that hold them. Only doorbells on the chime's console are
+        accepted.
+      required: false
+      example: "binary_sensor.front_doorbell_doorbell_ring"
+      selector:
+        target:
+          entity:
+            integration: unifi_insights
+            domain: binary_sensor
+            device_class: occupancy
+
 # UniFi Network services
+reconnect_client:
+  target:
+    entity:
+      integration: unifi_insights
+  fields:
+    site_id:
+      required: true
+      selector:
+        text:
+    client_id:
+      required: false
+      selector:
+        text:
+
+remove_clients:
+
 authorize_guest:
   name: Authorize Guest
   description: Authorize guest access for a client on the UniFi Network.
@@ -517,6 +559,34 @@ delete_voucher:
       selector:
         text:
 
+export_network_rules:
+  fields:
+    site_id:
+      required: false
+      selector:
+        text:
+    console_id:
+      required: false
+      selector:
+        text:
+    rule_types:
+      required: false
+      selector:
+        select:
+          multiple: true
+          options:
+            - firewall_rule
+            - policy_based_route
+            - port_forward
+            - traffic_rule
+            - nat_rule
+            - static_route
+    redact:
+      required: false
+      default: true
+      selector:
+        boolean:
+
 # UniFi Protect services
 trigger_alarm:
   name: Trigger Alarm
@@ -592,5 +662,78 @@ set_liveview:
       name: Live View ID
       description: The ID of the live view to set
       required: true
+      selector:
+        text:
+
+carrier_suspend_subscriber:
+  name: Suspend Subscriber
+  description: >-
+    Stop a subscriber's internet service. Requires the "Enable service actions"
+    option to be enabled on the Carrier Fabric integration entry, and an ISP
+    API key with the suspend:service scope.
+  target:
+    entity:
+      integration: unifi_insights
+  fields:
+    reason:
+      name: Reason
+      description: >-
+        Optional reason for stopping the subscriber's service (maximum 1024 characters).
+      required: false
+      selector:
+        text:
+
+carrier_resume_subscriber:
+  name: Resume Subscriber
+  description: >-
+    Restore a subscriber's internet service. Requires the "Enable service actions"
+    option to be enabled on the Carrier Fabric integration entry, and an ISP
+    API key with the resume:service scope.
+  target:
+    entity:
+      integration: unifi_insights
+
+set_access_user_pin:
+  fields:
+    user_id:
+      required: true
+      selector:
+        text:
+    pin:
+      required: true
+      selector:
+        text:
+          type: password
+    console_id:
+      required: false
+      selector:
+        text:
+
+remove_access_user_pin:
+  fields:
+    user_id:
+      required: true
+      selector:
+        text:
+    console_id:
+      required: false
+      selector:
+        text:
+
+set_access_user_status:
+  fields:
+    user_id:
+      required: true
+      selector:
+        text:
+    status:
+      required: true
+      selector:
+        select:
+          options:
+            - "ACTIVE"
+            - "DEACTIVATED"
+    console_id:
+      required: false
       selector:
         text:

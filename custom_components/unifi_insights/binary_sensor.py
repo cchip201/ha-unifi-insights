@@ -1,3 +1,4 @@
+# Copyright 2026 UniFi Insights contributors
 """Support for UniFi Insights binary sensors."""
 
 from __future__ import annotations
@@ -33,11 +34,8 @@ from .const import (
     ATTR_SENSOR_OPEN_STATUS_CHANGED_AT,
     ATTR_SENSOR_TAMPER_DETECTED,
     ATTR_SENSOR_TAMPER_DETECTED_AT,
-    CAMERA_TYPE_DOORBELL,
-    CAMERA_TYPE_DOORBELL_MAIN,
-    CAMERA_TYPE_DOORBELL_PACKAGE,
-    CAMERA_TYPE_DOORBELL_WITH_PACKAGE_DETECTION,
     DEVICE_TYPE_CAMERA,
+    DEVICE_TYPE_NVR,
     DEVICE_TYPE_SENSOR,
     SMART_DETECT_ANIMAL,
     SMART_DETECT_PACKAGE,
@@ -51,6 +49,11 @@ from .entity import (
     is_device_online,
     is_gateway_device,
 )
+from .helpers import is_doorbell_camera_model
+from .mobility_entity import async_setup_mobility_binary_sensors
+from .protect_security_entity import discover_protect_security_binary_sensors
+from .storage_entity import discover_storage_binary_sensors
+from .storage_telemetry import normalize_nvr_storage
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -118,28 +121,8 @@ def _is_smart_detect_active(camera_data: dict[str, Any], detect_type: str) -> bo
 
 def _is_doorbell_camera(camera_data: dict[str, Any]) -> bool:
     """Check if a camera is a doorbell camera."""
-    # Check camera type metadata set by the API client
-    camera_type = camera_data.get("_camera_type") or ""
-    if camera_type in [
-        CAMERA_TYPE_DOORBELL,
-        CAMERA_TYPE_DOORBELL_WITH_PACKAGE_DETECTION,
-        CAMERA_TYPE_DOORBELL_MAIN,
-        CAMERA_TYPE_DOORBELL_PACKAGE,
-    ]:
-        return True
-
-    # Fallback: Check camera type field from API (handle None safely)
-    api_camera_type = (camera_data.get("type") or "").lower()
-    if any(
-        doorbell_type in api_camera_type
-        for doorbell_type in [
-            "doorbell",
-            "g4-doorbell",
-            "ai-doorbell",
-            "g4doorbell",
-            "aidoorbell",
-        ]
-    ):
+    # The camera's type metadata and the API type field
+    if is_doorbell_camera_model(camera_data):
         return True
 
     # Fallback: Check camera name for doorbell indicators
@@ -175,6 +158,17 @@ def _water_leak_channel_count(sensor_data: dict[str, Any]) -> int:
     if isinstance(raw_count, str) and raw_count.isdigit():
         return int(raw_count)
     return 0
+
+
+def _camera_has_mic(camera_data: dict[str, Any]) -> bool:
+    """Return True if the camera has a microphone, defaulting to True when missing."""
+    feature_flags = get_field(camera_data, "featureFlags", "feature_flags")
+    if not isinstance(feature_flags, dict):
+        return True
+    has_mic = get_field(feature_flags, "hasMic", "has_mic")
+    if has_mic is None:
+        return True
+    return bool(has_mic)
 
 
 def _supports_internal_leak(sensor_data: dict[str, Any]) -> bool:
@@ -228,13 +222,33 @@ def _is_external_leak_detected(sensor_data: dict[str, Any]) -> bool:
 class UnifiInsightsBinarySensorEntityDescription(BinarySensorEntityDescription):  # type: ignore[misc]
     """Class describing UniFi Insights binary sensor entities."""
 
-    value_fn: Callable[[dict[str, Any]], bool] | None = None
+    value_fn: Callable[[dict[str, Any]], bool | None] | None = None
     device_type: str | None = None
     entity_type: str = "device"  # "device" or "protect"
     capability_fn: Callable[[dict[str, Any]], bool] | None = None
 
 
 BINARY_SENSOR_TYPES: tuple[UnifiInsightsBinarySensorEntityDescription, ...] = (
+    UnifiInsightsBinarySensorEntityDescription(
+        key="storage_degraded",
+        translation_key="storage_degraded",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: normalize_nvr_storage(data).degraded,
+        device_type=DEVICE_TYPE_NVR,
+        entity_type="protect",
+        capability_fn=lambda data: normalize_nvr_storage(data).degraded is not None,
+    ),
+    UnifiInsightsBinarySensorEntityDescription(
+        key="storage_nearly_full",
+        translation_key="storage_nearly_full",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: normalize_nvr_storage(data).nearly_full,
+        device_type=DEVICE_TYPE_NVR,
+        entity_type="protect",
+        capability_fn=lambda data: normalize_nvr_storage(data).nearly_full is not None,
+    ),
     # Network device status
     UnifiInsightsBinarySensorEntityDescription(
         key="device_status",
@@ -315,6 +329,20 @@ BINARY_SENSOR_TYPES: tuple[UnifiInsightsBinarySensorEntityDescription, ...] = (
         ),
         device_type=DEVICE_TYPE_CAMERA,
         entity_type="protect",
+    ),
+    # Camera microphone status (read-only)
+    UnifiInsightsBinarySensorEntityDescription(
+        key="camera_microphone",
+        translation_key="camera_microphone",
+        device_type=DEVICE_TYPE_CAMERA,
+        entity_type="protect",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        capability_fn=_camera_has_mic,
+        value_fn=lambda device: bool(
+            device.get("isMicEnabled")
+            if device.get("isMicEnabled") is not None
+            else device.get("micEnabled", False)
+        ),
     ),
     # Sensor motion detection
     UnifiInsightsBinarySensorEntityDescription(
@@ -515,6 +543,16 @@ async def async_setup_entry(
                                 )
                             )
 
+                    entities.extend(
+                        discover_storage_binary_sensors(
+                            coordinator,
+                            site_id,
+                            device_id,
+                            device_data,
+                            known_sensor_keys,
+                        )
+                    )
+
                     # Site-to-site VPN tunnels, one sensor each, on the gateway.
                     # Devices reporting WAN links route traffic even when their
                     # model/features are not recognised.
@@ -566,6 +604,10 @@ async def async_setup_entry(
                             if (
                                 description.entity_type == "protect"
                                 and description.device_type == DEVICE_TYPE_CAMERA
+                                and (
+                                    description.capability_fn is None
+                                    or description.capability_fn(camera_data)
+                                )
                             ):
                                 # Skip doorbell sensors for non-doorbell cameras
                                 if description.key in [
@@ -628,6 +670,35 @@ async def async_setup_entry(
                                     )
                                 )
 
+        if coordinator.protect_client and isinstance(coordinator.data, dict):
+            protect = coordinator.data.get("protect", {})
+            nvrs = protect.get("nvrs", {}) if isinstance(protect, dict) else {}
+            if isinstance(nvrs, dict):
+                for nvr_id, nvr_data in nvrs.items():
+                    if not isinstance(nvr_data, dict):
+                        continue
+                    for description in BINARY_SENSOR_TYPES:
+                        if (
+                            description.device_type != DEVICE_TYPE_NVR
+                            or description.capability_fn is None
+                            or not description.capability_fn(nvr_data)
+                        ):
+                            continue
+                        nvr_key = (nvr_id, description.key)
+                        if nvr_key in known_sensor_keys:
+                            continue
+                        known_sensor_keys.add(nvr_key)
+                        entities.append(
+                            UnifiInsightsNVRStorageBinarySensor(
+                                coordinator, description, nvr_id
+                            )
+                        )
+
+        # Add Protect alarm hub, link station and fob binary sensors
+        entities.extend(
+            discover_protect_security_binary_sensors(coordinator, known_sensor_keys)
+        )
+
         if entities:
             _LOGGER.info("Adding %d UniFi Insights binary sensors", len(entities))
             async_add_entities(entities)
@@ -636,6 +707,11 @@ async def async_setup_entry(
     config_entry.async_on_unload(
         coordinator.async_add_listener(async_discover_binary_sensors)
     )
+
+    if mobility_coordinator := config_entry.runtime_data.mobility_coordinator:
+        async_setup_mobility_binary_sensors(
+            hass, config_entry, mobility_coordinator, async_add_entities
+        )
 
 
 class UnifiInsightsBinarySensor(UnifiInsightsEntity, BinarySensorEntity):
@@ -738,7 +814,9 @@ class UnifiProtectBinarySensor(UnifiProtectEntity, BinarySensorEntity):
             ),
         )
 
-        if self.entity_description.device_type == DEVICE_TYPE_CAMERA:
+        if self.entity_description.key == "camera_microphone":
+            self._attr_extra_state_attributes = {}
+        elif self.entity_description.device_type == DEVICE_TYPE_CAMERA:
             self._attr_extra_state_attributes = {
                 ATTR_CAMERA_ID: self._device_id,
                 ATTR_CAMERA_NAME: device_name,
@@ -769,6 +847,22 @@ class UnifiProtectBinarySensor(UnifiProtectEntity, BinarySensorEntity):
                     "externalLeakDetectedAt", 0
                 ),
             }
+
+
+class UnifiInsightsNVRStorageBinarySensor(UnifiProtectBinarySensor):
+    """Conditional NVR problems; missing telemetry stays unavailable."""
+
+    @property
+    def available(self) -> bool:
+        """NVRs have no required state field; gate on each explicit signal."""
+        data = self.device_data
+        return (
+            self.coordinator.protect_available
+            and data is not None
+            and bool(data)
+            and data.get("state") not in ("DISCONNECTED", "DISCONNECTING")
+            and self.is_on is not None
+        )
 
 
 class UnifiPortBinarySensor(UnifiInsightsEntity, BinarySensorEntity):

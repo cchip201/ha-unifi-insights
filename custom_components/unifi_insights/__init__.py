@@ -1,11 +1,13 @@
+# Copyright 2026 UniFi Insights contributors
 """The UniFi Insights integration."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import homeassistant.helpers.config_validation as cv
 from homeassistant.config_entries import ConfigEntry
@@ -14,40 +16,72 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .access_webhook import (
+    async_remove_access_webhook,
+    async_setup_access_webhook,
+    async_unload_access_webhook,
+)
 from .api import (
     ApiKeyAuth,
     ConnectionType,
     LocalAuth,
     UniFiConnectionError,
+    UniFiError,
     UniFiTimeoutError,
 )
+from .api.access import UniFiAccessClient
+from .api.carrier_fabric.client import UniFiCarrierFabricClient
 from .api.innerspace import UniFiInnerSpaceClient
 from .api.network import UniFiNetworkClient
 from .api.protect import UniFiProtectClient
+from .carrier_fabric_data import (
+    CarrierFabricConfigEntry,
+    CarrierFabricData,
+)
 from .console_identity import (
+    build_legacy_site_unique_id,
+    build_site_unique_id,
     first_non_default_site_id,
     is_console_device,
+    normalize_console_namespace,
     normalize_mac,
     resolve_console_identity,
+    resolve_console_namespace,
 )
 from .const import (
+    CARRIER_FABRIC_REQUEST_TIMEOUT,
+    CONF_ACCESS_PORT,
+    CONF_ACCESS_TOKEN,
+    CONF_CARRIER_ORG_ID,
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
+    CONNECTION_TYPE_CARRIER_FABRIC,
     CONNECTION_TYPE_LOCAL,
+    DEFAULT_ACCESS_PORT,
     DEFAULT_API_HOST,
     DOMAIN,
+    MOBILITY_DEVICE_PREFIX,
+    MOBILITY_WORKSPACE_PREFIX,
 )
 from .const import (
     CONNECTION_TYPE_REMOTE as CONNECTION_TYPE_REMOTE,
 )
 from .coordinators import (
+    UnifiCarrierFabricCoordinator,
     UnifiConfigCoordinator,
     UnifiDeviceCoordinator,
     UnifiFacadeCoordinator,
     UnifiInsightsInnerSpaceCoordinator,
+    UnifiInsightsMobilityCoordinator,
     UnifiInsightsSiteManagerCoordinator,
     UnifiProtectCoordinator,
+)
+from .coordinators.access import UnifiInsightsAccessCoordinator
+from .coordinators.mobility import (
+    ACCESS_UNKNOWN,
+    async_hand_over_mobility,
+    async_setup_mobility,
 )
 from .coordinators.site_manager import (
     async_acquire_site_manager,
@@ -57,6 +91,8 @@ from .frontend import async_register_frontend
 from .probe import (
     ProbeResult,
     ProbeStatus,
+    async_probe_access,
+    async_probe_carrier_fabric,
     async_probe_innerspace,
     async_probe_network,
     async_probe_protect,
@@ -66,6 +102,7 @@ from .topology_keys import async_load_node_keys, async_remove_node_key
 from .websocket_api import async_register_websocket_commands
 
 if TYPE_CHECKING:
+    from aiohttp import ClientSession
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.device_registry import DeviceEntry
 
@@ -83,6 +120,10 @@ class UnifiInsightsData:
     innerspace_client: UniFiInnerSpaceClient | None = None
     site_manager_coordinator: UnifiInsightsSiteManagerCoordinator | None = None
     site_manager_fingerprint: str | None = None
+    # Only the remote entry that owns its cloud key's Mobility data has one.
+    mobility_coordinator: UnifiInsightsMobilityCoordinator | None = None
+    access_client: UniFiAccessClient | None = None
+    access_coordinator: UnifiInsightsAccessCoordinator | None = None
     # Facade coordinator for backward compatibility with entity classes
     _facade_coordinator: UnifiFacadeCoordinator | None = None
 
@@ -104,25 +145,39 @@ class UnifiInsightsData:
 # Use TypeAlias for proper mypy validation (Python 3.10+ style)
 UnifiInsightsConfigEntry: TypeAlias = ConfigEntry[UnifiInsightsData]  # noqa: UP040
 
+CARRIER_FABRIC_PLATFORMS: list[Platform] = [Platform.SENSOR]
+
 PLATFORMS: list[Platform] = [
+    Platform.ALARM_CONTROL_PANEL,
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
     Platform.CAMERA,
+    Platform.COVER,
     Platform.DEVICE_TRACKER,
     Platform.EVENT,
     Platform.IMAGE,
     Platform.LIGHT,
+    Platform.LOCK,
     Platform.SWITCH,
     Platform.SELECT,
+    Platform.MEDIA_PLAYER,
     Platform.NUMBER,
     Platform.UPDATE,
+    Platform.SIREN,
 ]
 
 # Add CONFIG_SCHEMA definition
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
+
+# cmcore (backlog 1015): a UniFi site id, as this fork's gateway-keyed site-level
+# unique ids begin with one (a UUID from the integration API, or `default`).
+_FORK_SITE_ID = re.compile(
+    r"^(?:default|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # noqa: ARG001
@@ -274,7 +329,7 @@ _is_console_device = is_console_device
 
 
 def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
-    """Return a stable site id to identify a console that exposes no gateway."""
+    """Return the first non-default site ID in coordinator API order."""
     data = getattr(config_coordinator, "data", None)
     if not isinstance(data, dict):
         return None
@@ -285,73 +340,138 @@ def _first_site_id(config_coordinator: UnifiConfigCoordinator) -> str | None:
     return first_non_default_site_id(sites)
 
 
-def _migrate_site_unique_ids(
-    hass: HomeAssistant, entry: ConfigEntry, coordinator_data: dict[str, Any]
-) -> int:
+def _migrate_fork_site_unique_ids(hass: HomeAssistant, entry: ConfigEntry) -> int:
     """
-    Move site-level sensor rows from `<site>_<key>` to `<site>_<gateway>_<key>`.
+    Move this fork's gateway-keyed site-level rows to upstream's console ids.
 
-    cmcore (backlog 648, 2026-10-01): see entity.site_unique_id_prefix. A row moves
-    only when its device is THIS console's gateway device (identifier
-    `<site>_<gateway>`), so a row another console last claimed is left for that
-    console's entry; it is re-homed to this entry. Returns how many moved.
+    cmcore (backlog 648, carried into v2026.10.2 by backlog 1015): every
+    console's default site has the same id, so v2026.9.10-cmcore.5 keyed the
+    site-level client-count and internet-activity sensors
+    `<site>_<gateway>_<key>`. Upstream v2026.10.2 (#309) fixed the same
+    collision with the console namespace, `<namespace>_<site>_<key>`, and
+    migrates only its own legacy `<site>_<key>` rows, so it would leave the
+    fork's rows behind and mint new entities beside them. Before the platforms
+    set up, each row of THIS entry in the fork's shape moves to the upstream id
+    and keeps its entity_id, history and settings. A row stays as it is when
+    the entry has no namespace yet, when its target is taken, or when a legacy
+    `<site>_<key>` row exists (upstream's own migration takes that one).
+    Returns how many moved.
     """
     # Imports stay lazy here: HA loads the platform modules itself.
-    from homeassistant.helpers import device_registry as dr  # noqa: PLC0415
-
-    from .entity import find_site_gateway_device_id  # noqa: PLC0415
     from .sensor import SITE_CLIENT_SENSOR_TYPES  # noqa: PLC0415
     from .site_internet_activity_sensor import (  # noqa: PLC0415
         SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
     )
 
+    namespace = resolve_console_namespace(entry)
+    if namespace is None:
+        return 0
     keys = {d.key for d in SITE_CLIENT_SENSOR_TYPES} | {
         d.key for d in SITE_INTERNET_ACTIVITY_SENSOR_TYPES
     }
-    ent_reg = er.async_get(hass)
-    dev_reg = dr.async_get(hass)
+    registry = er.async_get(hass)
     moved = 0
-    devices = coordinator_data.get("devices")
-    if not isinstance(devices, dict):
-        return 0
-    for site_id in devices:
-        gateway_id = find_site_gateway_device_id(coordinator_data, site_id)
-        if not gateway_id:
+    for row in er.async_entries_for_config_entry(registry, entry.entry_id):
+        key = row.translation_key
+        if row.domain != Platform.SENSOR or row.platform != DOMAIN or key not in keys:
             continue
-        gateway_identifier = (DOMAIN, f"{site_id}_{gateway_id}")
-        for key in keys:
-            old_uid = f"{site_id}_{key}"
-            new_uid = f"{site_id}_{gateway_id}_{key}"
-            entity_id = ent_reg.async_get_entity_id(Platform.SENSOR, DOMAIN, old_uid)
-            if entity_id is None or ent_reg.async_get_entity_id(
-                Platform.SENSOR, DOMAIN, new_uid
-            ):
-                continue
-            row = ent_reg.async_get(entity_id)
-            device = dev_reg.async_get(row.device_id) if row and row.device_id else None
-            if device is None or gateway_identifier not in device.identifiers:
-                continue
-            ent_reg.async_update_entity(
-                entity_id, new_unique_id=new_uid, config_entry_id=entry.entry_id
+        if not row.unique_id.endswith(f"_{key}"):
+            continue
+        site_id, sep, gateway_id = row.unique_id[: -len(key) - 1].partition("_")
+        if not sep or not gateway_id or "_" in gateway_id:
+            continue
+        if not _FORK_SITE_ID.match(site_id):
+            continue
+        target = build_site_unique_id(namespace, site_id, key)
+        legacy = build_legacy_site_unique_id(site_id, key)
+        if registry.async_get_entity_id(
+            Platform.SENSOR, DOMAIN, target
+        ) or registry.async_get_entity_id(Platform.SENSOR, DOMAIN, legacy):
+            _LOGGER.warning(
+                "Leaving %s on its gateway-keyed id: the console-scoped id or a "
+                "legacy site id is already registered",
+                row.entity_id,
             )
-            moved += 1
+            continue
+        try:
+            registry.async_update_entity(row.entity_id, new_unique_id=target)
+        except ValueError:
+            _LOGGER.warning("Could not move %s to its console-scoped id", row.entity_id)
+            continue
+        moved += 1
     if moved:
         _LOGGER.info(
-            "Moved %d site-level sensor(s) to per-console unique ids (%s)",
+            "Moved %d site-level sensor(s) from gateway-keyed to console-scoped "
+            "unique ids (%s)",
             moved,
             entry.title,
         )
     return moved
 
 
+async def _async_setup_carrier_fabric_entry(
+    hass: HomeAssistant, entry: CarrierFabricConfigEntry
+) -> bool:
+    """Set up UniFi Carrier Fabric integration from a config entry."""
+    _LOGGER.info("Setting up UniFi Carrier Fabric integration")
+    api_key = entry.data[CONF_API_KEY]
+    session = async_get_clientsession(hass)
+    auth = ApiKeyAuth(api_key=api_key)
+    client = UniFiCarrierFabricClient(
+        auth=auth, session=session, timeout=CARRIER_FABRIC_REQUEST_TIMEOUT
+    )
+
+    # Register client cleanup via entry.async_on_unload BEFORE anything can fail
+    entry.async_on_unload(client.close)
+
+    # Probe
+    probe_res = await async_probe_carrier_fabric(client)
+    if probe_res.status is ProbeStatus.AUTH_FAILED:
+        msg = f"Carrier Fabric authentication failed: {probe_res.error}"
+        raise ConfigEntryAuthFailed(msg) from probe_res.error
+    if probe_res.status is ProbeStatus.UNREACHABLE:
+        msg = f"Carrier Fabric API unreachable: {probe_res.error}"
+        raise ConfigEntryNotReady(msg) from probe_res.error
+    if probe_res.status in (ProbeStatus.ERROR, ProbeStatus.UNSUPPORTED):
+        msg = f"Carrier Fabric API probe failed ({probe_res.status}): {probe_res.error}"
+        raise ConfigEntryNotReady(msg) from probe_res.error
+
+    if probe_res.org_id and not entry.data.get(CONF_CARRIER_ORG_ID):
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_CARRIER_ORG_ID: probe_res.org_id},
+        )
+
+    # Coordinator
+    coordinator = UnifiCarrierFabricCoordinator(hass, client, entry)
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = CarrierFabricData(client=client, coordinator=coordinator)
+
+    # Forward ONLY sensor platform
+    await hass.config_entries.async_forward_entry_setups(
+        entry, CARRIER_FABRIC_PLATFORMS
+    )
+
+    # Register options reload listener (deviation 8)
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    _LOGGER.info("UniFi Carrier Fabric integration setup completed successfully")
+    return True
+
+
 async def async_setup_entry(
-    hass: HomeAssistant, entry: UnifiInsightsConfigEntry
+    hass: HomeAssistant, entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry
 ) -> bool:
     """Set up UniFi Insights from a config entry."""
     _LOGGER.info("Setting up UniFi Insights integration")
 
     # Determine connection type (default to local for backward compatibility)
     connection_type = entry.data.get(CONF_CONNECTION_TYPE, CONNECTION_TYPE_LOCAL)
+    if connection_type == CONNECTION_TYPE_CARRIER_FABRIC:
+        return await _async_setup_carrier_fabric_entry(
+            hass, cast("CarrierFabricConfigEntry", entry)
+        )
+
     is_local = connection_type == CONNECTION_TYPE_LOCAL
 
     # Get Home Assistant's aiohttp session for efficient connection pooling
@@ -574,17 +694,25 @@ async def async_setup_entry(
             if not console_name:
                 console_name = found_name
 
-    if is_local and (not console_id or console_id == entry.data.get(CONF_API_KEY)):
+    if (
+        is_local
+        and normalize_console_namespace(
+            console_id, credentials=(entry.data.get(CONF_API_KEY),)
+        )
+        is None
+    ):
+        console_mac = normalize_console_namespace(
+            console_mac, credentials=(entry.data.get(CONF_API_KEY),)
+        )
         if console_mac:
             console_id = console_mac
-        elif not console_id:
-            # The host is an address, not an identity: it changes on a DHCP
-            # renew, which is the problem this separation exists to fix. Fall
-            # back to the site id first and keep the host as a last resort,
-            # matching the order the config flow already uses.
-            console_id = (
-                _first_site_id(config_coordinator)
-                or entry.data.get(CONF_HOST, "local").lower()
+        else:
+            # A site ID may be shared across consoles. Use the actual local
+            # endpoint until hardware identity is available; without a safe
+            # endpoint, retain legacy rows and defer namespaced discovery.
+            console_id = normalize_console_namespace(
+                entry.data.get(CONF_HOST),
+                credentials=(entry.data.get(CONF_API_KEY),),
             )
 
     updates: dict[str, Any] = {}
@@ -623,13 +751,27 @@ async def async_setup_entry(
         await protect_coordinator.async_start_websocket()
         entry.async_on_unload(protect_coordinator.async_stop_websocket)
 
+    access_client: UniFiAccessClient | None = None
+    access_coordinator: UnifiInsightsAccessCoordinator | None = None
+    if is_local and entry.data.get(CONF_ACCESS_TOKEN):
+        access_client, access_coordinator = await _async_setup_access(
+            hass,
+            cast("UnifiInsightsConfigEntry", entry),
+            websession,
+            verify_ssl=verify_ssl,
+        )
+
     site_manager_fingerprint: str | None = None
     site_manager_coordinator: UnifiInsightsSiteManagerCoordinator | None = None
+    mobility_coordinator: UnifiInsightsMobilityCoordinator | None = None
     if not is_local:
         site_manager_fingerprint, account = await async_acquire_site_manager(
             hass, entry.data[CONF_API_KEY], entry.entry_id, websession
         )
         site_manager_coordinator = account.coordinator
+        # Mobility is not part of the facade: its polls do not update
+        # console entities, and its outages do not affect their availability.
+        mobility_coordinator = async_setup_mobility(hass, entry, websession)
 
     try:
         # The facade aggregates the optional account snapshot separately.
@@ -656,18 +798,24 @@ async def async_setup_entry(
             innerspace_client=innerspace_client,
             site_manager_coordinator=site_manager_coordinator,
             site_manager_fingerprint=site_manager_fingerprint,
+            mobility_coordinator=mobility_coordinator,
+            access_client=access_client,
+            access_coordinator=access_coordinator,
             _facade_coordinator=facade_coordinator,
         )
 
-        # cmcore (backlog 648): site-level ids gain the console's gateway; move the
-        # existing rows first so they keep their entity_id and history.
-        device_data = (
-            device_coordinator.data if isinstance(device_coordinator.data, dict) else {}
-        )
-        _migrate_site_unique_ids(hass, entry, {"devices": device_data.get("devices")})
+        if access_coordinator:
+            entry.async_on_unload(lambda: async_unload_access_webhook(hass, entry))
+            await async_setup_access_webhook(hass, entry, access_coordinator)
+
+        # cmcore (backlog 1015): carry the fork's gateway-keyed site-level rows
+        # over to upstream's console-scoped ids before the sensors look them up.
+        _migrate_fork_site_unique_ids(hass, entry)
 
         _LOGGER.debug("Setting up platforms: %s", PLATFORMS)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        if access_coordinator:
+            await access_coordinator.async_start_websocket()
         entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     except BaseException:
         if site_manager_fingerprint:
@@ -680,33 +828,130 @@ async def async_setup_entry(
     return True
 
 
+async def _async_setup_access(
+    hass: HomeAssistant,
+    entry: UnifiInsightsConfigEntry,
+    session: ClientSession,
+    *,
+    verify_ssl: bool,
+) -> tuple[UniFiAccessClient | None, UnifiInsightsAccessCoordinator | None]:
+    """
+    Set up optional Access without changing the existing application gate.
+
+    A transient outage keeps the coordinator. Its poll listeners discover door
+    entities on a later good poll, so no reload is needed. Rejected credentials
+    and unsupported or unexpected probe answers close the client. A 401 during
+    the first refresh also closes it.
+    """
+    client: UniFiAccessClient | None = None
+    try:
+        client = UniFiAccessClient(
+            token=entry.data[CONF_ACCESS_TOKEN],
+            host=entry.data.get(CONF_HOST, DEFAULT_API_HOST),
+            port=entry.data.get(CONF_ACCESS_PORT, DEFAULT_ACCESS_PORT),
+            verify_ssl=verify_ssl,
+            session=session,
+        )
+        result = await async_probe_access(client)
+        if result.status not in (
+            ProbeStatus.AVAILABLE,
+            ProbeStatus.EMPTY,
+            ProbeStatus.UNREACHABLE,
+        ):
+            _LOGGER.warning(
+                "UniFi Access is unavailable (%s); other applications remain active",
+                result.status,
+            )
+            await _async_close_access(client)
+            return None, None
+        coordinator = UnifiInsightsAccessCoordinator(hass, entry, client)
+        # Not async_config_entry_first_refresh: that raises on failure and would
+        # discard the coordinator. The failed snapshot stays empty and unavailable.
+        await coordinator.async_refresh()
+        if coordinator.auth_failed:
+            await _async_close_access(client)
+            return None, None
+        if not coordinator.last_update_success and coordinator.namespace is None:
+            # Entities need a namespace-backed listener to poll and recover.
+            _LOGGER.warning(
+                "UniFi Access is unavailable and has no console identity; "
+                "other applications remain active"
+            )
+            await _async_close_access(client)
+            return None, None
+        if not coordinator.last_update_success:
+            _LOGGER.warning(
+                "UniFi Access is unreachable at startup; its door entities appear "
+                "when the console responds"
+            )
+
+        # Cleanup also runs if platform forwarding subsequently fails. HA runs
+        # on_unload callbacks as concurrent tasks, so the close must follow the
+        # shutdown inside one coroutine rather than as a separate callback.
+        async def _async_teardown_access() -> None:
+            await coordinator.async_shutdown()
+            await _async_close_access(client)
+
+        entry.async_on_unload(_async_teardown_access)
+    except UniFiError as err:
+        _LOGGER.warning(
+            "UniFi Access setup failed (%s); other applications remain active",
+            type(err).__name__,
+        )
+        if client is not None:
+            await _async_close_access(client)
+        return None, None
+    return client, coordinator
+
+
+async def _async_close_access(client: UniFiAccessClient) -> None:
+    """Close the optional client without exposing secrets or blocking teardown."""
+    try:
+        await client.close()
+    except Exception as err:
+        _LOGGER.debug("Error closing Access client (%s)", type(err).__name__)
+
+
 async def async_unload_entry(
-    hass: HomeAssistant, entry: UnifiInsightsConfigEntry
+    hass: HomeAssistant, entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry
 ) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("Unloading UniFi Insights config entry")
     _clear_setup_probe_attempts(hass, entry.entry_id)
 
-    unload_ok: bool = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    is_carrier_fabric = (
+        entry.data.get(CONF_CONNECTION_TYPE) == CONNECTION_TYPE_CARRIER_FABRIC
+    )
+    if is_carrier_fabric or isinstance(entry.runtime_data, CarrierFabricData):
+        return await hass.config_entries.async_unload_platforms(
+            entry, CARRIER_FABRIC_PLATFORMS
+        )
+
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     # Only tear down the API clients once the platforms are gone; closing them
     # first would leave loaded entities behind with dead clients if a platform
     # failed to unload.
-    if unload_ok and hasattr(entry, "runtime_data") and entry.runtime_data:
+    if unload_ok and isinstance(entry.runtime_data, UnifiInsightsData):
         data = entry.runtime_data
         _LOGGER.debug("Closing API clients")
+        if data.access_coordinator:
+            await data.access_coordinator.async_shutdown()
+        await async_unload_access_webhook(hass, entry)
+        if data.access_client:
+            await _async_close_access(data.access_client)
+        # Stop the WebSocket (and await its background task) *before*
+        # closing the client below - stopping it after would leave the
+        # loop trying to use an already-closed session for whatever
+        # brief window passes before entry.async_on_unload's registered
+        # copy of this same call runs (see async_setup_entry - that
+        # registration is the safety net for a setup failure that
+        # happens after the WebSocket starts but before this function
+        # ever runs; async_stop_websocket() is idempotent so running it
+        # twice on a normal unload is harmless).
+        if data.protect_coordinator:
+            await data.protect_coordinator.async_stop_websocket()
         if data.protect_client:
-            # Stop the WebSocket (and await its background task) *before*
-            # closing the client below - stopping it after would leave the
-            # loop trying to use an already-closed session for whatever
-            # brief window passes before entry.async_on_unload's registered
-            # copy of this same call runs (see async_setup_entry - that
-            # registration is the safety net for a setup failure that
-            # happens after the WebSocket starts but before this function
-            # ever runs; async_stop_websocket() is idempotent so running it
-            # twice on a normal unload is harmless).
-            if data.protect_coordinator:
-                await data.protect_coordinator.async_stop_websocket()
             # Close Protect client (await the async close)
             try:
                 await data.protect_client.close()
@@ -721,23 +966,27 @@ async def async_unload_entry(
                 _LOGGER.debug("Error closing InnerSpace client: %s", err)
 
         # Close Network client (await the async close)
-        if data.network_client:
-            try:
-                await data.network_client.close()
-            except Exception as err:
-                _LOGGER.debug("Error closing Network client: %s", err)
+        try:
+            await data.network_client.close()
+        except Exception as err:
+            _LOGGER.debug("Error closing Network client: %s", err)
 
         if data.site_manager_fingerprint:
             await async_release_site_manager(
                 hass, data.site_manager_fingerprint, entry.entry_id
             )
 
+        # A disabled owner will not come back to poll Mobility; a reload or a
+        # Home Assistant restart will, so those keep it.
+        if data.mobility_coordinator and entry.disabled_by is not None:
+            async_hand_over_mobility(hass, entry)
+
     return unload_ok
 
 
 async def async_remove_config_entry_device(
     hass: HomeAssistant,
-    entry: UnifiInsightsConfigEntry,
+    entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry,
     device_entry: DeviceEntry,
 ) -> bool:
     """
@@ -746,8 +995,10 @@ async def async_remove_config_entry_device(
     Deselecting a site in options stops it being polled, so its devices can
     never come back and would otherwise sit unavailable with no way to remove
     them. WiFi devices carry no site id, so they are allowed once no polled
-    site serves that network any more. Everything else is refused: devices of
-    polled sites are live, and Protect and client devices are not site-scoped.
+    site serves that network any more. Mobility routers and workspaces are
+    allowed once Mobility no longer reports them. Everything else is refused:
+    devices of polled sites are live, and Protect and client devices are not
+    site-scoped.
 
     cmcore fork (backlog 529): the device of a randomized, unnamed client can
     be deleted too. This fork creates no entity for such a client, so nothing
@@ -769,6 +1020,19 @@ async def async_remove_config_entry_device(
     if runtime_data is None:
         return False
 
+    if isinstance(runtime_data, CarrierFabricData):
+        for domain, identifier in device_entry.identifiers:
+            if domain != DOMAIN:
+                continue
+            if identifier == entry.unique_id:
+                # Organisation device: refuse removal
+                return False
+            if identifier.startswith("carrier_subscriber_"):
+                sub_id = identifier.removeprefix("carrier_subscriber_")
+                coord_subs = runtime_data.coordinator.data.get("subscribers", {})
+                return sub_id not in coord_subs
+        return False
+
     config_coordinator = runtime_data.config_coordinator
     polled = config_coordinator.get_site_ids()
     deselected = set(config_coordinator.available_sites) - set(polled)
@@ -780,6 +1044,9 @@ async def async_remove_config_entry_device(
                 for site_id in deselected
             )
             or _is_stale_wifi_identifier(identifier, config_coordinator, polled)
+            or _is_stale_mobility_identifier(
+                identifier, runtime_data.mobility_coordinator
+            )
         )
         for domain, identifier in device_entry.identifiers
     )
@@ -787,11 +1054,12 @@ async def async_remove_config_entry_device(
 
 def _is_ephemeral_client_device(device_entry: DeviceEntry) -> bool:
     """
-    Return True for the device of a randomized, unnamed client (cmcore fork, backlog 529).
+    Return True for the device of a randomized, unnamed client (cmcore, 529).
 
-    The same test as is_ephemeral_client, read from the registry: a ``client_<mac>``
-    identifier with a locally administered MAC, and a device name that is empty or the
-    MAC itself. A name given in Home Assistant (name_by_user) makes it a named client.
+    The same test as is_ephemeral_client, read from the registry: a
+    ``client_<mac>`` identifier with a locally administered MAC, and a device
+    name that is empty or the MAC itself. A name given in Home Assistant
+    (name_by_user) makes it a named client.
     """
     from .entity import is_ephemeral_client  # noqa: PLC0415 - keep the import lazy
 
@@ -821,6 +1089,29 @@ def _is_empty_client_device(hass: HomeAssistant, device_entry: DeviceEntry) -> b
     return not er.async_entries_for_device(
         er.async_get(hass), device_entry.id, include_disabled_entities=True
     )
+
+
+def _is_stale_mobility_identifier(
+    identifier: str, coordinator: UnifiInsightsMobilityCoordinator | None
+) -> bool:
+    """
+    Return True if a Mobility router or workspace is no longer reported.
+
+    An entry without a Mobility coordinator no longer owns its key's Mobility
+    data, so devices it created earlier can never update again. Otherwise only
+    a successful poll that answered for the key is proof a device is gone.
+    """
+    if not identifier.startswith(MOBILITY_DEVICE_PREFIX):
+        return False
+    if coordinator is None:
+        return True
+    data = coordinator.data
+    if not coordinator.last_update_success or data["access"] == ACCESS_UNKNOWN:
+        return False
+    if identifier.startswith(MOBILITY_WORKSPACE_PREFIX):
+        workspace_id = identifier.removeprefix(MOBILITY_WORKSPACE_PREFIX)
+        return workspace_id not in data["workspaces"]
+    return identifier.removeprefix(MOBILITY_DEVICE_PREFIX) not in data["devices"]
 
 
 def _is_stale_wifi_identifier(
@@ -866,15 +1157,18 @@ def _is_site_scoped_identifier(identifier: str, site_id: str) -> bool:
 
 
 async def async_remove_entry(
-    hass: HomeAssistant, entry: UnifiInsightsConfigEntry
+    hass: HomeAssistant, entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry
 ) -> None:
     """Forget per-entry setup state when an entry is deleted."""
     _clear_setup_probe_attempts(hass, entry.entry_id)
     await async_remove_node_key(hass, entry.entry_id)
+    async_hand_over_mobility(hass, entry)
+    if entry.data.get(CONF_ACCESS_TOKEN):
+        await async_remove_access_webhook(hass, entry)
 
 
 async def async_reload_entry(
-    hass: HomeAssistant, entry: UnifiInsightsConfigEntry
+    hass: HomeAssistant, entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry
 ) -> None:
     """Reload config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
