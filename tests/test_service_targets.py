@@ -70,6 +70,7 @@ from custom_components.unifi_insights.service_targets import (
     _resolve_network_device_id,
     _resolve_protect_resource_id,
     _select_network_entry,
+    _select_protect_entry,
     resolve_access_call,
     resolve_carrier_subscriber_call,
     resolve_chime_pairing_call,
@@ -1086,10 +1087,10 @@ async def test_protect_secondary_not_cached_anywhere_is_allowed(
     assert target.entry is entry
 
 
-async def test_protect_console_id_skips_the_ownership_checks(
+async def test_protect_console_id_without_a_target_picks_the_console(
     hass: HomeAssistant,
 ) -> None:
-    """An explicit console_id picks that console without any further check."""
+    """Without a resource target, console_id alone picks the console."""
     _console(hass, "Office", {}, protect=True)
     garage = _console(hass, "Garage", {}, protect=True)
     facade = garage.runtime_data.coordinator
@@ -1103,6 +1104,110 @@ async def test_protect_console_id_skips_the_ownership_checks(
         cache=facade,
         protect_commands=facade.require_protect_coordinator.return_value,
     )
+
+
+@pytest.mark.parametrize(
+    ("garage", "registered_on", "console_id", "expect"),
+    [
+        ({"cameras": {}}, None, "Garage", "refused"),
+        ({"cameras": {}}, None, "garage", "refused"),
+        ({"cameras": {"cam1": {}}}, "office", "Garage", "refused"),
+        ({"cameras": {"cam1": {}}}, None, "Garage", "Garage"),
+        ({"cameras": {"cam1": {}}}, None, "Office", "Office"),
+        ({"cameras": {"cam1": {}}}, "office", "Office", "Office"),
+        ("loading", None, "Garage", "refused"),
+        ("loading", "garage", "Garage", "Garage"),
+        ({"cameras": {}}, None, "nowhere", "console_not_found"),
+    ],
+    ids=[
+        "cached-on-another-console",
+        "named-by-entry-id",
+        "registered-on-another-console",
+        "collision-picks-named-console",
+        "collision-picks-the-other-console",
+        "registered-on-the-named-console",
+        "named-console-not-loaded-yet-owned-elsewhere",
+        "named-console-not-loaded-yet-registered-on-it",
+        "unknown-console",
+    ],
+)
+async def test_protect_console_id_with_a_target_must_own_it(
+    hass: HomeAssistant,
+    garage: Any,
+    registered_on: str | None,
+    console_id: str,
+    expect: str,
+) -> None:
+    """With a target, console_id only chooses among the consoles that own it."""
+    entries = {
+        "Office": _console(hass, "Office", {"protect": _CAMS["protect"]}, protect=True),
+        "Garage": _console(hass, "Garage", {"protect": garage}, protect=True),
+    }
+    resource_id = "cam1"
+    if registered_on is not None:
+        resource_id = (
+            er.async_get(hass)
+            .async_get_or_create(
+                "camera",
+                DOMAIN,
+                "unifi_insights_camera_cam1",
+                config_entry=hass.config_entries.async_get_entry(registered_on),
+            )
+            .entity_id
+        )
+
+    def select() -> tuple[Any, str | None]:
+        return _select_protect_entry(
+            hass, resource_type="camera", resource_id=resource_id, console_id=console_id
+        )
+
+    if expect in entries:
+        assert select() == (entries[expect], "cam1")
+        return
+    with pytest.raises(ServiceValidationError) as err:
+        select()
+    if expect == "refused":
+        assert _key(err) == "protect_resource_not_on_console"
+        assert err.value.translation_placeholders == {
+            "resource_type": "camera",
+            "resource_id": resource_id,
+            "console": "Garage",
+        }
+    else:
+        assert _key(err) == expect
+
+
+async def test_protect_console_id_falls_back_while_no_console_owns_it(
+    hass: HomeAssistant,
+) -> None:
+    """While no console can tell it owns the target, the named one is used."""
+    _console(hass, "Office", {"protect": "loading"}, protect=True)
+    garage = _console(hass, "Garage", {"protect": "loading"}, protect=True)
+
+    assert _select_protect_entry(
+        hass, resource_type="camera", resource_id="cam1", console_id="Garage"
+    ) == (garage, "cam1")
+
+
+async def test_protect_console_id_still_checks_the_secondary_target(
+    hass: HomeAssistant,
+) -> None:
+    """A named console that owns the chime still refuses another console's camera."""
+    office = _console(
+        hass, "Office", {"protect": {"chimes": {"r1": {}}, "cameras": {}}}, protect=True
+    )
+    _console(hass, "Garage", {"protect": {"cameras": {"cam9": {}}}}, protect=True)
+
+    with pytest.raises(ServiceValidationError) as err:
+        _select_protect_entry(
+            hass,
+            resource_type="chime",
+            resource_id="r1",
+            secondary_resource_type="camera",
+            secondary_resource_id="cam9",
+            console_id=office.title,
+        )
+    assert _key(err) == "protect_secondary_other_console"
 
 
 @pytest.mark.parametrize("console_id", ["Garage", " GARAGE ", "garage"])
@@ -1892,7 +1997,7 @@ async def test_carrier_identifier_in_two_entries_is_ambiguous(
 
 
 async def test_carrier_entity_of_a_subscriber_resolves(hass: HomeAssistant) -> None:
-    """A subscriber entity resolves through its device; areas are ignored."""
+    """A subscriber entity resolves through its device."""
     entry = _carrier_entry(hass, "carrier_a")
     (device,) = dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
     entity = er.async_get(hass).async_get_or_create(
@@ -1904,7 +2009,7 @@ async def test_carrier_entity_of_a_subscriber_resolves(hass: HomeAssistant) -> N
         _call(
             hass,
             "carrier_suspend_subscriber",
-            target={"entity_id": [entity.entity_id], "area_id": "porch"},
+            target={"entity_id": [entity.entity_id]},
             entity_id=entity.entity_id,
         ),
     )

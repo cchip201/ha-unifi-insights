@@ -362,6 +362,31 @@ def _protect_entry_has_resource(
     return True if owns is None else owns
 
 
+def _owned_elsewhere_while_unverified(
+    selected: UnifiInsightsConfigEntry,
+    resolved_reg_entry: UnifiInsightsConfigEntry | None,
+    candidates: list[UnifiInsightsConfigEntry],
+    collection_key: str,
+    resource_id: str,
+) -> bool:
+    """
+    Return True if another console owns a resource the selected one cannot vouch for.
+
+    A console still warming up stays a candidate only while no other console
+    has positive evidence of owning the resource. The registry entry the
+    resource was resolved from counts as that console's evidence.
+    """
+    if resolved_reg_entry is selected:
+        return False
+    if _protect_owns_resource(selected, collection_key, resource_id) is not None:
+        return False
+    return any(
+        entry is not selected
+        and _protect_owns_resource(entry, collection_key, resource_id) is True
+        for entry in candidates
+    )
+
+
 # --- Client identity --------------------------------------------------------
 
 
@@ -990,18 +1015,26 @@ def _select_protect_entry(
     secondary_resource_id: str | None = None,
     console_id: str | None = None,
 ) -> tuple[UnifiInsightsConfigEntry, str | None]:
-    """Return the Protect console owning a resource, and the native resource ID."""
+    """
+    Return the Protect console owning a resource, and the native resource ID.
+
+    Without a resource, ``console_id`` alone picks the console. With a
+    resource, ``console_id`` only chooses among the consoles that own it: a
+    console that does not own the resource is refused.
+    """
     protect_entries = _protect_entries(hass)
     if not protect_entries:
         msg = "No UniFi Protect coordinator found"
         raise _invalid(msg, "no_protect_coordinator")
 
-    # 0. An explicit console always wins. It skips the ownership checks below.
-    if console_id:
-        entry = _select_console(protect_entries, console_id, "UniFi Protect console")
-        return entry, None
-
+    selected = (
+        _select_console(protect_entries, console_id, "UniFi Protect console")
+        if console_id
+        else None
+    )
     if resource_type is None or resource_id is None:
+        if selected is not None:
+            return selected, None
         if len(protect_entries) > 1:
             known = _console_titles(protect_entries)
             msg = (
@@ -1030,6 +1063,31 @@ def _select_protect_entry(
             " configured UniFi Protect console"
         )
         raise _invalid(msg, "protect_resource_not_found", **placeholders)
+
+    if selected is not None:
+        if (
+            selected not in matching_entries
+            or resolved_reg_entry not in (None, selected)
+            or _owned_elsewhere_while_unverified(
+                selected,
+                resolved_reg_entry,
+                matching_entries,
+                collection_key,
+                native_resource_id,
+            )
+        ):
+            msg = (
+                f"{resource_type.capitalize()} '{resource_id}' does not belong to"
+                f" the UniFi Protect console '{selected.title}'"
+            )
+            raise _invalid(
+                msg,
+                "protect_resource_not_on_console",
+                resource_type=resource_type,
+                resource_id=resource_id,
+                console=selected.title,
+            )
+        matching_entries = [selected]
 
     if resolved_reg_entry is not None and resolved_reg_entry not in matching_entries:
         msg = (
@@ -1261,8 +1319,8 @@ def _extract_carrier_targets(call: ServiceCall) -> list[str]:
     """
     Extract all target entity or device IDs from a service call.
 
-    Subscribers are devices, so area targets are not supported and are
-    ignored wherever they appear.
+    Subscribers are devices, so area targets are not supported; the action
+    schemas refuse them before this runs.
     """
     targets: list[str] = []
 
