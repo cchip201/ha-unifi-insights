@@ -43,10 +43,12 @@ from .api import (
 )
 from .api.access import UniFiAccessClient
 from .api.carrier_fabric.client import UniFiCarrierFabricClient
+from .api.innerspace import UniFiInnerSpaceClient
 from .api.network import UniFiNetworkClient
 from .api.protect import UniFiProtectClient
 from .console_identity import (
     DEFAULT_SITE_ID,
+    cloud_host_id_for_mac,
     device_fields,
     normalize_console_namespace,
     normalize_mac,
@@ -64,10 +66,13 @@ from .const import (
     CONF_CARRIER_ACTIONS,
     CONF_CARRIER_ORG_ID,
     CONF_CLEAR_ACCESS_TOKEN,
+    CONF_CLEAR_INNERSPACE_CLOUD_API_KEY,
     CONF_CLIENT_CONTROL,
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
+    CONF_INNERSPACE_CLOUD_API_KEY,
+    CONF_INNERSPACE_CLOUD_CONSOLE_ID,
     CONF_POLL_INTERVAL,
     CONF_SITE_IDS,
     CONF_TRACK_CLIENTS,
@@ -85,6 +90,7 @@ from .const import (
     DEFAULT_TRACK_CLIENTS,
     DEFAULT_TRACK_SUBSCRIBERS,
     DOMAIN,
+    INNERSPACE_CLOUD_CONFIG_KEYS,
     MAX_POLL_INTERVAL,
     MIN_POLL_INTERVAL,
     poll_interval_seconds,
@@ -99,9 +105,11 @@ from .probe import (
     ProbeStatus,
     async_probe_access,
     async_probe_carrier_fabric,
+    async_probe_innerspace,
     async_probe_network,
     async_probe_protect,
     async_probe_with_client,
+    classify_error,
     is_transient_error,
 )
 from .topology_contract import normalize_mac as normalize_hardware_mac
@@ -138,6 +146,13 @@ def _clear_access_field(entry: ConfigEntry) -> dict[Any, Any]:
     """Offer the clear-token flag only for an entry that stores a token."""
     if entry.data.get(CONF_ACCESS_TOKEN):
         return {vol.Optional(CONF_CLEAR_ACCESS_TOKEN, default=False): bool}
+    return {}
+
+
+def _clear_innerspace_cloud_field(entry: ConfigEntry) -> dict[Any, Any]:
+    """Offer the clear-key flag only when an InnerSpace cloud key is stored."""
+    if entry.data.get(CONF_INNERSPACE_CLOUD_API_KEY):
+        return {vol.Optional(CONF_CLEAR_INNERSPACE_CLOUD_API_KEY, default=False): bool}
     return {}
 
 
@@ -1089,6 +1104,103 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                 access_fields[key] = entry.data[key]
         return {}, access_fields, None
 
+    @staticmethod
+    def _innerspace_cloud_key_input(user_input: dict[str, Any]) -> str | None:
+        """Return the typed InnerSpace cloud key without surrounding whitespace."""
+        value = user_input.get(CONF_INNERSPACE_CLOUD_API_KEY)
+        if not isinstance(value, str):
+            return None
+        return value.strip() or None
+
+    async def _async_validate_innerspace_cloud(
+        self, api_key: str, console_mac: str
+    ) -> tuple[str | None, str | None]:
+        """
+        Find this console in UniFi's cloud and read InnerSpace through it.
+
+        cmcore (backlog 1353). Returns the console's UI.com host id and None, or
+        None and the form error key. The key must list the console among its
+        Site Manager hosts (matched by MAC) and InnerSpace must answer through
+        the cloud connector with it: a key that is saved must work.
+        """
+        auth = ApiKeyAuth(api_key=api_key)
+        try:
+            async with UniFiNetworkClient(
+                auth=auth, connection_type=ConnectionType.REMOTE, timeout=30
+            ) as network_client:
+                hosts = await network_client.get_hosts()
+        except Exception as err:
+            status = classify_error(err)
+            _LOGGER.debug("UniFi cloud host listing failed: %s (%r)", status, err)
+            if status is ProbeStatus.AUTH_FAILED:
+                return None, "innerspace_cloud_invalid_auth"
+            if status is ProbeStatus.UNREACHABLE:
+                return None, "innerspace_cloud_cannot_connect"
+            return None, "innerspace_cloud_unsupported"
+        console_id = cloud_host_id_for_mac(hosts, console_mac)
+        if console_id is None:
+            return None, "innerspace_cloud_console_not_found"
+        result = await async_probe_with_client(
+            UniFiInnerSpaceClient(
+                auth=auth,
+                connection_type=ConnectionType.REMOTE,
+                console_id=console_id,
+                timeout=30,
+            ),
+            async_probe_innerspace,
+        )
+        if result.status in (ProbeStatus.AVAILABLE, ProbeStatus.EMPTY):
+            return console_id, None
+        if result.status is ProbeStatus.AUTH_FAILED:
+            return None, "innerspace_cloud_invalid_auth"
+        if result.status is ProbeStatus.UNREACHABLE:
+            return None, "innerspace_cloud_cannot_connect"
+        return None, "innerspace_cloud_unsupported"
+
+    async def _async_reconfigure_innerspace_cloud(
+        self,
+        entry: ConfigEntry,
+        user_input: dict[str, Any],
+        console_info: dict[str, str],
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """
+        Validate and plan the InnerSpace cloud key for a local reconfigure.
+
+        cmcore (backlog 1353). Returns the form errors and the fields to store.
+        A typed key is validated against this console before it is saved and
+        wins over the clear flag; an empty field keeps the stored key and
+        console; the clear flag alone removes both, so InnerSpace is read on
+        the console again.
+        """
+        typed_key = self._innerspace_cloud_key_input(user_input)
+        if typed_key is None:
+            if user_input.get(CONF_CLEAR_INNERSPACE_CLOUD_API_KEY):
+                return {}, {}
+            return {}, {
+                key: entry.data[key]
+                for key in INNERSPACE_CLOUD_CONFIG_KEYS
+                if key in entry.data
+            }
+        console_mac = normalize_hardware_mac(console_info.get("mac"))
+        console_mac = console_mac or normalize_hardware_mac(
+            entry.data.get(CONF_CONSOLE_ID)
+        )
+        if console_mac is None:
+            error: str | None = "innerspace_cloud_console_not_found"
+            console_id = None
+        else:
+            console_id, error = await self._async_validate_innerspace_cloud(
+                typed_key, console_mac
+            )
+        if console_id is None:
+            return {
+                CONF_INNERSPACE_CLOUD_API_KEY: error or "innerspace_cloud_unsupported"
+            }, {}
+        return {}, {
+            CONF_INNERSPACE_CLOUD_API_KEY: typed_key,
+            CONF_INNERSPACE_CLOUD_CONSOLE_ID: console_id,
+        }
+
     async def _async_reconfigure_local(
         self,
         entry: ConfigEntry,
@@ -1097,6 +1209,7 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         *,
         access_data: dict[str, Any],
         cleanup: Literal["clear", "move"] | None,
+        innerspace_data: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
         """Save a validated local reconfigure, with its Access fields and cleanup."""
         current_id = entry.data.get(CONF_CONSOLE_ID) or entry.unique_id
@@ -1157,6 +1270,8 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
             if keep_receiver and not removed:
                 return self.async_abort(reason="cannot_connect")
         new_data.update(access_data)
+        # cmcore (backlog 1353): the InnerSpace cloud key and console, if any.
+        new_data.update(innerspace_data or {})
         try:
             return self._async_update_site_entry_and_abort(
                 entry,
@@ -1231,8 +1346,19 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                             access_data,
                             cleanup,
                         ) = await self._async_reconfigure_access(entry, user_input)
-                        if access_errors:
+                        # cmcore (backlog 1353): the optional InnerSpace cloud key.
+                        innerspace_errors: dict[str, str] = {}
+                        innerspace_data: dict[str, Any] = {}
+                        if not access_errors:
+                            (
+                                innerspace_errors,
+                                innerspace_data,
+                            ) = await self._async_reconfigure_innerspace_cloud(
+                                entry, user_input, console_info
+                            )
+                        if access_errors or innerspace_errors:
                             errors.update(access_errors)
+                            errors.update(innerspace_errors)
                         else:
                             return await self._async_reconfigure_local(
                                 entry,
@@ -1240,6 +1366,7 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                                 console_info,
                                 access_data=access_data,
                                 cleanup=cleanup,
+                                innerspace_data=innerspace_data,
                             )
                     elif error_code == "invalid_auth":
                         errors[CONF_API_KEY] = "invalid_auth"
@@ -1347,6 +1474,9 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                             ),
                         ): _ACCESS_PORT_SCHEMA,
                         **_clear_access_field(entry),
+                        # cmcore (backlog 1353): InnerSpace through UniFi's cloud.
+                        vol.Optional(CONF_INNERSPACE_CLOUD_API_KEY): str,
+                        **_clear_innerspace_cloud_field(entry),
                     }
                 ),
                 errors=errors,

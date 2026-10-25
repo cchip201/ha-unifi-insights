@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.unifi_insights.api import (
     UniFiAuthenticationError,
@@ -57,6 +58,7 @@ class UnifiInsightsInnerSpaceCoordinator(UnifiBaseCoordinator):
         *,
         device_coordinator: UnifiDeviceCoordinator | None = None,
         protect_coordinator: UnifiProtectCoordinator | None = None,
+        reauth_on_auth_error: bool = True,
     ) -> None:
         """Initialize the InnerSpace coordinator."""
         super().__init__(
@@ -70,6 +72,9 @@ class UnifiInsightsInnerSpaceCoordinator(UnifiBaseCoordinator):
         self.innerspace_client = innerspace_client
         self._device_coordinator = device_coordinator
         self._protect_coordinator = protect_coordinator
+        # cmcore (backlog 1353): False when InnerSpace is read with a UI.com key
+        # the entry's reauth flow does not ask for (a local entry's cloud route).
+        self._reauth_on_auth_error = reauth_on_auth_error
         # Floor plans that currently have a device (those with an image_url),
         # for stale device cleanup.
         self._previous_floor_plan_ids: set[str] = set()
@@ -107,6 +112,24 @@ class UnifiInsightsInnerSpaceCoordinator(UnifiBaseCoordinator):
                     remove_config_entry_id=self.config_entry.entry_id,
                 )
         self._previous_floor_plan_ids = current_ids
+
+    def _handle_auth_error(self, err: UniFiAuthenticationError) -> None:
+        """
+        Start reauth, or pause InnerSpace when its key is not the entry's own.
+
+        cmcore (backlog 1353): a local entry's reauth flow asks for the console's
+        API key, which cannot replace a rejected cloud key, so the cloud route
+        fails the update instead: the floor plan is unavailable until the entry
+        is reconfigured with a working key, and Network and Protect carry on.
+        """
+        if self._reauth_on_auth_error:
+            super()._handle_auth_error(err)  # raises ConfigEntryAuthFailed
+        self._available = False
+        msg = (
+            "The UniFi cloud rejected the InnerSpace cloud API key; reconfigure "
+            f"the entry with a new key: {err}"
+        )
+        raise UpdateFailed(msg) from err
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch InnerSpace floor plans, placed devices, and inventory."""

@@ -69,7 +69,9 @@
           "console_id": "Console ID",
           "access_token": "UniFi Access API token (optional)",
           "access_port": "UniFi Access developer API port",
-          "clear_access_token": "Remove the Access token"
+          "clear_access_token": "Remove the Access token",
+          "innerspace_cloud_api_key": "UniFi cloud API key for InnerSpace (optional)",
+          "clear_innerspace_cloud_api_key": "Remove the InnerSpace cloud API key"
         },
         "data_description": {
           "host": "The URL of your UniFi device (e.g., https://192.168.1.1)",
@@ -78,7 +80,9 @@
           "console_id": "The UniFi cloud console ID this entry connects to",
           "access_token": "Enter a new token to replace the stored one. Leave empty to keep the current token.",
           "access_port": "Port of the UniFi Access developer API on the console.",
-          "clear_access_token": "Turn on to remove the Access token and its access-result webhook. Ignored when a new token is entered."
+          "clear_access_token": "Turn on to remove the Access token and its access-result webhook. Ignored when a new token is entered.",
+          "innerspace_cloud_api_key": "A Site Manager API key from unifi.ui.com. InnerSpace answers only a console login, so with this key the floor plans are read through UniFi's cloud while Network, Protect and Access stay local. Leave empty to keep the current key.",
+          "clear_innerspace_cloud_api_key": "Turn on to read InnerSpace on the console again. Ignored when a new key is entered."
         }
       },
       "carrier_fabric": {
@@ -124,7 +128,11 @@
       "carrier_missing_scope": "The ISP API key lacks the required Carrier Fabric permissions.",
       "access_invalid_auth": "The UniFi Access token was rejected. Create a new token in Access and try again.",
       "access_cannot_connect": "Could not reach the UniFi Access API. Check the host and port, and that Access is running.",
-      "access_unsupported": "This console did not answer the UniFi Access API. Check that UniFi Access is installed and up to date."
+      "access_unsupported": "This console did not answer the UniFi Access API. Check that UniFi Access is installed and up to date.",
+      "innerspace_cloud_invalid_auth": "The UniFi cloud rejected this API key. Create a Site Manager API key at unifi.ui.com and try again.",
+      "innerspace_cloud_cannot_connect": "Could not reach the UniFi cloud (api.ui.com). Try again later.",
+      "innerspace_cloud_console_not_found": "This console is not among the consoles this cloud API key can see. Use a key from the UI account that owns the console.",
+      "innerspace_cloud_unsupported": "InnerSpace did not answer through the UniFi cloud for this console. Check that InnerSpace is installed on the console."
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",

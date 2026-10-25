@@ -123,6 +123,20 @@ ACCESS_CONFIG_KEYS: Final = (
     CONF_ACCESS_WEBHOOK_ENDPOINT_ID,
     CONF_ACCESS_WEBHOOK_SECRET,
 )
+# cmcore (backlog 1353): a local entry can read InnerSpace through UniFi's cloud
+# connector. InnerSpace 1.4.1 serves its integration API only to a console
+# session whose role holds innerspace.management admin; the console's proxy
+# passes no session for an X-API-Key request, so every local key gets 403
+# "Headers missing". A UI.com (Site Manager) API key reaches the same project
+# through api.ui.com. Network, Protect and Access stay local; only InnerSpace
+# follows the cloud key, and both fields are stored only while one is set.
+CONF_INNERSPACE_CLOUD_API_KEY: Final = "innerspace_cloud_api_key"
+CONF_INNERSPACE_CLOUD_CONSOLE_ID: Final = "innerspace_cloud_console_id"
+CONF_CLEAR_INNERSPACE_CLOUD_API_KEY: Final = "clear_innerspace_cloud_api_key"
+INNERSPACE_CLOUD_CONFIG_KEYS: Final = (
+    CONF_INNERSPACE_CLOUD_API_KEY,
+    CONF_INNERSPACE_CLOUD_CONSOLE_ID,
+)
 # Access has no version endpoint in the official API, so these minimums are
 # checked against the Access application version the user reports, and each
 # feature is also detected by its own endpoint response.
