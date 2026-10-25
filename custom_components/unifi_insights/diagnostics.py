@@ -21,8 +21,6 @@ from .const import (
     CONF_ACCESS_WEBHOOK_SECRET,
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
-    CONF_INNERSPACE_CLOUD_API_KEY,
-    CONF_INNERSPACE_CLOUD_CONSOLE_ID,
     CONNECTION_TYPE_REMOTE,
     ISP_WAN_NUMBERS,
     MOBILITY_MODELS,
@@ -58,10 +56,6 @@ TO_REDACT = {
     CONF_ACCESS_WEBHOOK_ID,
     CONF_ACCESS_WEBHOOK_ENDPOINT_ID,
     CONF_ACCESS_WEBHOOK_SECRET,
-    # cmcore (backlog 1353): a local entry's InnerSpace cloud key and the UI.com
-    # host id it reads, which embeds the console's MAC
-    CONF_INNERSPACE_CLOUD_API_KEY,
-    CONF_INNERSPACE_CLOUD_CONSOLE_ID,
     # Network identifiers
     CONF_HOST,
     "ip",

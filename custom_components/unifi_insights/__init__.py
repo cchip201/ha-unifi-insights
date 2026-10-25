@@ -56,8 +56,6 @@ from .const import (
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
-    CONF_INNERSPACE_CLOUD_API_KEY,
-    CONF_INNERSPACE_CLOUD_CONSOLE_ID,
     CONNECTION_TYPE_CARRIER_FABRIC,
     CONNECTION_TYPE_LOCAL,
     DEFAULT_ACCESS_PORT,
@@ -475,14 +473,6 @@ async def async_setup_entry(
         )
 
     is_local = connection_type == CONNECTION_TYPE_LOCAL
-    # cmcore (backlog 1353): a local entry that stores a UI.com key reads InnerSpace
-    # through UniFi's cloud connector - no local API key can reach it. Network,
-    # Protect and Access stay local, and the cloud never holds up, fails or
-    # reauthenticates the entry: InnerSpace is only paused while it is down.
-    innerspace_via_cloud = is_local and bool(
-        entry.data.get(CONF_INNERSPACE_CLOUD_API_KEY)
-        and entry.data.get(CONF_INNERSPACE_CLOUD_CONSOLE_ID)
-    )
 
     # Get Home Assistant's aiohttp session for efficient connection pooling
     # (Platinum requirement)
@@ -538,27 +528,14 @@ async def async_setup_entry(
                 timeout=30,
                 session=websession,
             )
-            if innerspace_via_cloud:
-                _LOGGER.debug(
-                    "Initializing UniFi InnerSpace API client (REMOTE, cloud key)"
-                )
-                innerspace_api = UniFiInnerSpaceClient(
-                    auth=ApiKeyAuth(api_key=entry.data[CONF_INNERSPACE_CLOUD_API_KEY]),
-                    connection_type=ConnectionType.REMOTE,
-                    console_id=entry.data[CONF_INNERSPACE_CLOUD_CONSOLE_ID],
-                    timeout=30,
-                    # api.ui.com always has a valid certificate.
-                    session=async_get_clientsession(hass),
-                )
-            else:
-                _LOGGER.debug("Initializing UniFi InnerSpace API client (LOCAL)")
-                innerspace_api = UniFiInnerSpaceClient(
-                    auth=auth,
-                    base_url=entry.data.get(CONF_HOST, DEFAULT_API_HOST),
-                    connection_type=ConnectionType.LOCAL,
-                    timeout=30,
-                    session=websession,
-                )
+            _LOGGER.debug("Initializing UniFi InnerSpace API client (LOCAL)")
+            innerspace_api = UniFiInnerSpaceClient(
+                auth=auth,
+                base_url=entry.data.get(CONF_HOST, DEFAULT_API_HOST),
+                connection_type=ConnectionType.LOCAL,
+                timeout=30,
+                session=websession,
+            )
         else:
             _LOGGER.debug("Initializing UniFi Protect API client (REMOTE)")
             protect_api = UniFiProtectClient(
@@ -597,29 +574,10 @@ async def async_setup_entry(
             _LOGGER.info("UniFi Protect API validated successfully")
             protect_client = protect_api
         innerspace_client: UniFiInnerSpaceClient | None = None
-        # cmcore (backlog 1353): a cloud that is down at setup keeps the client,
-        # so the 5-minute poll brings the floor plan back without a reload.
-        innerspace_waits_for_cloud = (
-            innerspace_via_cloud and innerspace_probe.status is ProbeStatus.UNREACHABLE
-        )
-        if innerspace_available or innerspace_waits_for_cloud:
-            if innerspace_waits_for_cloud:
-                _LOGGER.warning(
-                    "UniFi InnerSpace through the UniFi cloud is unreachable, "
-                    "retrying every 5 minutes: %s",
-                    innerspace_probe.error,
-                )
-            else:
-                _LOGGER.info("UniFi InnerSpace API validated successfully")
+        if innerspace_available:
+            _LOGGER.info("UniFi InnerSpace API validated successfully")
             innerspace_client = innerspace_api
         else:
-            if innerspace_via_cloud:
-                _LOGGER.warning(
-                    "UniFi InnerSpace through the UniFi cloud answered %s, "
-                    "continuing without InnerSpace: %s",
-                    innerspace_probe.status,
-                    innerspace_probe.error or "no project or device records",
-                )
             try:
                 await innerspace_api.close()
             except Exception as err:
@@ -630,8 +588,7 @@ async def async_setup_entry(
             entry.entry_id,
             network_probe,
             protect_probe,
-            # cmcore (backlog 1353): the console's own applications decide setup.
-            innerspace_probe=None if innerspace_via_cloud else innerspace_probe,
+            innerspace_probe=innerspace_probe,
         )
 
     # Probe failures are classified in _raise_for_setup_probes; these catch
@@ -655,9 +612,7 @@ async def async_setup_entry(
         protect_client=protect_client,
         entry=entry,
         network_available=network_available,
-        # cmcore (backlog 1353): InnerSpace read with a cloud key is not one of the
-        # console's own applications, so a rejected local key still reauths.
-        innerspace_available=innerspace_available and not innerspace_via_cloud,
+        innerspace_available=innerspace_available,
     )
 
     # 2. Device coordinator - fast updates (30 seconds) for devices, stats
@@ -699,7 +654,6 @@ async def async_setup_entry(
             entry=entry,
             device_coordinator=device_coordinator,
             protect_coordinator=protect_coordinator,
-            reauth_on_auth_error=not innerspace_via_cloud,
         )
 
     # Fetch initial data - config first, then device/protect/innerspace in parallel
@@ -711,13 +665,7 @@ async def async_setup_entry(
     if protect_coordinator:
         refresh_tasks.append(protect_coordinator.async_config_entry_first_refresh())
     if innerspace_coordinator:
-        # cmcore (backlog 1353): a failed cloud read leaves InnerSpace unavailable
-        # until a later poll succeeds, instead of failing the local entry's setup.
-        refresh_tasks.append(
-            innerspace_coordinator.async_refresh()
-            if innerspace_via_cloud
-            else innerspace_coordinator.async_config_entry_first_refresh()
-        )
+        refresh_tasks.append(innerspace_coordinator.async_config_entry_first_refresh())
     await asyncio.gather(*refresh_tasks)
 
     # Discover and update console identity if needed (backward compatibility)

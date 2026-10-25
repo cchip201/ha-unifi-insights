@@ -590,12 +590,6 @@ InnerSpace places your UniFi devices on floor plans. For each device that InnerS
 
 InnerSpace works with Local and Remote entries, and data is refreshed every 5 minutes.
 
-### InnerSpace through the cloud for a Local entry (cmcore fork)
-
-InnerSpace 1.4.1 serves its Integration API only to a console login, so a console API key gets `403 Headers missing` and a Local entry has no floor plans. Reconfigure the Local entry and enter a Site Manager API key from [unifi.ui.com](https://unifi.ui.com) in **UniFi cloud API key for InnerSpace**. The flow finds the console among that key's consoles by its MAC address and reads InnerSpace through the cloud before saving.
-
-With the key stored, only InnerSpace goes through the cloud. Network, Protect and Access stay local. While the UniFi cloud is down the floor plan and placement sensors are unavailable, and they return at the next 5-minute refresh; the cloud never delays, fails or reauthenticates the entry. A rejected cloud key leaves InnerSpace unavailable until the entry is reconfigured with a new key. Leaving the field empty keeps the stored key; **Remove the InnerSpace cloud API key** reads InnerSpace on the console again.
-
 ## UniFi Mobility
 
 Remote entries also read [UniFi Mobility](https://unifi.ui.com) workspaces and mobile routers (UMR, UMR Industrial, UMR Ultra). Mobility is only available through the UniFi cloud, so Local entries can't use it.
