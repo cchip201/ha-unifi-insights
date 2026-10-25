@@ -1,10 +1,14 @@
 # Copyright 2026 UniFi Insights contributors
 """Tests for UniFi Protect select entities."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 
 from custom_components.unifi_insights.const import (
     DEVICE_TYPE_CAMERA,
@@ -13,8 +17,10 @@ from custom_components.unifi_insights.const import (
     DOMAIN,
     HDR_MODE_AUTO,
     HDR_MODE_ON,
+    VIDEO_MODE_API_TO_OPTION,
     VIDEO_MODE_DEFAULT,
-    VIDEO_MODE_HIGH_FPS,
+    VIDEO_MODE_OPTIONS,
+    VIDEO_MODES,
 )
 from custom_components.unifi_insights.select import (
     PARALLEL_UPDATES,
@@ -30,6 +36,10 @@ from custom_components.unifi_insights.select import (
 )
 from tests.fixtures.command_owners import autospec_command_owners, protect_owner
 from tests.fixtures.facade_data import with_protect_collection, with_protect_fields
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 
 @pytest.fixture
@@ -430,6 +440,13 @@ class TestUnifiProtectHDRModeSelect:
 class TestUnifiProtectVideoModeSelect:
     """Tests for UnifiProtectVideoModeSelect entity."""
 
+    def test_option_mapping_is_bijective(self) -> None:
+        """Every HA option must round-trip to exactly one supported API mode."""
+        assert tuple(VIDEO_MODE_OPTIONS.values()) == VIDEO_MODES
+        assert len(set(VIDEO_MODE_OPTIONS.values())) == len(VIDEO_MODE_OPTIONS)
+        for option, mode in VIDEO_MODE_OPTIONS.items():
+            assert VIDEO_MODE_API_TO_OPTION[mode] == option
+
     def test_initialization(self, mock_coordinator):
         """Test video mode select initialization."""
         mock_coordinator.data = {
@@ -463,10 +480,21 @@ class TestUnifiProtectVideoModeSelect:
         assert entity._attr_translation_key == "video_mode"
         assert entity._attr_current_option == "default"
         assert VIDEO_MODE_DEFAULT in entity._attr_options
-        assert VIDEO_MODE_HIGH_FPS in entity._attr_options
+        assert "high_fps" in entity._attr_options
 
+    @pytest.mark.parametrize(
+        ("option", "mode"),
+        [
+            ("default", "default"),
+            ("high_fps", "highFps"),
+            ("sport", "sport"),
+            ("slow_shutter", "slowShutter"),
+            ("lpr_reflex", "lprReflex"),
+            ("lpr_none_reflex", "lprNoneReflex"),
+        ],
+    )
     async def test_async_select_option_success(
-        self, mock_coordinator: MagicMock
+        self, mock_coordinator: MagicMock, option: str, mode: str
     ) -> None:
         """Test selecting video mode option successfully."""
         mock_coordinator.data = {
@@ -495,16 +523,17 @@ class TestUnifiProtectVideoModeSelect:
         )
         entity.async_write_ha_state = MagicMock()
 
-        await entity.async_select_option("highFps")
+        await entity.async_select_option(option)
 
         protect_owner(mock_coordinator).async_set_video_mode.assert_awaited_once_with(
-            "cam1", "highFps"
+            "cam1", mode
         )
         mock_coordinator.data = with_protect_fields(
-            mock_coordinator.data, "cameras", "cam1", videoMode="highFps"
+            mock_coordinator.data, "cameras", "cam1", videoMode=mode
         )
         entity._update_from_data()
-        assert entity._attr_current_option == "highFps"
+        assert entity._attr_current_option == option
+        assert entity.extra_state_attributes["video_mode"] == mode
 
     async def test_async_select_option_error(self, mock_coordinator):
         """Test selecting video mode option with error."""
@@ -541,7 +570,130 @@ class TestUnifiProtectVideoModeSelect:
         entity.async_write_ha_state = MagicMock()
 
         with pytest.raises(HomeAssistantError, match="Unable to set video mode"):
-            await entity.async_select_option("highFps")
+            await entity.async_select_option("high_fps")
+
+    @pytest.mark.parametrize(
+        "mode", [None, 123, ["invalid"], "unsupported", "high_fps", "slow_shutter"]
+    )
+    def test_unknown_api_mode_stays_unknown(
+        self, mock_coordinator: MagicMock, mode: object
+    ) -> None:
+        """Malformed or unsupported API values must not become a valid mode."""
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {"cam1": {"id": "cam1", "state": "CONNECTED", "videoMode": mode}},
+        )
+        entity = UnifiProtectVideoModeSelect(mock_coordinator, "cam1")
+        assert entity.state is None
+        assert entity.extra_state_attributes["video_mode"] == mode
+
+    def test_missing_api_mode_uses_default(self, mock_coordinator: MagicMock) -> None:
+        """An omitted API field retains the established default fallback."""
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {"cam1": {"id": "cam1", "state": "CONNECTED"}},
+        )
+        entity = UnifiProtectVideoModeSelect(mock_coordinator, "cam1")
+        assert entity.state == "default"
+        assert entity.extra_state_attributes["video_mode"] == "default"
+
+
+class TestLprVideoModeStates:
+    """Exercise camera API responses through the real HA state machine."""
+
+    @pytest.fixture
+    def mock_protect_client(
+        self, mock_protect_client: MagicMock, mode: str
+    ) -> MagicMock:
+        """Seed the API boundary before the integration builds its snapshots."""
+        mock_protect_client.cameras.get_all.return_value = [
+            {
+                "id": "lpr_camera",
+                "name": "LPR Camera",
+                "state": "CONNECTED",
+                "model": "UVC-G5-Bullet",
+                "mac": "11:22:33:44:55:66",
+                "videoMode": mode,
+                "featureFlags": {},
+            }
+        ]
+        return mock_protect_client
+
+    @pytest.mark.parametrize(
+        ("mode", "option"),
+        [
+            ("default", "default"),
+            ("highFps", "high_fps"),
+            ("sport", "sport"),
+            ("slowShutter", "slow_shutter"),
+            ("lprReflex", "lpr_reflex"),
+            ("lprNoneReflex", "lpr_none_reflex"),
+        ],
+    )
+    async def test_lpr_mode_serializes_as_reported(
+        self,
+        hass: HomeAssistant,
+        init_integration: MockConfigEntry,
+        mock_protect_client: MagicMock,
+        mode: str,
+        option: str,
+    ) -> None:
+        """A documented LPR mode must serialize as its value, never unknown."""
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id(
+            "select", DOMAIN, "unifi_insights_camera_lpr_camera_video_mode"
+        )
+        assert entity_id is not None
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == option
+        assert state.attributes["video_mode"] == mode
+        assert state.attributes["options"] == [
+            "default",
+            "high_fps",
+            "sport",
+            "slow_shutter",
+            "lpr_reflex",
+            "lpr_none_reflex",
+        ]
+
+        # Public HA service validation rejects legacy select keys before I/O.
+        with pytest.raises(ServiceValidationError):
+            await hass.services.async_call(
+                "select",
+                "select_option",
+                {"entity_id": entity_id, "option": "highFps"},
+                blocking=True,
+            )
+        mock_protect_client.cameras.set_video_mode.assert_not_awaited()
+        await hass.services.async_call(
+            "select",
+            "select_option",
+            {"entity_id": entity_id, "option": option},
+            blocking=True,
+        )
+        mock_protect_client.cameras.set_video_mode.assert_awaited_once_with(
+            "lpr_camera", mode
+        )
+
+        # A fresh API response must publish the new translated state through HA.
+        raw_update = "highFps" if mode == "default" else "default"
+        key_update = "high_fps" if mode == "default" else "default"
+        mock_protect_client.cameras.get_all.return_value = [
+            {
+                **mock_protect_client.cameras.get_all.return_value[0],
+                "videoMode": raw_update,
+            }
+        ]
+        owner = init_integration.runtime_data.coordinator.require_protect_coordinator()
+        await owner.async_refresh()
+        await hass.async_block_till_done()
+        updated = hass.states.get(entity_id)
+        assert updated is not None
+        assert updated.state == key_update
+        assert updated.attributes["video_mode"] == raw_update
 
 
 class TestUnifiProtectChimeRingtoneSelect:

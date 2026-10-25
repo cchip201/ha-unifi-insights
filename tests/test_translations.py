@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 from string import Formatter
 from typing import Any, Final, cast
@@ -43,6 +44,25 @@ _INTEGRATION_DIR = Path(__file__).parent.parent / "custom_components" / "unifi_i
 _EN_JSON = _INTEGRATION_DIR / "translations" / "en.json"
 _STRINGS_JSON = _INTEGRATION_DIR / "strings.json"
 _ICONS_JSON = _INTEGRATION_DIR / "icons.json"
+
+
+def test_video_mode_options_have_readable_native_translations() -> None:
+    """Video Mode uses valid HA state keys with matching English labels."""
+    expected = {
+        "default": "Normal",
+        "high_fps": "High frame rate",
+        "sport": "Fast motion",
+        "slow_shutter": "Low light",
+        "lpr_reflex": "License plates (reflective)",
+        "lpr_none_reflex": "License plates (non-reflective)",
+    }
+    for path in (_STRINGS_JSON, _EN_JSON):
+        strings = json.loads(path.read_text())
+        assert strings["entity"]["select"]["video_mode"]["state"] == expected
+        assert all(
+            re.fullmatch(r"(?!.+[_-]{2})(?![_-])[a-z0-9-_]+(?<![_-])", key)
+            for key in strings["entity"]["select"]["video_mode"]["state"]
+        )
 
 
 def test_binary_sensor_camera_and_sensor_translation_keys_present_in_en_json() -> None:

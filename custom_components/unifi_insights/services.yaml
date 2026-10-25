@@ -140,15 +140,25 @@ set_video_mode:
         text:
     mode:
       name: Video Mode
-      description: Video mode (default, highFps, sport, slowShutter)
+      description: >-
+        Raw Protect video mode (default, highFps, sport, slowShutter, lprReflex,
+        lprNoneReflex). These action values differ from the select entity keys.
       required: true
       selector:
         select:
           options:
-            - "default"
-            - "highFps"
-            - "sport"
-            - "slowShutter"
+            - label: Normal
+              value: "default"
+            - label: High frame rate
+              value: "highFps"
+            - label: Fast motion
+              value: "sport"
+            - label: Low light
+              value: "slowShutter"
+            - label: License plates (reflective)
+              value: "lprReflex"
+            - label: License plates (non-reflective)
+              value: "lprNoneReflex"
 
 set_mic_volume:
   name: Set Microphone Volume
