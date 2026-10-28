@@ -201,6 +201,34 @@ def _restored_name(
     return device.name_by_user or device.name
 
 
+def _uplink_identifiers(
+    device_registry: dr.DeviceRegistry, reg_entry: er.RegistryEntry
+) -> set[tuple[str, str]] | None:
+    """
+    Return the AP or switch this tracker was last grouped under (cmcore, 643).
+
+    A client that is offline when the entry sets up has no uplink in the live
+    payload, and upstream then files its tracker under a standalone
+    ``client_<mac>`` device - no area, and left behind empty once the client
+    returns and the tracker moves back under its uplink at the next reload.
+    39 such devices appeared on one day of planned outages (2026-10-01).
+    Returning the identifiers of the device the registry entry already points
+    at keeps the tracker where it was. None when that device is itself a
+    ``client_`` placeholder, or no longer exists.
+    """
+    if not reg_entry.device_id:
+        return None
+    device = device_registry.async_get(reg_entry.device_id)
+    if device is None:
+        return None
+    ids = {
+        (domain, ident)
+        for domain, ident in device.identifiers
+        if domain == DOMAIN and not str(ident).startswith("client_")
+    }
+    return ids or None
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
@@ -282,6 +310,7 @@ async def async_setup_entry(
     # `async_add_clients` adding a second entity with the same unique_id when a
     # retained client comes back.
     retained: list[UnifiClientTracker] = []
+    device_registry = dr.async_get(hass) if surviving else None
     for reg_entry in surviving:
         mac = _mac_from_unique_id(reg_entry.unique_id)
         retained.append(
@@ -291,6 +320,11 @@ async def async_setup_entry(
                 site_id=connected_macs.get(mac),
                 restored_name=_restored_name(hass, reg_entry, mac),
                 unique_id=reg_entry.unique_id,
+                previous_device_identifiers=(
+                    _uplink_identifiers(device_registry, reg_entry)
+                    if device_registry
+                    else None
+                ),
             )
         )
         tracked.add(mac)
@@ -334,6 +368,8 @@ class UnifiClientTracker(
         site_id: str | None = None,
         restored_name: str | None = None,
         unique_id: str | None = None,
+        *,
+        previous_device_identifiers: set[tuple[str, str]] | None = None,
     ) -> None:
         """
         Initialize the tracker.
@@ -343,6 +379,10 @@ class UnifiClientTracker(
         `restored_name` is the name the registry kept for such a tracker.
         `unique_id` overrides the default DOMAIN_mac id format, used when
         restoring legacy entries that could not be migrated due to collision.
+        `previous_device_identifiers` (cmcore, 643) are the identifiers of the AP
+        or switch device the registry entry already sits under; an offline
+        client's tracker stays there instead of getting a standalone client
+        device.
         """
         super().__init__(coordinator)
         self._site_id = site_id
@@ -384,6 +424,13 @@ class UnifiClientTracker(
             self._device_info = DeviceInfo(
                 identifiers={(DOMAIN, f"{self._site_id}_{uplink_device_id}")},
             )
+            self._attr_name = display_name
+        elif previous_device_identifiers:
+            # cmcore (643): offline at setup, but the registry entry already sits
+            # under an AP or switch - stay there rather than minting a standalone
+            # client device (see _uplink_identifiers). The next connection
+            # regroups it.
+            self._device_info = DeviceInfo(identifiers=set(previous_device_identifiers))
             self._attr_name = display_name
         else:
             # Fallback: a standalone device representing the client itself.
