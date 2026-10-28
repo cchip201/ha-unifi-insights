@@ -11,10 +11,9 @@ from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.diagnostics import REDACTED, async_redact_data
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
+from unifi_official_api import __version__ as api_version
+from unifi_official_api.const import SENSITIVE_CREDENTIAL_KEYS
 
-from .api import __version__ as api_version
-from .api.const import SENSITIVE_CREDENTIAL_KEYS
-from .carrier_fabric_data import CarrierFabricData
 from .const import (
     CONF_ACCESS_WEBHOOK_ENDPOINT_ID,
     CONF_ACCESS_WEBHOOK_ID,
@@ -32,15 +31,17 @@ from .coordinators.carrier_fabric import (
     SERVICE_PLAN_ALLOWLIST,
     SUBSCRIBER_ALLOWLIST,
 )
+from .data_transforms import NETWORK_FACTS_KEY
 from .innerspace_transforms import build_innerspace_diagnostics_summary
 
+# CarrierFabricData is imported inside functions: __init__.py imports this
+# module (through services.py) while it loads, before the class exists.
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from homeassistant.core import HomeAssistant
 
-    from . import UnifiInsightsConfigEntry
-    from .carrier_fabric_data import CarrierFabricConfigEntry
+    from . import CarrierFabricConfigEntry, UnifiInsightsConfigEntry
     from .coordinators.access import UnifiInsightsAccessCoordinator
     from .coordinators.mobility import UnifiInsightsMobilityCoordinator
 
@@ -729,6 +730,8 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     _ = hass
     _LOGGER.debug("Gathering diagnostics data for UniFi Insights")
 
@@ -814,6 +817,9 @@ async def async_get_config_entry_diagnostics(
     # nested fields. Build their summaries separately and exclude raw sections.
     facade_data = dict(coordinator.data)
     facade_data.pop("site_manager", None)
+    # The read model repeats devices and stats as frozen records, which the
+    # MAC pass cannot walk into; the raw sections already carry it all.
+    facade_data.pop(NETWORK_FACTS_KEY, None)
     innerspace_snapshot = facade_data.pop("innerspace", None)
     innerspace_coord = getattr(data, "innerspace_coordinator", None)
     if not isinstance(innerspace_snapshot, Mapping) and innerspace_coord is not None:

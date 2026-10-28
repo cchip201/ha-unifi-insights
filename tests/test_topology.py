@@ -6,24 +6,38 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
+from homeassistant.exceptions import HomeAssistantError
+from pytest_homeassistant_custom_component.common import flush_store
 
 from custom_components.unifi_insights.topology import (
+    _NODE_KEYS,
+    _STORAGE_KEY,
+    MAX_CLIENTS_PER_SITE,
+    async_get_node_key,
+    async_load_node_keys,
+    async_remove_node_key,
     build_site_topology,
     build_unavailable_topology,
-)
-from custom_components.unifi_insights.topology_contract import (
-    MAX_CLIENTS_PER_SITE,
     device_kind,
     device_state,
     normalize_mac,
     opaque_node_id,
     site_display_name,
+    wan_node_id,
+    wan_state,
 )
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 ENTRY = "entry-1"
 KEY = bytes(range(32))
@@ -92,6 +106,10 @@ def test_opaque_node_id_is_keyed() -> None:
         ({"type": "accessPoint"}, "access_point"),
         ({"features": ["accessPoint"]}, "access_point"),
         ({"features": ["switching"]}, "switch"),
+        # The observed UDM Pro (#337): null type, only switching, no legacy
+        # block. Its model makes it a gateway, before the switching check.
+        ({"type": None, "model": "UDM Pro", "features": ["switching"]}, "gateway"),
+        ({"model": "USW-24", "features": ["switching", "gateway"]}, "gateway"),
         ({"type": "sensor", "features": []}, "other"),
         ({"topology": {"legacy_type": "uph"}}, "other"),
         ({}, "other"),
@@ -106,10 +124,17 @@ def test_device_kind(device, expected) -> None:
     ("device", "expected"),
     [
         ({"state": "ONLINE"}, "online"),
-        ({"state": "connected"}, "online"),
-        ({"status": "UP"}, "online"),
+        ({"status": "online"}, "online"),
+        # The Network API spec mapping (#337): CONNECTED, UP, DISCONNECTED
+        # and DOWN are not network device states.
+        ({"state": "connected"}, "unknown"),
+        ({"status": "UP"}, "unknown"),
+        ({"state": "DISCONNECTED"}, "unknown"),
+        ({"state": "DOWN"}, "unknown"),
         ({"state": "OFFLINE"}, "offline"),
-        ({"state": "DISCONNECTED"}, "offline"),
+        ({"state": "CONNECTION_INTERRUPTED"}, "offline"),
+        ({"state": "ISOLATED"}, "offline"),
+        ({"state": "U5G_INCORRECT_TOPOLOGY"}, "offline"),
         ({"state": "PENDING_ADOPTION"}, "unknown"),
         ({"state": 1}, "unknown"),
         ({}, "unknown"),
@@ -274,6 +299,34 @@ def _live_layout() -> dict:
     return _data(devices, clients)
 
 
+WAN_IP = "203.0.113.7"
+
+
+def _wan(key: str, *, connected: bool | None, name: str | None = None) -> dict:
+    """Return a WAN record as normalize_legacy_wans() emits it."""
+    wan: dict = {
+        "key": key,
+        "name": name if name is not None else key.upper(),
+        "status": "online" if connected else "offline",
+        "alive": connected,
+        "ip": WAN_IP if connected else None,
+    }
+    if connected is not None:
+        wan["connected"] = connected
+    return wan
+
+
+def _with_wans(data: dict, wans: list | None = None) -> dict:
+    """Give the live layout's gateway its WAN records (Fiber up, 5G backup down)."""
+    if wans is None:
+        wans = [
+            _wan("wan", connected=True, name="Fiber"),
+            _wan("wan2", connected=False, name="5G Backup"),
+        ]
+    data["devices"][SITE]["uuid-gw"]["wans"] = wans
+    return data
+
+
 def _build(data: dict, **kwargs):
     kwargs.setdefault("ha_device_ids", {})
     kwargs.setdefault("node_key", KEY)
@@ -289,7 +342,7 @@ def test_live_layout_builds_the_tree() -> None:
     """Every switch/AP hangs off the core; the core hangs off the gateway."""
     snapshot = _build(_live_layout())
 
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert snapshot["status"] == "ok"
     assert snapshot["issues"] == []
     assert snapshot["unresolved"] == []
@@ -494,6 +547,124 @@ def test_gateway_with_unknown_upstream_is_root() -> None:
     assert not [e for e in snapshot["edges"] if e["source"] == "dev:uuid-gw"]
 
 
+def test_gateway_with_in_site_uplink_is_root() -> None:
+    """A gateway whose uplink names an in-site switch never gets a parent edge."""
+    data = _data(
+        {
+            "uuid-gw": _device(
+                "uuid-gw", "Gateway", mac=GW_MAC, legacy_type="ucg", uplink_mac=CORE_MAC
+            ),
+            "uuid-core": _device("uuid-core", "Core", mac=CORE_MAC, legacy_type="usw"),
+        }
+    )
+    snapshot = _build(data)
+
+    assert not [e for e in snapshot["edges"] if e["source"] == "dev:uuid-gw"]
+    assert {"node_id": "dev:uuid-core", "reason": "no_uplink_data"} in snapshot[
+        "unresolved"
+    ]
+    assert not [u for u in snapshot["unresolved"] if u["node_id"] == "dev:uuid-gw"]
+
+
+def test_mutual_gateway_switch_uplink_keeps_gateway_root() -> None:
+    """Gateway and switch naming each other over one link: switch -> gateway."""
+    data = _data(
+        {
+            "uuid-gw": _device(
+                "uuid-gw",
+                "Gateway",
+                mac=GW_MAC,
+                legacy_type="ucg",
+                uplink_mac=CORE_MAC,
+                remote_port=9,
+                speed=10000,
+            ),
+            "uuid-core": _device(
+                "uuid-core",
+                "Living Room Switch",
+                mac=CORE_MAC,
+                legacy_type="usw",
+                uplink_mac=GW_MAC,
+                remote_port=5,
+                speed=10000,
+            ),
+            "uuid-ap": _device(
+                "uuid-ap",
+                "AP",
+                mac="02:00:00:00:00:08",
+                legacy_type="uap",
+                uplink_mac=CORE_MAC,
+                remote_port=3,
+            ),
+        },
+        {"cli-tv": _client("cli-tv", "TV", uplink="uuid-core")},
+    )
+    snapshot = _build(data)
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["unresolved"] == []
+    device_edges = [e for e in snapshot["edges"] if e["source"].startswith("dev:")]
+    assert len(device_edges) == 2
+    core_edge = _edge(snapshot, "dev:uuid-core")
+    assert core_edge["target"] == "dev:uuid-gw"
+    assert core_edge["parent_port"] == 5
+    assert core_edge["speed_mbps"] == 10000
+    assert _edge(snapshot, "dev:uuid-ap")["target"] == "dev:uuid-core"
+    assert _edge(snapshot, "cli:cli-tv")["target"] == "dev:uuid-core"
+
+
+def test_multiple_gateways_are_all_roots() -> None:
+    """Gateways naming each other (or the same switch) are each their own root."""
+    second_gw_mac = "02:00:00:00:00:09"
+    data = _data(
+        {
+            "uuid-gw": _device(
+                "uuid-gw", "Gateway", mac=GW_MAC, legacy_type="udm", uplink_mac=CORE_MAC
+            ),
+            "uuid-gw2": _device(
+                "uuid-gw2",
+                "Gateway 2",
+                mac=second_gw_mac,
+                legacy_type="uxg",
+                uplink_mac=GW_MAC,
+            ),
+            "uuid-core": _device(
+                "uuid-core",
+                "Core",
+                mac=CORE_MAC,
+                legacy_type="usw",
+                uplink_mac=GW_MAC,
+            ),
+        }
+    )
+    snapshot = _build(data)
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["unresolved"] == []
+    sources = {edge["source"] for edge in snapshot["edges"]}
+    assert sources == {"dev:uuid-core"}
+
+
+def test_gateway_self_uplink_is_root() -> None:
+    """A gateway that names itself as uplink has no edge and is not unresolved."""
+    snapshot = _build(
+        _data(
+            {
+                "uuid-gw": _device(
+                    "uuid-gw",
+                    "Gateway",
+                    mac=GW_MAC,
+                    legacy_type="ucg",
+                    uplink_mac=GW_MAC,
+                )
+            }
+        )
+    )
+
+    assert snapshot["edges"] == []
+    assert snapshot["unresolved"] == []
+
+
 def test_self_edge_is_skipped() -> None:
     """A device that claims itself as parent gets no edge."""
     snapshot = _build(
@@ -594,11 +765,20 @@ def test_client_name_mac_shaped_is_replaced() -> None:
 
 
 def test_allowlist_never_emits_sensitive_values() -> None:
-    """No MAC, IP, hostname or firmware reaches the payload."""
-    snapshot = _build(_live_layout())
+    """No MAC, IP, hostname, firmware or WAN detail reaches the payload."""
+    snapshot = _build(_with_wans(_live_layout()))
     payload = json.dumps(snapshot)
 
-    for forbidden in ("02:00:00", "12:00:00", "10.1.0.", "10.2.0.", "-host", "7.4.2"):
+    for forbidden in (
+        "02:00:00",
+        "12:00:00",
+        "10.1.0.",
+        "10.2.0.",
+        "-host",
+        "7.4.2",
+        WAN_IP,
+        "alive",
+    ):
         assert forbidden not in payload
     node_keys = {key for node in snapshot["nodes"] for key in node}
     assert node_keys <= {
@@ -879,9 +1059,299 @@ def test_frontend_contract_fixture_is_current() -> None:
         },
     )
     ha_device_ids = {"uuid-gw": "reg-gw", "uuid-core": "reg-core"}
-    snapshot = _build(data, ha_device_ids=ha_device_ids)
+    snapshot = _build(_with_wans(data), ha_device_ids=ha_device_ids)
     rendered = json.dumps(snapshot, indent=2, sort_keys=True) + chr(10)
     if os.environ.get("UPDATE_TOPOLOGY_FIXTURE"):
         FRONTEND_FIXTURE.parent.mkdir(parents=True, exist_ok=True)
         FRONTEND_FIXTURE.write_text(rendered, encoding="utf-8")
     assert FRONTEND_FIXTURE.read_text(encoding="utf-8") == rendered
+
+
+@pytest.mark.parametrize(
+    ("wan", "expected"),
+    [
+        ({"connected": True}, "online"),
+        ({"connected": False}, "offline"),
+        ({"connected": None}, "unknown"),
+        ({"connected": "yes"}, "unknown"),
+        ({}, "unknown"),
+    ],
+)
+def test_wan_state(wan, expected) -> None:
+    """Only a real boolean ``connected`` decides a WAN's state."""
+    assert wan_state(wan) == expected
+
+
+def test_wan_node_id_is_opaque_and_stable() -> None:
+    """A MAC-keyed gateway's WAN id is hashed; the WAN key is normalised."""
+    assert wan_node_id(KEY, "uuid-gw", "wan2") == "wan:uuid-gw:wan2"
+    hashed = wan_node_id(KEY, "AA:BB:CC:DD:EE:FF", "WAN")
+    assert hashed == f"{opaque_node_id('wan', KEY, 'aabbccddeeff')}:wan"
+    assert "aa:bb" not in hashed.lower()
+    assert hashed == wan_node_id(KEY, "aabbccddeeff", "wan")
+    assert hashed != wan_node_id(bytes(32), "aabbccddeeff", "wan")
+
+
+def test_dual_wan_nodes_sit_above_the_gateway() -> None:
+    """Each WAN is a node whose edge runs gateway -> WAN; WANs sort first."""
+    snapshot = _build(_with_wans(_live_layout()), ha_device_ids={"uuid-gw": "reg-gw"})
+
+    assert snapshot["schema_version"] == 2
+    assert snapshot["status"] == "ok"
+    assert snapshot["unresolved"] == []
+    wans = [node for node in snapshot["nodes"] if node["kind"] == "wan"]
+    assert wans == [
+        {
+            "id": "wan:uuid-gw:wan",
+            "kind": "wan",
+            "name": "Fiber",
+            "state": "online",
+            "ha_device_id": "reg-gw",
+        },
+        {
+            "id": "wan:uuid-gw:wan2",
+            "kind": "wan",
+            "name": "5G Backup",
+            "state": "offline",
+            "ha_device_id": "reg-gw",
+        },
+    ]
+    assert [node["kind"] for node in snapshot["nodes"][:3]] == [
+        "wan",
+        "wan",
+        "gateway",
+    ]
+    wan_edges = [e for e in snapshot["edges"] if e["target"].startswith("wan:")]
+    assert wan_edges == [
+        {"source": "dev:uuid-gw", "target": "wan:uuid-gw:wan", "medium": "unknown"},
+        {"source": "dev:uuid-gw", "target": "wan:uuid-gw:wan2", "medium": "unknown"},
+    ]
+    # The rest of the tree is untouched.
+    assert _edge(snapshot, "dev:uuid-core")["target"] == "dev:uuid-gw"
+
+
+def test_single_wan_and_one_down() -> None:
+    """One WAN gives one node; its state follows ``connected`` across polls."""
+    up = _build(_with_wans(_live_layout(), [_wan("wan", connected=True)]))
+    down = _build(_with_wans(_live_layout(), [_wan("wan", connected=False)]))
+
+    (up_node,) = [n for n in up["nodes"] if n["kind"] == "wan"]
+    (down_node,) = [n for n in down["nodes"] if n["kind"] == "wan"]
+    assert up_node == {
+        "id": "wan:uuid-gw:wan",
+        "kind": "wan",
+        "name": "WAN",
+        "state": "online",
+    }
+    assert down_node["id"] == up_node["id"]
+    assert down_node["state"] == "offline"
+    assert up["revision"] != down["revision"]
+
+
+def test_no_wan_data_leaves_snapshot_unchanged() -> None:
+    """A gateway without ``wans`` (or with an empty list) adds nothing."""
+    plain = _build(_live_layout())
+    empty = _build(_with_wans(_live_layout(), []))
+    malformed = _live_layout()
+    malformed["devices"][SITE]["uuid-gw"]["wans"] = "wan"
+
+    assert not [n for n in plain["nodes"] if n["kind"] == "wan"]
+    assert empty == plain
+    assert _build(malformed) == plain
+
+
+def test_unusable_wan_records_are_skipped() -> None:
+    """Records without a key, non-dicts and repeated keys produce no extra node."""
+    snapshot = _build(
+        _with_wans(
+            _live_layout(),
+            [
+                "wan",
+                {"key": "", "connected": True},
+                {"name": "No key", "connected": True},
+                _wan("wan", connected=None, name=""),
+                _wan("WAN", connected=True),
+            ],
+        )
+    )
+
+    wans = [node for node in snapshot["nodes"] if node["kind"] == "wan"]
+    assert wans == [
+        {"id": "wan:uuid-gw:wan", "kind": "wan", "name": "WAN", "state": "unknown"}
+    ]
+    assert len([e for e in snapshot["edges"] if e["target"].startswith("wan:")]) == 1
+
+
+def test_wans_only_on_gateways() -> None:
+    """A non-gateway reporting ``wans`` (e.g. a 5G backup) gets no WAN nodes."""
+    data = _live_layout()
+    data["devices"][SITE]["uuid-core"]["wans"] = [_wan("wan", connected=True)]
+    snapshot = _build(data)
+
+    assert not [node for node in snapshot["nodes"] if node["kind"] == "wan"]
+
+
+def test_each_gateway_gets_its_own_wan_nodes() -> None:
+    """Two gateways with the same WAN key get distinct WAN node ids and edges."""
+    data = _with_wans(_live_layout(), [_wan("wan", connected=True)])
+    data["devices"][SITE]["uuid-gw2"] = _device(
+        "uuid-gw2", "Gateway 2", mac="02:00:00:00:00:09", legacy_type="uxg"
+    )
+    data["devices"][SITE]["uuid-gw2"]["wans"] = [_wan("wan", connected=False)]
+    snapshot = _build(data)
+
+    wan_edges = {
+        edge["target"]: edge["source"]
+        for edge in snapshot["edges"]
+        if edge["target"].startswith("wan:")
+    }
+    assert wan_edges == {
+        "wan:uuid-gw:wan": "dev:uuid-gw",
+        "wan:uuid-gw2:wan": "dev:uuid-gw2",
+    }
+
+
+# --- Node id keys ------------------------------------------------------------
+
+# Tests for the per-entry topology node-id keys.
+
+STORAGE_KEY = _STORAGE_KEY
+
+
+async def _flush(hass: HomeAssistant) -> None:
+    """Write the store's pending delayed save now."""
+    await flush_store(hass.data[_NODE_KEYS].store)
+
+
+def _stored_keys(hass_storage: dict[str, Any]) -> dict[str, str]:
+    return hass_storage[STORAGE_KEY]["data"]["keys"]
+
+
+async def test_key_is_created_persisted_and_reloaded(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A key is random per entry, stable, and survives a restart."""
+    await async_load_node_keys(hass)
+    key = async_get_node_key(hass, "entry-1")
+
+    assert len(key) == 32
+    assert async_get_node_key(hass, "entry-1") == key
+    assert async_get_node_key(hass, "entry-2") != key
+
+    await _flush(hass)
+    assert _stored_keys(hass_storage)["entry-1"] == key.hex()
+
+    # Simulate a restart: nothing in memory, the store is read again.
+    hass.data.pop(_NODE_KEYS)
+    await async_load_node_keys(hass)
+    assert async_get_node_key(hass, "entry-1") == key
+
+
+async def test_load_is_idempotent(hass: HomeAssistant) -> None:
+    """A second load keeps keys created since the first one."""
+    await async_load_node_keys(hass)
+    key = async_get_node_key(hass, "entry-1")
+
+    await async_load_node_keys(hass)
+
+    assert async_get_node_key(hass, "entry-1") == key
+
+
+async def test_load_drops_malformed_keys(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Only 32-byte lower-case hex keys are trusted from storage."""
+    good = "ab" * 32
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": STORAGE_KEY,
+        "data": {"keys": {"good": good, "short": "abcd", "upper": "AB" * 32, "num": 5}},
+    }
+
+    await async_load_node_keys(hass)
+
+    assert async_get_node_key(hass, "good") == bytes.fromhex(good)
+    for entry_id in ("short", "upper", "num"):
+        assert len(async_get_node_key(hass, entry_id)) == 32
+    assert async_get_node_key(hass, "upper") != bytes.fromhex("AB" * 32)
+
+
+async def test_load_ignores_non_dict_keys(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """A stored payload with the wrong shape starts from no keys."""
+    hass_storage[STORAGE_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": STORAGE_KEY,
+        "data": {"keys": ["not", "a", "dict"]},
+    }
+
+    await async_load_node_keys(hass)
+
+    assert hass.data[_NODE_KEYS].keys == {}
+
+
+async def test_unreadable_store_starts_fresh(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A corrupt store logs a warning instead of failing component setup."""
+    with (
+        caplog.at_level(logging.WARNING),
+        patch(
+            "custom_components.unifi_insights.topology.Store.async_load",
+            side_effect=HomeAssistantError("corrupt"),
+        ),
+    ):
+        await async_load_node_keys(hass)
+
+    assert "Could not read topology node keys" in caplog.text
+    assert len(async_get_node_key(hass, "entry-1")) == 32
+
+
+async def test_remove_node_key(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Removing an entry's key persists; unknown entries are a no-op."""
+    await async_load_node_keys(hass)
+    async_get_node_key(hass, "entry-1")
+    kept = async_get_node_key(hass, "entry-2")
+    await _flush(hass)
+
+    await async_remove_node_key(hass, "entry-1")
+    await async_remove_node_key(hass, "missing")
+    await _flush(hass)
+
+    assert _stored_keys(hass_storage) == {"entry-2": kept.hex()}
+
+
+async def test_remove_node_key_loads_store_first(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Removal works before anything loaded the keys (entry not set up)."""
+    await async_load_node_keys(hass)
+    async_get_node_key(hass, "entry-1")
+    await _flush(hass)
+    hass.data.pop(_NODE_KEYS)
+
+    await async_remove_node_key(hass, "entry-1")
+    await _flush(hass)
+
+    assert _stored_keys(hass_storage) == {}
+
+
+async def test_entry_removal_forgets_key(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    init_integration: MockConfigEntry,
+) -> None:
+    """Deleting the config entry deletes its node-id key."""
+    async_get_node_key(hass, init_integration.entry_id)
+    await _flush(hass)
+    assert init_integration.entry_id in _stored_keys(hass_storage)
+
+    await hass.config_entries.async_remove(init_integration.entry_id)
+    await _flush(hass)
+
+    assert init_integration.entry_id not in _stored_keys(hass_storage)

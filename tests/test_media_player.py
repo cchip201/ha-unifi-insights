@@ -17,9 +17,9 @@ from homeassistant.components.media_player import (
     MediaType,
 )
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from unifi_official_api.protect.models.files import TalkbackSession
+from unifi_official_api.protect.talkback import TalkbackStream
 
-from custom_components.unifi_insights.api.protect.models.files import TalkbackSession
-from custom_components.unifi_insights.api.protect.talkback import TalkbackStream
 from custom_components.unifi_insights.const import (
     CAMERA_STATE_CONNECTED,
     DOMAIN,
@@ -28,6 +28,13 @@ from custom_components.unifi_insights.media_player import (
     PARALLEL_UPDATES,
     UnifiProtectCameraSpeaker,
     async_setup_entry,
+)
+from tests.fixtures.command_owners import autospec_command_owners, protect_owner
+from tests.fixtures.facade_data import (
+    set_availability,
+    with_protect_collection,
+    with_protect_device,
+    with_protect_fields,
 )
 
 
@@ -47,7 +54,6 @@ class TestAsyncSetupEntry:
         """Create mock coordinator."""
         coordinator = MagicMock()
         coordinator.protect_client = MagicMock()
-        coordinator.protect_available = True
         coordinator.data = {
             "sites": {},
             "devices": {},
@@ -88,45 +94,49 @@ class TestAsyncSetupEntry:
         self, hass: Any, mock_entry: MagicMock, mock_coordinator: MagicMock
     ) -> None:
         """Test setup creates one entity for each supported flag case."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "cam_top": {
-                "id": "cam_top",
-                "name": "Top Level Speaker Camera",
-                "state": CAMERA_STATE_CONNECTED,
-                "hasSpeaker": True,
-                "speakerVolume": 80,
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {
+                "cam_top": {
+                    "id": "cam_top",
+                    "name": "Top Level Speaker Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                    "hasSpeaker": True,
+                    "speakerVolume": 80,
+                },
+                "cam_nested": {
+                    "id": "cam_nested",
+                    "name": "Nested Flag Speaker Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                    "hasSpeaker": False,
+                    "featureFlags": {"hasSpeaker": True},
+                    "speakerVolume": 60,
+                },
+                "cam_removable": {
+                    "id": "cam_removable",
+                    "name": "Removable Speaker Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                    "featureFlags": {"hasRemovableSpeaker": True},
+                    "volume": 40,
+                },
+                "cam_no_speaker": {
+                    "id": "cam_no_speaker",
+                    "name": "No Speaker Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                    "hasSpeaker": False,
+                    "featureFlags": {"hasSpeaker": False, "hasRemovableSpeaker": False},
+                },
+                "cam_non_bool": {
+                    "id": "cam_non_bool",
+                    "name": "Non Boolean Flag Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                    "hasSpeaker": "truthy_string",
+                    "featureFlags": {"hasSpeaker": 1},
+                },
+                "non_dict_record": "invalid_camera_data",
             },
-            "cam_nested": {
-                "id": "cam_nested",
-                "name": "Nested Flag Speaker Camera",
-                "state": CAMERA_STATE_CONNECTED,
-                "hasSpeaker": False,
-                "featureFlags": {"hasSpeaker": True},
-                "speakerVolume": 60,
-            },
-            "cam_removable": {
-                "id": "cam_removable",
-                "name": "Removable Speaker Camera",
-                "state": CAMERA_STATE_CONNECTED,
-                "featureFlags": {"hasRemovableSpeaker": True},
-                "volume": 40,
-            },
-            "cam_no_speaker": {
-                "id": "cam_no_speaker",
-                "name": "No Speaker Camera",
-                "state": CAMERA_STATE_CONNECTED,
-                "hasSpeaker": False,
-                "featureFlags": {"hasSpeaker": False, "hasRemovableSpeaker": False},
-            },
-            "cam_non_bool": {
-                "id": "cam_non_bool",
-                "name": "Non Boolean Flag Camera",
-                "state": CAMERA_STATE_CONNECTED,
-                "hasSpeaker": "truthy_string",
-                "featureFlags": {"hasSpeaker": 1},
-            },
-            "non_dict_record": "invalid_camera_data",
-        }
+        )
 
         entities: list[UnifiProtectCameraSpeaker] = []
 
@@ -145,18 +155,22 @@ class TestAsyncSetupEntry:
         self, hass: Any, mock_entry: MagicMock, mock_coordinator: MagicMock
     ) -> None:
         """Test setup with only unsupported cameras creates no entities."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "cam_none": {
-                "id": "cam_none",
-                "name": "No Speaker",
-                "state": CAMERA_STATE_CONNECTED,
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {
+                "cam_none": {
+                    "id": "cam_none",
+                    "name": "No Speaker",
+                    "state": CAMERA_STATE_CONNECTED,
+                },
+                "cam_false": {
+                    "id": "cam_false",
+                    "hasSpeaker": False,
+                    "state": CAMERA_STATE_CONNECTED,
+                },
             },
-            "cam_false": {
-                "id": "cam_false",
-                "hasSpeaker": False,
-                "state": CAMERA_STATE_CONNECTED,
-            },
-        }
+        )
 
         add_entities = MagicMock()
         await async_setup_entry(hass, mock_entry, add_entities)
@@ -195,14 +209,18 @@ class TestAsyncSetupEntry:
         self, hass: Any, mock_entry: MagicMock, mock_coordinator: MagicMock
     ) -> None:
         """Test dynamic discovery adds new cameras without duplicating existing ones."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "cam1": {
-                "id": "cam1",
-                "name": "Initial Camera",
-                "state": CAMERA_STATE_CONNECTED,
-                "hasSpeaker": True,
-            }
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {
+                "cam1": {
+                    "id": "cam1",
+                    "name": "Initial Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                    "hasSpeaker": True,
+                }
+            },
+        )
 
         entities: list[UnifiProtectCameraSpeaker] = []
 
@@ -219,12 +237,17 @@ class TestAsyncSetupEntry:
         listener = mock_coordinator.async_add_listener.call_args[0][0]
 
         # Add a new camera to coordinator data and call listener
-        mock_coordinator.data["protect"]["cameras"]["cam2"] = {
-            "id": "cam2",
-            "name": "New Camera",
-            "state": CAMERA_STATE_CONNECTED,
-            "hasSpeaker": True,
-        }
+        mock_coordinator.data = with_protect_device(
+            mock_coordinator.data,
+            "cameras",
+            "cam2",
+            {
+                "id": "cam2",
+                "name": "New Camera",
+                "state": CAMERA_STATE_CONNECTED,
+                "hasSpeaker": True,
+            },
+        )
         listener()
 
         assert len(entities) == 2
@@ -241,9 +264,8 @@ class TestUnifiProtectCameraSpeaker:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator with camera speaker data."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
-        coordinator.protect_available = True
         coordinator.data = {
             "sites": {},
             "devices": {},
@@ -290,58 +312,86 @@ class TestUnifiProtectCameraSpeaker:
     def test_volume_fallback_and_missing(self, mock_coordinator: MagicMock) -> None:
         """Test volume resolution order: speakerSettings, volume, top-level."""
         # speakerSettings.speakerVolume takes highest priority
-        mock_coordinator.data["protect"]["cameras"]["cam1"] = {
-            "id": "cam1",
-            "state": CAMERA_STATE_CONNECTED,
-            "hasSpeaker": True,
-            "speakerSettings": {"speakerVolume": 85, "volume": 50},
-            "speakerVolume": 70,
-        }
+        mock_coordinator.data = with_protect_device(
+            mock_coordinator.data,
+            "cameras",
+            "cam1",
+            {
+                "id": "cam1",
+                "state": CAMERA_STATE_CONNECTED,
+                "hasSpeaker": True,
+                "speakerSettings": {"speakerVolume": 85, "volume": 50},
+                "speakerVolume": 70,
+            },
+        )
         entity = UnifiProtectCameraSpeaker(mock_coordinator, "cam1")
         assert entity.volume_level == 0.85
 
         # Fallback to speakerSettings.volume
-        mock_coordinator.data["protect"]["cameras"]["cam1"] = {
-            "id": "cam1",
-            "state": CAMERA_STATE_CONNECTED,
-            "hasSpeaker": True,
-            "speakerSettings": {"volume": 55},
-            "speakerVolume": 70,
-        }
+        mock_coordinator.data = with_protect_device(
+            mock_coordinator.data,
+            "cameras",
+            "cam1",
+            {
+                "id": "cam1",
+                "state": CAMERA_STATE_CONNECTED,
+                "hasSpeaker": True,
+                "speakerSettings": {"volume": 55},
+                "speakerVolume": 70,
+            },
+        )
         entity = UnifiProtectCameraSpeaker(mock_coordinator, "cam1")
         assert entity.volume_level == 0.55
 
         # Fallback to top-level speakerVolume
-        mock_coordinator.data["protect"]["cameras"]["cam1"] = {
-            "id": "cam1",
-            "state": CAMERA_STATE_CONNECTED,
-            "hasSpeaker": True,
-            "speakerVolume": 65,
-        }
+        mock_coordinator.data = with_protect_device(
+            mock_coordinator.data,
+            "cameras",
+            "cam1",
+            {
+                "id": "cam1",
+                "state": CAMERA_STATE_CONNECTED,
+                "hasSpeaker": True,
+                "speakerVolume": 65,
+            },
+        )
         entity = UnifiProtectCameraSpeaker(mock_coordinator, "cam1")
         assert entity.volume_level == 0.65
 
         # Out of bounds volume (negative or >100) returns None
-        mock_coordinator.data["protect"]["cameras"]["cam1"]["speakerVolume"] = 105
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", speakerVolume=105
+        )
         assert entity.volume_level is None
-        mock_coordinator.data["protect"]["cameras"]["cam1"]["speakerVolume"] = -5
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", speakerVolume=-5
+        )
         assert entity.volume_level is None
 
         # Boolean volume (bool is subclass of int in Python) returns None
-        mock_coordinator.data["protect"]["cameras"]["cam1"]["speakerVolume"] = True
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", speakerVolume=True
+        )
         assert entity.volume_level is None
 
         # Missing both volumes returns None
-        mock_coordinator.data["protect"]["cameras"]["cam1"] = {
-            "id": "cam1",
-            "state": CAMERA_STATE_CONNECTED,
-            "hasSpeaker": True,
-        }
+        mock_coordinator.data = with_protect_device(
+            mock_coordinator.data,
+            "cameras",
+            "cam1",
+            {
+                "id": "cam1",
+                "state": CAMERA_STATE_CONNECTED,
+                "hasSpeaker": True,
+            },
+        )
         entity = UnifiProtectCameraSpeaker(mock_coordinator, "cam1")
         assert entity.volume_level is None
 
         # Non-dict camera data
-        mock_coordinator.data["protect"]["cameras"]["cam1"] = "invalid"
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data, "cameras", {"cam1": "invalid"}
+        )
         assert entity.volume_level is None
 
     def test_state_idle_and_playing(self, mock_coordinator: MagicMock) -> None:
@@ -363,23 +413,29 @@ class TestUnifiProtectCameraSpeaker:
         assert entity.available is True
 
         # Camera state not CONNECTED
-        mock_coordinator.data["protect"]["cameras"]["cam1"]["state"] = "DISCONNECTED"
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", state="DISCONNECTED"
+        )
         assert entity.available is False
 
         # Protect coordinator unavailable
-        mock_coordinator.data["protect"]["cameras"]["cam1"]["state"] = (
-            CAMERA_STATE_CONNECTED
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", state=CAMERA_STATE_CONNECTED
         )
-        mock_coordinator.protect_available = False
+        set_availability(mock_coordinator, protect=False)
         assert entity.available is False
-        mock_coordinator.protect_available = True
+        set_availability(mock_coordinator, protect=True)
 
         # Speaker capability removed
-        mock_coordinator.data["protect"]["cameras"]["cam1"]["hasSpeaker"] = False
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", hasSpeaker=False
+        )
         assert entity.available is False
 
         # Missing camera device data
-        mock_coordinator.data["protect"]["cameras"] = {}
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data, "cameras", {}
+        )
         assert entity.available is False
 
     @pytest.mark.asyncio
@@ -395,9 +451,9 @@ class TestUnifiProtectCameraSpeaker:
         mock_stream = MagicMock()
         mock_stream.running = True
         mock_stream.wait_until_complete = AsyncMock(side_effect=completion_event.wait)
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            return_value=mock_stream
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.return_value = mock_stream
 
         with patch(
             "custom_components.unifi_insights.media_player.async_process_play_media_url",
@@ -408,7 +464,9 @@ class TestUnifiProtectCameraSpeaker:
                 media_id="http://media.local/test.mp3",
             )
 
-        mock_coordinator.async_start_camera_talkback.assert_called_once_with(
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.assert_called_once_with(
             "cam1", "http://processed.local/test.mp3"
         )
         assert entity._current_stream is mock_stream
@@ -437,9 +495,9 @@ class TestUnifiProtectCameraSpeaker:
         mock_stream = MagicMock()
         mock_stream.running = True
         mock_stream.wait_until_complete = AsyncMock()
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            return_value=mock_stream
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.return_value = mock_stream
 
         resolved_item = MagicMock(url="/local/audio.mp3", mime_type="audio/mpeg")
 
@@ -462,7 +520,9 @@ class TestUnifiProtectCameraSpeaker:
                 media_id="media-source://radio_browser/123",
             )
 
-        mock_coordinator.async_start_camera_talkback.assert_called_once_with(
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.assert_called_once_with(
             "cam1", "http://127.0.0.1:8123/local/audio.mp3"
         )
         await entity._completion_task
@@ -492,7 +552,7 @@ class TestUnifiProtectCameraSpeaker:
             )
 
         assert exc_info.value.translation_key == "media_not_audio"
-        mock_coordinator.async_start_camera_talkback.assert_not_called()
+        protect_owner(mock_coordinator).async_start_camera_talkback.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_play_media_non_music_rejected(
@@ -500,7 +560,6 @@ class TestUnifiProtectCameraSpeaker:
     ) -> None:
         """Test non-music media type is rejected before request."""
         entity = UnifiProtectCameraSpeaker(mock_coordinator, "cam1")
-        mock_coordinator.async_start_camera_talkback = AsyncMock()
 
         with pytest.raises(ServiceValidationError) as exc_info:
             await entity.async_play_media(
@@ -509,7 +568,7 @@ class TestUnifiProtectCameraSpeaker:
             )
 
         assert exc_info.value.translation_key == "media_not_audio"
-        mock_coordinator.async_start_camera_talkback.assert_not_called()
+        protect_owner(mock_coordinator).async_start_camera_talkback.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_play_media_stops_previous_stream(
@@ -529,9 +588,9 @@ class TestUnifiProtectCameraSpeaker:
         new_stream = MagicMock()
         new_stream.running = True
         new_stream.wait_until_complete = AsyncMock(side_effect=completion_event.wait)
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            return_value=new_stream
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.return_value = new_stream
 
         with patch(
             "custom_components.unifi_insights.media_player.async_process_play_media_url",
@@ -556,9 +615,9 @@ class TestUnifiProtectCameraSpeaker:
         entity.hass = hass
         entity.async_write_ha_state = MagicMock()  # type: ignore[method-assign]
 
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            side_effect=HomeAssistantError("Start failed")
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.side_effect = HomeAssistantError("Start failed")
 
         with (
             patch(
@@ -590,9 +649,9 @@ class TestUnifiProtectCameraSpeaker:
         old_stream.stop = AsyncMock()
         entity._current_stream = old_stream
 
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            side_effect=HomeAssistantError("Start failed")
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.side_effect = HomeAssistantError("Start failed")
 
         with (
             patch(
@@ -626,9 +685,9 @@ class TestUnifiProtectCameraSpeaker:
         mock_stream.wait_until_complete = AsyncMock(
             side_effect=RuntimeError("Stream network error")
         )
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            return_value=mock_stream
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.return_value = mock_stream
 
         with patch(
             "custom_components.unifi_insights.media_player.async_process_play_media_url",
@@ -789,7 +848,9 @@ class TestUnifiProtectCameraSpeaker:
             samplingRate=24000,
             bitsPerSample=16,
         )
-        stream = TalkbackStream(session, "http://processed.local/test.mp3", hass)
+        stream = TalkbackStream(
+            session, "http://processed.local/test.mp3", loop=hass.loop
+        )
 
         transcoder_started = threading.Event()
 
@@ -807,9 +868,9 @@ class TestUnifiProtectCameraSpeaker:
             await stream.start()
             return stream
 
-        mock_coordinator.async_start_camera_talkback = AsyncMock(
-            side_effect=_mock_start_camera_talkback
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_start_camera_talkback.side_effect = _mock_start_camera_talkback
 
         with (
             patch.object(entity, "async_write_ha_state"),
@@ -821,10 +882,7 @@ class TestUnifiProtectCameraSpeaker:
                 return_value="http://processed.local/test.mp3",
             ),
             patch(
-                (
-                    "custom_components.unifi_insights.api.protect.talkback"
-                    "._transcode_and_stream"
-                ),
+                ("unifi_official_api.protect.talkback._transcode_and_stream"),
                 side_effect=_mock_transcode,
             ),
         ):
@@ -902,7 +960,7 @@ class TestUnifiProtectCameraSpeaker:
                 media_id="http://media.local/test.mp3",
             )
 
-        mock_coordinator.async_start_camera_talkback.assert_not_called()
+        protect_owner(mock_coordinator).async_start_camera_talkback.assert_not_called()
         assert entity._current_stream is None
 
     @pytest.mark.asyncio

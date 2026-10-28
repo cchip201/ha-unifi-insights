@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import io
 import logging
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import segno
@@ -15,23 +14,28 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
+from unifi_official_api.exceptions import UniFiError
 
-from .api.exceptions import UniFiError
-from .console_identity import resolve_console_namespace
+from .console_identity import async_migrate_site_entity, resolve_console_namespace
 from .const import DOMAIN, MANUFACTURER
-from .coordinators import UnifiFacadeCoordinator
-from .coordinators.voucher_state import (
+from .coordinators import UnifiInsightsFacadeCoordinator
+from .data_transforms import (
     _field,
+    latest_voucher,
     latest_voucher_qr_payload,
+    owner_available,
     parse_timestamp,
+    rule_record,
+    section_by_site,
+    site_section_available,
     voucher_site_ids,
 )
-from .entity import build_site_device_info
-from .helpers import async_migrate_site_entity
+from .entity import UnifiSiteEntity
 from .innerspace_transforms import parse_floor_plan_asset_path, strip_url_query
 
 if TYPE_CHECKING:
     import asyncio
+    from collections.abc import Mapping
     from datetime import datetime
 
     from homeassistant.core import HomeAssistant
@@ -59,41 +63,37 @@ async def async_setup_entry(
     @callback
     def async_discover_images() -> None:
         """Discover and add new WiFi QR code and floor plan image entities."""
-        if not coordinator.data or not isinstance(coordinator.data, dict):
+        snapshot: Mapping[str, Any] = coordinator.data
+        if not snapshot or not isinstance(snapshot, dict):
             return
 
         new_entities: list[ImageEntity] = []
 
         # WiFi QR codes
-        wifi_by_site = coordinator.data.get("wifi", {})
-        if isinstance(wifi_by_site, dict):
-            for site_id, wifi_networks in wifi_by_site.items():
-                if not isinstance(wifi_networks, dict):
+        wifi_by_site = section_by_site(coordinator.data, "wifi") or {}
+        for site_id, wifi_networks in wifi_by_site.items():
+            for wifi_id, wifi_data in wifi_networks.items():
+                # Only networks for which we resolved a connect string (i.e.
+                # the passphrase was available from the classic API) get a
+                # QR code.
+                if not wifi_data.get("qr_code"):
                     continue
-                for wifi_id, wifi_data in wifi_networks.items():
-                    if not isinstance(wifi_data, dict):
-                        continue
-                    # Only networks for which we resolved a connect string (i.e.
-                    # the passphrase was available from the classic API) get a
-                    # QR code.
-                    if not wifi_data.get("qr_code"):
-                        continue
-                    key = (site_id, wifi_id)
-                    if key in known_wifi_keys:
-                        continue
-                    known_wifi_keys.add(key)
-                    wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
-                    _LOGGER.debug(
-                        "Creating WiFi QR code image for %s (%s)", wifi_name, wifi_id
+                key = (site_id, wifi_id)
+                if key in known_wifi_keys:
+                    continue
+                known_wifi_keys.add(key)
+                wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
+                _LOGGER.debug(
+                    "Creating WiFi QR code image for %s (%s)", wifi_name, wifi_id
+                )
+                new_entities.append(
+                    UnifiWifiQrCodeImage(
+                        hass=hass,
+                        coordinator=coordinator,
+                        site_id=site_id,
+                        wifi_id=wifi_id,
                     )
-                    new_entities.append(
-                        UnifiWifiQrCodeImage(
-                            hass=hass,
-                            coordinator=coordinator,
-                            site_id=site_id,
-                            wifi_id=wifi_id,
-                        )
-                    )
+                )
 
         # InnerSpace floor plans
         innerspace = coordinator.data.get("innerspace")
@@ -149,16 +149,19 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(async_discover_images))
 
 
-class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity):
+class UnifiWifiQrCodeImage(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ImageEntity
+):
     """A QR code image that joins a device to a WiFi network."""
 
     _attr_has_entity_name = True
+    _attr_translation_key = "wifi_qr_code"
     _attr_content_type = "image/png"
 
     def __init__(
         self,
         hass: HomeAssistant,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         wifi_id: str,
     ) -> None:
@@ -173,7 +176,6 @@ class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntit
         wifi_name = wifi_data.get("name") or wifi_data.get("ssid", wifi_id)
 
         self._attr_unique_id = f"{site_id}_{wifi_id}_qr_code"
-        self._attr_name = "WiFi QR code"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"wifi_{wifi_id}")},
             name=f"WiFi: {wifi_name}",
@@ -189,12 +191,10 @@ class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntit
 
     def _get_wifi_data(self) -> dict[str, Any]:
         """Get WiFi data for this network from the coordinator."""
-        result: dict[str, Any] = (
-            self.coordinator.data.get("wifi", {})
-            .get(self._site_id, {})
-            .get(self._wifi_id, {})
+        result = rule_record(
+            self.coordinator.data, "wifi", self._site_id, self._wifi_id
         )
-        return result
+        return result if isinstance(result, dict) else {}
 
     def _current_payload(self) -> str | None:
         """Return the current WiFi connect (QR) payload, if available."""
@@ -205,7 +205,8 @@ class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntit
     def available(self) -> bool:
         """Return True if entity is available."""
         return bool(
-            self.coordinator.wifi_available(self._site_id) and self._current_payload()
+            site_section_available(self.coordinator.data, self._site_id, "wifi")
+            and self._current_payload()
         )
 
     @callback
@@ -232,7 +233,9 @@ class UnifiWifiQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntit
         return self._cached_png
 
 
-class UnifiFloorPlanImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity):
+class UnifiFloorPlanImage(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ImageEntity
+):
     """An image entity representing a UniFi InnerSpace floor plan."""
 
     _attr_has_entity_name = True
@@ -241,7 +244,7 @@ class UnifiFloorPlanImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity
     def __init__(
         self,
         hass: HomeAssistant,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         plan_id: str,
     ) -> None:
         """Initialize the floor plan image entity."""
@@ -269,9 +272,10 @@ class UnifiFloorPlanImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity
 
     def _get_floor_plan_data(self) -> dict[str, Any] | None:
         """Get floor plan data from coordinator."""
-        if not self.coordinator.data or not isinstance(self.coordinator.data, dict):
+        snapshot: Mapping[str, Any] = self.coordinator.data
+        if not snapshot or not isinstance(snapshot, dict):
             return None
-        innerspace = self.coordinator.data.get("innerspace")
+        innerspace = snapshot.get("innerspace")
         if not isinstance(innerspace, dict):
             return None
         floor_plans = innerspace.get("floor_plans")
@@ -291,7 +295,7 @@ class UnifiFloorPlanImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        if not self.coordinator.innerspace_available:
+        if not owner_available(self.coordinator.data, "innerspace"):
             return False
         if not self._current_image_url():
             return False
@@ -441,7 +445,7 @@ class UnifiFloorPlanImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity
         return self._cached_bytes
 
 
-class UnifiVoucherQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEntity):
+class UnifiVoucherQrCodeImage(UnifiSiteEntity, ImageEntity):
     """
     QR code of the latest generated hotspot voucher code.
 
@@ -449,27 +453,21 @@ class UnifiVoucherQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEn
     It does NOT configure Wi-Fi credentials or join a network.
     """
 
-    _attr_has_entity_name = True
     _attr_translation_key = "voucher_qr_code"
     _attr_content_type = "image/png"
 
     def __init__(
         self,
         hass: HomeAssistant,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         *,
         unique_id: str,
     ) -> None:
         """Initialize the voucher QR code image."""
-        CoordinatorEntity.__init__(self, coordinator)
+        UnifiSiteEntity.__init__(self, coordinator, site_id, unique_id=unique_id)
         ImageEntity.__init__(self, hass)
         self.hass = hass
-        self._site_id = site_id
-        self._attr_unique_id = unique_id
-        self._attr_device_info = DeviceInfo(
-            **build_site_device_info(coordinator.data, site_id)  # type: ignore[typeddict-item]
-        )
         self._last_observed_payload: str | None = self._current_payload()
         self._rendered_payload: str | None = None
         self._rendered_png: bytes | None = None
@@ -487,11 +485,8 @@ class UnifiVoucherQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEn
         self._cancel_expiration_timer()
         if not getattr(self, "hass", None):
             return
-        latest_vouchers = self.coordinator.data.get("latest_vouchers")
-        if not isinstance(latest_vouchers, Mapping):
-            return
-        record = latest_vouchers.get(self._site_id)
-        if not isinstance(record, Mapping):
+        record = latest_voucher(self.coordinator.data, self._site_id)
+        if record is None:
             return
         if record.get("expired") is True:
             return
@@ -532,16 +527,15 @@ class UnifiVoucherQrCodeImage(CoordinatorEntity[UnifiFacadeCoordinator], ImageEn
 
     def _current_payload(self) -> str | None:
         """Return the QR payload for the latest voucher if active and unexpired."""
-        latest_vouchers = self.coordinator.data.get("latest_vouchers")
-        if not isinstance(latest_vouchers, Mapping):
-            return None
-        return latest_voucher_qr_payload(latest_vouchers.get(self._site_id))
+        return latest_voucher_qr_payload(
+            latest_voucher(self.coordinator.data, self._site_id)
+        )
 
     @property
     def available(self) -> bool:
         """Return True if vouchers are available and a valid QR payload exists."""
         return bool(
-            self.coordinator.vouchers_available(self._site_id)
+            site_section_available(self.coordinator.data, self._site_id, "vouchers")
             and self._current_payload()
         )
 

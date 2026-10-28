@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.number import (
     NumberDeviceClass,
@@ -15,11 +15,9 @@ from homeassistant.components.number import (
 )
 from homeassistant.const import UnitOfDataRate, UnitOfInformation, UnitOfTime
 from homeassistant.core import callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .console_identity import resolve_console_namespace
+from .console_identity import async_migrate_site_entity, resolve_console_namespace
 from .const import (
     ATTR_CAMERA_ID,
     ATTR_CAMERA_NAME,
@@ -35,26 +33,30 @@ from .const import (
     DEVICE_TYPE_CHIME,
     DEVICE_TYPE_LIGHT,
 )
-from .coordinators import UnifiFacadeCoordinator
-from .coordinators.voucher_state import (
+from .data_transforms import (
     VOUCHER_INPUTS,
     cast_input,
+    led_level_to_percent,
+    percent_to_led_level,
+    protect_collection,
+    protect_device,
     restore_input,
+    site_section_available,
     voucher_site_ids,
 )
 from .entity import (
     UnifiProtectEntity,
-    async_call_coordinator_action,
-    build_site_device_info,
+    UnifiSiteEntity,
 )
-from .helpers import async_migrate_site_entity
-from .led_level import led_level_to_percent, percent_to_led_level
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
+    from .coordinators import UnifiInsightsFacadeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,7 +121,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up number entities for UniFi Protect integration."""
-    coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = entry.runtime_data.coordinator
     _async_setup_voucher_numbers(hass, entry, coordinator, async_add_entities)
 
     # Skip if Protect API is not available
@@ -132,92 +134,74 @@ async def async_setup_entry(
     @callback
     def async_discover_numbers() -> None:
         """Discover and add new number entities."""
-        if (
-            not coordinator.data
-            or not isinstance(coordinator.data, dict)
-            or "protect" not in coordinator.data
-            or not isinstance(coordinator.data["protect"], dict)
-        ):
-            return
-
-        protect = coordinator.data["protect"]
         entities: list[NumberEntity] = []
 
         # Add camera microphone volume numbers
-        cameras = protect.get("cameras", {})
-        if isinstance(cameras, dict):
-            for camera_id, camera_data in cameras.items():
-                if not isinstance(camera_data, dict):
-                    continue
-                key = (camera_id, "mic_volume")
-                if key in known_number_keys:
-                    continue
-                known_number_keys.add(key)
-                _LOGGER.debug(
-                    "Adding microphone volume number for camera %s",
-                    camera_data.get("name", camera_id),
+        cameras = protect_collection(coordinator.data, "cameras") or {}
+        for camera_id, camera_data in cameras.items():
+            key = (camera_id, "mic_volume")
+            if key in known_number_keys:
+                continue
+            known_number_keys.add(key)
+            _LOGGER.debug(
+                "Adding microphone volume number for camera %s",
+                camera_data.get("name", camera_id),
+            )
+            entities.append(
+                UnifiProtectMicrophoneVolumeNumber(
+                    coordinator=coordinator,
+                    camera_id=camera_id,
                 )
-                entities.append(
-                    UnifiProtectMicrophoneVolumeNumber(
-                        coordinator=coordinator,
-                        camera_id=camera_id,
-                    )
-                )
+            )
 
         # Add light brightness level numbers
-        lights = protect.get("lights", {})
-        if isinstance(lights, dict):
-            for light_id, light_data in lights.items():
-                if not isinstance(light_data, dict):
-                    continue
-                key = (light_id, "light_level")
-                if key in known_number_keys:
-                    continue
-                known_number_keys.add(key)
-                _LOGGER.debug(
-                    "Adding brightness level number for light %s",
-                    light_data.get("name", light_id),
+        lights = protect_collection(coordinator.data, "lights") or {}
+        for light_id, light_data in lights.items():
+            key = (light_id, "light_level")
+            if key in known_number_keys:
+                continue
+            known_number_keys.add(key)
+            _LOGGER.debug(
+                "Adding brightness level number for light %s",
+                light_data.get("name", light_id),
+            )
+            entities.append(
+                UnifiProtectLightLevelNumber(
+                    coordinator=coordinator,
+                    light_id=light_id,
                 )
-                entities.append(
-                    UnifiProtectLightLevelNumber(
-                        coordinator=coordinator,
-                        light_id=light_id,
-                    )
-                )
+            )
 
         # Add chime volume and repeat times numbers
-        chimes = protect.get("chimes", {})
-        if isinstance(chimes, dict):
-            for chime_id, chime_data in chimes.items():
-                if not isinstance(chime_data, dict):
-                    continue
-                vol_key = (chime_id, "chime_volume")
-                if vol_key not in known_number_keys:
-                    known_number_keys.add(vol_key)
-                    _LOGGER.debug(
-                        "Adding volume number for chime %s",
-                        chime_data.get("name", chime_id),
+        chimes = protect_collection(coordinator.data, "chimes") or {}
+        for chime_id, chime_data in chimes.items():
+            vol_key = (chime_id, "chime_volume")
+            if vol_key not in known_number_keys:
+                known_number_keys.add(vol_key)
+                _LOGGER.debug(
+                    "Adding volume number for chime %s",
+                    chime_data.get("name", chime_id),
+                )
+                entities.append(
+                    UnifiProtectChimeVolumeNumber(
+                        coordinator=coordinator,
+                        chime_id=chime_id,
                     )
-                    entities.append(
-                        UnifiProtectChimeVolumeNumber(
-                            coordinator=coordinator,
-                            chime_id=chime_id,
-                        )
-                    )
+                )
 
-                rep_key = (chime_id, "repeat_times")
-                if rep_key not in known_number_keys:
-                    known_number_keys.add(rep_key)
-                    _LOGGER.debug(
-                        "Adding repeat times number for chime %s",
-                        chime_data.get("name", chime_id),
+            rep_key = (chime_id, "repeat_times")
+            if rep_key not in known_number_keys:
+                known_number_keys.add(rep_key)
+                _LOGGER.debug(
+                    "Adding repeat times number for chime %s",
+                    chime_data.get("name", chime_id),
+                )
+                entities.append(
+                    UnifiProtectChimeRepeatTimesNumber(
+                        coordinator=coordinator,
+                        chime_id=chime_id,
                     )
-                    entities.append(
-                        UnifiProtectChimeRepeatTimesNumber(
-                            coordinator=coordinator,
-                            chime_id=chime_id,
-                        )
-                    )
+                )
 
         if entities:
             _LOGGER.info("Adding %d UniFi Protect number entities", len(entities))
@@ -240,7 +224,7 @@ class UnifiProtectMicrophoneVolumeNumber(UnifiProtectEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -256,8 +240,8 @@ class UnifiProtectMicrophoneVolumeNumber(UnifiProtectEntity, NumberEntity):
 
     def _update_from_data(self) -> None:
         """Update entity from data."""
-        camera_data = self.coordinator.data["protect"]["cameras"].get(
-            self._device_id, {}
+        camera_data = (
+            protect_device(self.coordinator.data, "cameras", self._device_id) or {}
         )
 
         # Set value; unknown when the camera doesn't report one (0 is below
@@ -281,21 +265,9 @@ class UnifiProtectMicrophoneVolumeNumber(UnifiProtectEntity, NumberEntity):
             "Setting microphone volume to %s for camera %s", value, self._device_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_microphone_volume",
-            f"Unable to set microphone volume for camera {self._device_id}",
-            self._device_id,
-            int(value),
-            fallback_factory=lambda: (
-                self.coordinator.protect_client.set_microphone_volume(  # type: ignore[union-attr]
-                    camera_id=self._device_id,
-                    volume=int(value),
-                )
-            ),
-        )
-        self._attr_native_value = value
-        self.async_write_ha_state()
+        # The owner publishes the written volume; the value follows from it.
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_set_microphone_volume(self._device_id, int(value))
 
 
 class UnifiProtectLightLevelNumber(UnifiProtectEntity, NumberEntity):
@@ -310,7 +282,7 @@ class UnifiProtectLightLevelNumber(UnifiProtectEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         light_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -324,7 +296,9 @@ class UnifiProtectLightLevelNumber(UnifiProtectEntity, NumberEntity):
 
     def _update_from_data(self) -> None:
         """Update entity from data."""
-        light_data = self.coordinator.data["protect"]["lights"].get(self._device_id, {})
+        light_data = (
+            protect_device(self.coordinator.data, "lights", self._device_id) or {}
+        )
 
         # The slider is a 0-100 percentage; Protect stores a 1-6 ledLevel.
         # lightDeviceSettings can be present but None, as in light.py.
@@ -353,22 +327,10 @@ class UnifiProtectLightLevelNumber(UnifiProtectEntity, NumberEntity):
             self._device_id,
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_light_brightness",
-            f"Unable to set brightness for light {self._device_id}",
-            self._device_id,
-            led_level,
-            fallback_factory=lambda: (
-                self.coordinator.protect_client.lights.set_brightness(  # type: ignore[union-attr]
-                    self._device_id,
-                    led_level,
-                )
-            ),
-        )
-        # Show the percentage Protect will report for the level it was given
-        self._attr_native_value = led_level_to_percent(led_level)
-        self.async_write_ha_state()
+        # The owner publishes the level; the slider shows the percentage
+        # Protect will report for it.
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_set_light_brightness(self._device_id, led_level)
 
 
 class UnifiProtectChimeVolumeNumber(UnifiProtectEntity, NumberEntity):
@@ -380,11 +342,10 @@ class UnifiProtectChimeVolumeNumber(UnifiProtectEntity, NumberEntity):
     _attr_native_max_value = 100
     _attr_native_step = 1
     _attr_mode = NumberMode.SLIDER
-    _attr_icon = "mdi:volume-high"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         chime_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -398,7 +359,9 @@ class UnifiProtectChimeVolumeNumber(UnifiProtectEntity, NumberEntity):
 
     def _update_from_data(self) -> None:
         """Update entity from data."""
-        chime_data = self.coordinator.data["protect"]["chimes"].get(self._device_id, {})
+        chime_data = (
+            protect_device(self.coordinator.data, "chimes", self._device_id) or {}
+        )
 
         # Get ring settings - use the first camera's settings or default to 80
         ring_settings = chime_data.get("ringSettings", [])
@@ -422,19 +385,8 @@ class UnifiProtectChimeVolumeNumber(UnifiProtectEntity, NumberEntity):
         """Set the chime volume level."""
         _LOGGER.debug("Setting chime volume to %s for chime %s", value, self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_chime_volume",
-            f"Unable to set volume for chime {self._device_id}",
-            self._device_id,
-            int(value),
-            fallback_factory=lambda: self.coordinator.protect_client.set_chime_volume(  # type: ignore[union-attr]
-                chime_id=self._device_id,
-                volume=int(value),
-            ),
-        )
-        self._attr_native_value = int(value)
-        self.async_write_ha_state()
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_set_chime_volume(self._device_id, int(value))
 
 
 class UnifiProtectChimeRepeatTimesNumber(UnifiProtectEntity, NumberEntity):
@@ -446,11 +398,10 @@ class UnifiProtectChimeRepeatTimesNumber(UnifiProtectEntity, NumberEntity):
     _attr_native_max_value = 10
     _attr_native_step = 1
     _attr_mode = NumberMode.BOX
-    _attr_icon = "mdi:repeat"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         chime_id: str,
     ) -> None:
         """Initialize the number entity."""
@@ -464,7 +415,9 @@ class UnifiProtectChimeRepeatTimesNumber(UnifiProtectEntity, NumberEntity):
 
     def _update_from_data(self) -> None:
         """Update entity from data."""
-        chime_data = self.coordinator.data["protect"]["chimes"].get(self._device_id, {})
+        chime_data = (
+            protect_device(self.coordinator.data, "chimes", self._device_id) or {}
+        )
 
         # Get ring settings - use the first camera's settings or default to 3
         ring_settings = chime_data.get("ringSettings", [])
@@ -490,29 +443,19 @@ class UnifiProtectChimeRepeatTimesNumber(UnifiProtectEntity, NumberEntity):
             "Setting chime repeat times to %s for chime %s", value, self._device_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_set_chime_repeat",
-            f"Unable to set repeat count for chime {self._device_id}",
-            self._device_id,
-            int(value),
-            fallback_factory=lambda: self.coordinator.protect_client.set_chime_repeat(  # type: ignore[union-attr]
-                chime_id=self._device_id,
-                repeat_times=int(value),
-            ),
-        )
-        self._attr_native_value = int(value)
-        self.async_write_ha_state()
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_set_chime_repeat(self._device_id, int(value))
 
 
 def _async_setup_voucher_numbers(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
-    coordinator: UnifiFacadeCoordinator,
+    coordinator: UnifiInsightsFacadeCoordinator,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up hotspot voucher input number entities."""
-    if not isinstance(coordinator.data, dict) or "vouchers" not in coordinator.data:
+    snapshot: Mapping[str, Any] = coordinator.data
+    if not isinstance(snapshot, dict) or "vouchers" not in snapshot:
         return
 
     known: set[tuple[str, str]] = set()
@@ -544,39 +487,36 @@ def _async_setup_voucher_numbers(
     discover()
 
 
-class UnifiVoucherInputNumber(CoordinatorEntity[UnifiFacadeCoordinator], RestoreNumber):
+class UnifiVoucherInputNumber(UnifiSiteEntity, RestoreNumber):
     """Input number entity holding parameters for next generated voucher."""
 
-    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
     entity_description: NumberEntityDescription
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         description: NumberEntityDescription,
         site_id: str,
         *,
         unique_id: str,
     ) -> None:
         """Initialize the voucher input number."""
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._site_id = site_id
-        self._attr_unique_id = unique_id
-        self._attr_device_info = DeviceInfo(
-            **build_site_device_info(coordinator.data, site_id)  # type: ignore[typeddict-item]
+        super().__init__(
+            coordinator, site_id, unique_id=unique_id, description=description
         )
 
     @property
     def available(self) -> bool:
         """Return True if vouchers are available for this site."""
-        return bool(self.coordinator.vouchers_available(self._site_id))
+        return site_section_available(self.coordinator.data, self._site_id, "vouchers")
 
     @property
     def native_value(self) -> float | None:
         """Return current native value from settings."""
-        settings = self.coordinator.get_voucher_settings(self._site_id)
+        settings = self.coordinator.config_coordinator.get_voucher_settings(
+            self._site_id
+        )
         val = getattr(settings, VOUCHER_INPUTS[self.entity_description.key].field)
         return float(val) if val is not None else None
 
@@ -587,13 +527,17 @@ class UnifiVoucherInputNumber(CoordinatorEntity[UnifiFacadeCoordinator], Restore
         if last is not None and last.native_value is not None:
             restored = restore_input(self.entity_description.key, last.native_value)
             if restored is not None:
-                settings = self.coordinator.get_voucher_settings(self._site_id)
-                field = VOUCHER_INPUTS[self.entity_description.key].field
-                setattr(settings, field, restored)
+                self.coordinator.config_coordinator.set_voucher_setting(
+                    self._site_id,
+                    VOUCHER_INPUTS[self.entity_description.key].field,
+                    restored,
+                )
 
     async def async_set_native_value(self, value: float) -> None:
         """Update settings value held in HA without calling external API."""
-        settings = self.coordinator.get_voucher_settings(self._site_id)
-        field = VOUCHER_INPUTS[self.entity_description.key].field
-        setattr(settings, field, cast_input(self.entity_description.key, value))
+        self.coordinator.config_coordinator.set_voucher_setting(
+            self._site_id,
+            VOUCHER_INPUTS[self.entity_description.key].field,
+            cast_input(self.entity_description.key, value),
+        )
         self.async_write_ha_state()

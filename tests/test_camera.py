@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
 from homeassistant.components.camera import CameraEntityFeature
@@ -23,6 +24,15 @@ from custom_components.unifi_insights.const import (
     CAMERA_STATE_CONNECTED,
     DEVICE_TYPE_CAMERA,
 )
+from tests.fixtures.command_owners import autospec_command_owners, protect_owner
+from tests.fixtures.facade_data import (
+    with_camera,
+    with_protect_collection,
+    with_protect_fields,
+)
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 
 class TestParallelUpdates:
@@ -59,7 +69,9 @@ class TestAsyncSetupEntry:
         return coordinator
 
     @pytest.mark.asyncio
-    async def test_setup_entry_no_protect_client(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_no_protect_client(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup when Protect API is not available."""
         mock_coordinator.protect_client = None
 
@@ -75,15 +87,21 @@ class TestAsyncSetupEntry:
         async_add_entities.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_setup_entry_with_cameras(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_with_cameras(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with cameras present."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "camera1": {
-                "id": "camera1",
-                "name": "Test Camera",
-                "state": CAMERA_STATE_CONNECTED,
-            }
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {
+                "camera1": {
+                    "id": "camera1",
+                    "name": "Test Camera",
+                    "state": CAMERA_STATE_CONNECTED,
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -101,14 +119,18 @@ class TestAsyncSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_with_multiple_cameras(
-        self, hass, mock_coordinator
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
         """Test setup with multiple cameras."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "camera1": {"id": "camera1", "name": "Front", "state": "CONNECTED"},
-            "camera2": {"id": "camera2", "name": "Back", "state": "CONNECTED"},
-            "camera3": {"id": "camera3", "name": "Side", "state": "DISCONNECTED"},
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {
+                "camera1": {"id": "camera1", "name": "Front", "state": "CONNECTED"},
+                "camera2": {"id": "camera2", "name": "Back", "state": "CONNECTED"},
+                "camera3": {"id": "camera3", "name": "Side", "state": "DISCONNECTED"},
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -128,14 +150,12 @@ class TestUnifiProtectCamera:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
-        coordinator.protect_client.cameras = MagicMock()
-        coordinator.protect_client.cameras.get_snapshot = AsyncMock(
-            return_value=b"image_data"
-        )
-        coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock()
+        protect = protect_owner(coordinator)
+        protect.async_get_camera_snapshot.return_value = b"image_data"
+        protect.async_create_camera_stream_url.return_value = None
         coordinator.network_client = MagicMock()
         coordinator.network_client.base_url = "https://192.168.1.1"
         coordinator.data = {
@@ -165,7 +185,7 @@ class TestUnifiProtectCamera:
         }
         return coordinator
 
-    def test_initialization(self, mock_coordinator) -> None:
+    def test_initialization(self, mock_coordinator: MagicMock) -> None:
         """Test camera entity initialization."""
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -179,27 +199,29 @@ class TestUnifiProtectCamera:
         assert camera._attr_supported_features == CameraEntityFeature.STREAM
         assert camera._attr_entity_category is None
 
-    def test_update_from_data_connected(self, mock_coordinator) -> None:
+    def test_update_from_data_connected(self, mock_coordinator: MagicMock) -> None:
         """Test _update_from_data with connected camera."""
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
             camera_id="camera1",
         )
 
-        assert camera._attr_available is True
+        assert camera.available is True
 
-    def test_update_from_data_disconnected(self, mock_coordinator) -> None:
+    def test_update_from_data_disconnected(self, mock_coordinator: MagicMock) -> None:
         """Test _update_from_data with disconnected camera."""
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["state"] = "DISCONNECTED"
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "camera1", state="DISCONNECTED"
+        )
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
             camera_id="camera1",
         )
 
-        assert camera._attr_available is False
+        assert camera.available is False
 
-    def test_extra_state_attributes(self, mock_coordinator) -> None:
+    def test_extra_state_attributes(self, mock_coordinator: MagicMock) -> None:
         """Test extra state attributes."""
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -214,16 +236,17 @@ class TestUnifiProtectCamera:
         assert attrs[ATTR_IS_PACKAGE_CAMERA] is False
         assert attrs[ATTR_PARENT_CAMERA_ID] is None
 
-    def test_extra_state_attributes_package_camera(self, mock_coordinator) -> None:
+    def test_extra_state_attributes_package_camera(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test extra state attributes for package camera."""
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["_camera_type"] = (
-            "doorbell_package"
-        )
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["_is_package_camera"] = (
-            True
-        )
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["_parent_camera_id"] = (
-            "doorbell_main"
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "cameras",
+            "camera1",
+            _camera_type="doorbell_package",
+            _is_package_camera=True,
+            _parent_camera_id="doorbell_main",
         )
 
         camera = UnifiProtectCamera(
@@ -237,7 +260,9 @@ class TestUnifiProtectCamera:
         assert attrs[ATTR_PARENT_CAMERA_ID] == "doorbell_main"
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_success(self, mock_coordinator) -> None:
+    async def test_async_camera_image_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test getting camera image successfully."""
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -249,12 +274,14 @@ class TestUnifiProtectCamera:
         assert result == b"image_data"
         # The Protect snapshot endpoint rejects width/height query params
         # (HTTP 500), so the call must not include them.
-        mock_coordinator.protect_client.cameras.get_snapshot.assert_called_once_with(
-            "camera1",
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_get_camera_snapshot.assert_awaited_once_with("camera1")
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_with_dimensions(self, mock_coordinator) -> None:
+    async def test_async_camera_image_with_dimensions(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test getting camera image with specific dimensions."""
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -265,52 +292,33 @@ class TestUnifiProtectCamera:
 
         assert result == b"image_data"
         # Requested dimensions are ignored; HA scales the returned JPEG.
-        mock_coordinator.protect_client.cameras.get_snapshot.assert_called_once_with(
-            "camera1",
-        )
+        protect_owner(
+            mock_coordinator
+        ).async_get_camera_snapshot.assert_awaited_once_with("camera1")
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_error(self, mock_coordinator) -> None:
-        """Test getting camera image with error."""
-        mock_coordinator.protect_client.cameras.get_snapshot.side_effect = Exception(
-            "API error"
-        )
+    async def test_async_camera_image_unreadable(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """A snapshot the owner cannot read is no image."""
+        protect_owner(mock_coordinator).async_get_camera_snapshot.return_value = None
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
             camera_id="camera1",
         )
 
-        result = await camera.async_camera_image()
-
-        assert result is None
+        assert await camera.async_camera_image() is None
 
     @pytest.mark.asyncio
-    async def test_async_camera_image_non_bytes(self, mock_coordinator) -> None:
-        """Test getting camera image when response is not bytes."""
-        mock_coordinator.protect_client.cameras.get_snapshot.return_value = "not bytes"
-
-        camera = UnifiProtectCamera(
-            coordinator=mock_coordinator,
-            camera_id="camera1",
-        )
-
-        result = await camera.async_camera_image()
-
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_stream_source_success(self, mock_coordinator) -> None:
+    async def test_stream_source_success(self, mock_coordinator: MagicMock) -> None:
         """Test getting stream source successfully using the API.
 
-        The vendored API package returns a dynamic stream URL from
-        create_rtsps_stream.
+        The Protect owner returns the dynamic URL it created.
         """
-        # Mock the create_rtsps_stream to return a proper stream object
-        mock_stream = MagicMock()
-        mock_stream.high = "rtsps://192.168.1.1:7441/camera1_abc123?enableSrtp"
-        mock_coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock(
-            return_value=mock_stream
+        protect = protect_owner(mock_coordinator)
+        protect.async_create_camera_stream_url.return_value = (
+            "rtsps://192.168.1.1:7441/camera1_abc123?enableSrtp"
         )
 
         camera = UnifiProtectCamera(
@@ -320,19 +328,16 @@ class TestUnifiProtectCamera:
 
         result = await camera.stream_source()
 
-        # URL comes from the API's create_rtsps_stream response
+        # URL comes from the owner's dynamic stream
         assert result == "rtsps://192.168.1.1:7441/camera1_abc123?enableSrtp"
-        mock_coordinator.protect_client.cameras.create_rtsps_stream.assert_called_once_with(
-            "camera1", qualities=["high"]
-        )
+        protect.async_create_camera_stream_url.assert_awaited_once_with("camera1")
 
     @pytest.mark.asyncio
-    async def test_stream_source_api_failure_fallback(self, mock_coordinator) -> None:
+    async def test_stream_source_api_failure_fallback(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test fallback to static URL when API fails."""
-        # Mock the API to fail
-        mock_coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock(
-            side_effect=Exception("API error")
-        )
+        # The owner could not create a dynamic stream (its fixture default)
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -345,14 +350,13 @@ class TestUnifiProtectCamera:
         assert result == "rtsps://192.168.1.1:7441/camera1?enableSrtp"
 
     @pytest.mark.asyncio
-    async def test_stream_source_no_host(self, mock_coordinator) -> None:
+    async def test_stream_source_no_host(self, mock_coordinator: MagicMock) -> None:
         """Test getting stream source when NVR host cannot be determined."""
-        # Mock the API to fail
-        mock_coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock(
-            side_effect=Exception("API error")
-        )
+        # The owner could not create a dynamic stream (its fixture default)
         # Clear NVR data and set base_url to invalid
-        mock_coordinator.data["protect"]["nvrs"] = {}
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data, "nvrs", {}
+        )
         mock_coordinator.protect_client.base_url = None
 
         camera = UnifiProtectCamera(
@@ -365,16 +369,14 @@ class TestUnifiProtectCamera:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_stream_source_from_nvr_data(self, mock_coordinator) -> None:
+    async def test_stream_source_from_nvr_data(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test getting stream source from NVR data when API fails."""
-        # Mock the API to fail so it falls back to static URL
-        mock_coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock(
-            side_effect=Exception("API error")
-        )
         # Add NVR data with a host
-        mock_coordinator.data["protect"]["nvrs"] = {
-            "nvr1": {"host": "10.0.0.1"},
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data, "nvrs", {"nvr1": {"host": "10.0.0.1"}}
+        )
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -388,11 +390,13 @@ class TestUnifiProtectCamera:
 
     @pytest.mark.asyncio
     async def test_stream_source_protect_client_none_fallback(
-        self, mock_coordinator
+        self, mock_coordinator: MagicMock
     ) -> None:
-        """Test fallback to static URL when protect_client is None."""
+        """Without a Protect client the NVR host still builds the static URL."""
         mock_coordinator.protect_client = None
-        mock_coordinator.data["protect"]["nvrs"] = {"nvr1": {"host": "10.0.0.1"}}
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data, "nvrs", {"nvr1": {"host": "10.0.0.1"}}
+        )
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -403,16 +407,13 @@ class TestUnifiProtectCamera:
         assert result == "rtsps://10.0.0.1:7441/camera1?enableSrtp"
 
     @pytest.mark.asyncio
-    async def test_stream_source_create_stream_missing_high_quality(
-        self, mock_coordinator
+    async def test_stream_source_no_dynamic_url_uses_nvr_host(
+        self, mock_coordinator: MagicMock
     ) -> None:
-        """Test fallback to static URL when stream high URL is missing."""
-        mock_stream = MagicMock()
-        mock_stream.high = None
-        mock_coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock(
-            return_value=mock_stream
+        """Test fallback to static URL when the owner returns no dynamic URL."""
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data, "nvrs", {"nvr1": {"host": "10.0.0.1"}}
         )
-        mock_coordinator.data["protect"]["nvrs"] = {"nvr1": {"host": "10.0.0.1"}}
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -423,15 +424,15 @@ class TestUnifiProtectCamera:
         assert result == "rtsps://10.0.0.1:7441/camera1?enableSrtp"
 
     @pytest.mark.asyncio
-    async def test_stream_source_nvr_data_without_host(self, mock_coordinator) -> None:
+    async def test_stream_source_nvr_data_without_host(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test NVR loop continues when NVR data has no host."""
-        mock_coordinator.protect_client.cameras.create_rtsps_stream = AsyncMock(
-            side_effect=Exception("API error")
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "nvrs",
+            {"nvr1": {"name": "No Host"}, "nvr2": {"host": "10.0.0.2"}},
         )
-        mock_coordinator.data["protect"]["nvrs"] = {
-            "nvr1": {"name": "No Host"},
-            "nvr2": {"host": "10.0.0.2"},
-        }
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
@@ -441,27 +442,29 @@ class TestUnifiProtectCamera:
         result = await camera.stream_source()
         assert result == "rtsps://10.0.0.2:7441/camera1?enableSrtp"
 
-    def test_missing_camera_data(self, mock_coordinator) -> None:
+    def test_missing_camera_data(self, mock_coordinator: MagicMock) -> None:
         """Test handling missing camera data."""
-        mock_coordinator.data["protect"]["cameras"]["camera1"] = {}
+        mock_coordinator.data = with_camera(mock_coordinator.data, "camera1", {})
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
             camera_id="camera1",
         )
 
-        assert camera._attr_available is False
+        assert camera.available is False
         attrs = camera._attr_extra_state_attributes
         assert attrs[ATTR_CAMERA_TYPE] == "regular"  # Default
         assert attrs[ATTR_IS_PACKAGE_CAMERA] is False  # Default
 
-    def test_connecting_state(self, mock_coordinator) -> None:
+    def test_connecting_state(self, mock_coordinator: MagicMock) -> None:
         """Test camera in CONNECTING state."""
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["state"] = "CONNECTING"
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "camera1", state="CONNECTING"
+        )
 
         camera = UnifiProtectCamera(
             coordinator=mock_coordinator,
             camera_id="camera1",
         )
 
-        assert camera._attr_available is False
+        assert camera.available is False

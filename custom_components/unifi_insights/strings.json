@@ -143,7 +143,6 @@
           "track_wifi_clients": "Track WiFi Clients",
           "track_wired_clients": "Track Wired Clients",
           "client_control": "Enable Client Control",
-          "poll_interval": "Poll interval (seconds)",
           "site_ids": "Sites",
           "track_subscribers": "Track individual subscribers as devices",
           "carrier_actions": "Enable service actions (suspend and resume subscribers)",
@@ -153,7 +152,6 @@
           "track_wifi_clients": "Create device tracker entities for connected WiFi clients. This may create many entities.",
           "track_wired_clients": "Create device tracker entities for connected wired (LAN) clients. This may create many entities.",
           "client_control": "Create allow/block switch and reconnect button entities for connected clients, and Wake-on-LAN buttons (disabled by default) for wired clients. Turning this off removes client buttons.",
-          "poll_interval": "How often devices, clients and Protect are polled. Cloud entries default to 120 s because UniFi's remote connector times out under faster polling; local entries default to 30 s. Clear the field to return to the default.",
           "site_ids": "Only poll these sites. Leave empty to include every site on the console. Unselected sites are not queried, which reduces API traffic on multi-site consoles.",
           "track_subscribers": "Create device entries for each subscriber in your Carrier Fabric organisation.",
           "carrier_actions": "Allow suspending and resuming subscriber services from Home Assistant.",
@@ -184,6 +182,10 @@
         "device_id": {
           "name": "Device ID",
           "description": "The ID of the device to restart."
+        },
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the device to target. Use this or the device ID."
         }
       }
     },
@@ -198,6 +200,14 @@
         "doorbells": {
           "name": "Doorbells",
           "description": "Doorbell ring sensors of this integration, or the doorbell devices or areas that hold them. Only doorbells on the chime's console are accepted."
+        },
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the chime to target. Use this or the chime ID."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "The chime device to target. Use this or the chime ID."
         }
       }
     },
@@ -208,12 +218,30 @@
         "reason": {
           "name": "Reason",
           "description": "Optional reason for stopping the subscriber's service (maximum 1024 characters)."
+        },
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the subscriber to target."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "The subscriber device to target."
         }
       }
     },
     "carrier_resume_subscriber": {
       "name": "Resume Subscriber",
-      "description": "Restore a subscriber's internet service. Requires the \"Enable service actions\" option to be enabled on the Carrier Fabric integration entry, and an ISP API key with the resume:service scope."
+      "description": "Restore a subscriber's internet service. Requires the \"Enable service actions\" option to be enabled on the Carrier Fabric integration entry, and an ISP API key with the resume:service scope.",
+      "fields": {
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the subscriber to target."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "The subscriber device to target."
+        }
+      }
     },
     "power_cycle_port": {
       "name": "Power Cycle PoE Port",
@@ -230,6 +258,10 @@
         "port_idx": {
           "name": "Port Index",
           "description": "The 1-based port index to power-cycle."
+        },
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the device to target. Use this or the device ID."
         }
       }
     },
@@ -244,6 +276,14 @@
         "client_id": {
           "name": "Client ID",
           "description": "The client ID or MAC address of the connected wireless client to reconnect."
+        },
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the client to target. Use this or the client ID."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "The client device to target. Use this or the client ID."
         }
       }
     },
@@ -262,6 +302,14 @@
         "ringtone_id": {
           "name": "Ringtone ID",
           "description": "Kept only so existing automations stay valid. The action raises the same not supported error with or without this field."
+        },
+        "entity_id": {
+          "name": "Entity",
+          "description": "An entity of the chime to target. Use this or the chime ID."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "The chime device to target. Use this or the chime ID."
         }
       }
     },
@@ -369,9 +417,6 @@
       "humidity": {
         "name": "Humidity"
       },
-      "light_level": {
-        "name": "Light Level"
-      },
       "light": {
         "name": "Light"
       },
@@ -448,37 +493,37 @@
         "name": "WAN Uptime"
       },
       "site_total_clients": {
-        "name": "Total Clients"
+        "name": "Total clients"
       },
       "site_wired_clients": {
-        "name": "Wired Clients"
+        "name": "Wired clients"
       },
       "site_wireless_clients": {
-        "name": "Wireless Clients"
+        "name": "Wireless clients"
       },
       "internet_download_1h": {
-        "name": "Internet Download (Last Hour)"
+        "name": "Internet download (last hour)"
       },
       "internet_upload_1h": {
-        "name": "Internet Upload (Last Hour)"
+        "name": "Internet upload (last hour)"
       },
       "internet_download_1d": {
-        "name": "Internet Download (Last 24 Hours)"
+        "name": "Internet download (last 24 hours)"
       },
       "internet_upload_1d": {
-        "name": "Internet Upload (Last 24 Hours)"
+        "name": "Internet upload (last 24 hours)"
       },
       "internet_download_1w": {
-        "name": "Internet Download (Last 7 Days)"
+        "name": "Internet download (last 7 days)"
       },
       "internet_upload_1w": {
-        "name": "Internet Upload (Last 7 Days)"
+        "name": "Internet upload (last 7 days)"
       },
       "internet_download_1m": {
-        "name": "Internet Download (Last 30 Days)"
+        "name": "Internet download (last 30 days)"
       },
       "internet_upload_1m": {
-        "name": "Internet Upload (Last 30 Days)"
+        "name": "Internet upload (last 30 days)"
       },
       "ac_power_consumption": {
         "name": "AC Power Consumption"
@@ -666,6 +711,9 @@
       },
       "active_vouchers": {
         "name": "Active vouchers"
+      },
+      "wifi_client_count": {
+        "name": "Connected clients"
       }
     },
     "binary_sensor": {
@@ -677,7 +725,7 @@
         }
       },
       "wan_status": {
-        "name": "WAN Status"
+        "name": "WAN status"
       },
       "wan_link": {
         "name": "{wan_name} Connection"
@@ -722,22 +770,7 @@
         "name": "External Leak Detection"
       },
       "port_sfp_present": {
-        "name": "SFP Module"
-      },
-      "motion": {
-        "name": "Motion"
-      },
-      "door": {
-        "name": "Door"
-      },
-      "is_recording": {
-        "name": "Recording"
-      },
-      "is_dark": {
-        "name": "Dark"
-      },
-      "doorbell": {
-        "name": "Doorbell"
+        "name": "{port_label} SFP module"
       },
       "alarm_hub_device_tamper": {
         "name": "Tamper Detection"
@@ -757,19 +790,16 @@
     },
     "button": {
       "device_restart": {
-        "name": "Restart"
-      },
-      "reboot": {
-        "name": "Reboot"
+        "name": "Device restart"
       },
       "play": {
         "name": "Play"
       },
       "ptz_patrol_start": {
-        "name": "Start PTZ Patrol"
+        "name": "Start PTZ patrol"
       },
       "ptz_patrol_stop": {
-        "name": "Stop PTZ Patrol"
+        "name": "Stop PTZ patrol"
       },
       "poe_power_cycle": {
         "name": "{port_label} PoE Power Cycle"
@@ -782,24 +812,14 @@
       },
       "access_door_unlock": {
         "name": "Unlock"
-      }
-    },
-    "camera": {
-      "camera": {
-        "name": "Camera"
-      }
-    },
-    "light": {
-      "floodlight": {
-        "name": "Floodlight"
+      },
+      "client_reconnect": {
+        "name": "{client_name} reconnect"
       }
     },
     "switch": {
       "status_light": {
         "name": "Status Light"
-      },
-      "hdr_mode": {
-        "name": "HDR Mode"
       },
       "high_fps_mode": {
         "name": "High FPS Mode"
@@ -867,7 +887,15 @@
         "name": "HDR Mode"
       },
       "video_mode": {
-        "name": "Video Mode"
+        "name": "Video Mode",
+        "state": {
+          "default": "Normal",
+          "high_fps": "High frame rate",
+          "sport": "Fast motion",
+          "slow_shutter": "Low light",
+          "lpr_reflex": "License plates (reflective)",
+          "lpr_none_reflex": "License plates (non-reflective)"
+        }
       },
       "ringtone": {
         "name": "Ringtone"
@@ -877,9 +905,6 @@
       },
       "liveview": {
         "name": "Liveview"
-      },
-      "infrared_mode": {
-        "name": "Infrared Mode"
       }
     },
     "number": {
@@ -888,9 +913,6 @@
       },
       "brightness_level": {
         "name": "Brightness Level"
-      },
-      "speaker_volume": {
-        "name": "Speaker Volume"
       },
       "chime_volume": {
         "name": "Chime Volume"
@@ -967,6 +989,9 @@
       },
       "voucher_qr_code": {
         "name": "Latest voucher QR code"
+      },
+      "wifi_qr_code": {
+        "name": "WiFi QR code"
       }
     },
     "lock": {
@@ -1082,6 +1107,9 @@
     "client_target_required": {
       "message": "Client ID or target is required."
     },
+    "protect_target_required": {
+      "message": "A {resource_type} ID or target is required."
+    },
     "client_not_connected": {
       "message": "Client is not currently connected."
     },
@@ -1132,6 +1160,30 @@
     },
     "network_rule_update_failed": {
       "message": "Unable to update {rule_type} {rule_name}."
+    },
+    "command_failed": {
+      "message": "Unable to complete the request on your UniFi console."
+    },
+    "invalid_api_response": {
+      "message": "Your UniFi console returned data that UniFi Insights could not read."
+    },
+    "refresh_failed": {
+      "message": "Unable to refresh UniFi Insights data from {targets}."
+    },
+    "client_not_resolvable": {
+      "message": "Unable to find the MAC address of client {client_id}."
+    },
+    "restart_rejected": {
+      "message": "Your UniFi console did not accept the restart of device {device_id}."
+    },
+    "voucher_not_created": {
+      "message": "Your UniFi console did not create a guest voucher for site {site_id}."
+    },
+    "ringtone_not_found": {
+      "message": "Ringtone {ringtone_id} is not available on chime {chime_id}."
+    },
+    "liveview_not_found": {
+      "message": "No UniFi Protect liveview is named {liveview}."
     },
     "access_auth_failed": {
       "message": "The UniFi Access token was rejected. Replace it in the integration's reconfigure settings."
@@ -1201,6 +1253,111 @@
     },
     "access_console_required": {
       "message": "More than one UniFi Access console is loaded. Set the console to use."
+    },
+    "target_required": {
+      "message": "At least one target must be specified."
+    },
+    "target_multiple": {
+      "message": "Multiple targets specified for {service}; this action only supports a single target."
+    },
+    "device_target_required": {
+      "message": "Device ID or target is required."
+    },
+    "target_entity_not_found": {
+      "message": "Target entity {target} not found in entity registry."
+    },
+    "target_not_integration_entity": {
+      "message": "Target {target} is not a UniFi Insights entity."
+    },
+    "target_not_integration_device": {
+      "message": "Target {target} is not a UniFi Insights device."
+    },
+    "target_not_protect_resource": {
+      "message": "Target {target} is not a UniFi Protect {resource_type}."
+    },
+    "target_console_not_loaded": {
+      "message": "Target's UniFi console is not loaded."
+    },
+    "target_mobility_unsupported": {
+      "message": "Target {target} is a UniFi Mobility router, which this action does not support."
+    },
+    "network_device_unresolved": {
+      "message": "Could not resolve target {target} to a UniFi network device."
+    },
+    "site_not_found": {
+      "message": "Site {site_id} not found on any configured UniFi console."
+    },
+    "device_other_console": {
+      "message": "Device {device_id} belongs to a different console than site {site_id}."
+    },
+    "device_not_on_site_console": {
+      "message": "Device {device_id} not found on the console for site {site_id}."
+    },
+    "device_not_on_any_console": {
+      "message": "Device {device_id} not found on any configured UniFi console."
+    },
+    "device_site_ambiguous": {
+      "message": "Multiple consoles found for site {site_id} and device {device_id}; the target is ambiguous."
+    },
+    "device_ambiguous": {
+      "message": "Multiple consoles found for device {device_id}; the target is ambiguous."
+    },
+    "client_ambiguous": {
+      "message": "Multiple consoles contain client {client_id}; the target is ambiguous."
+    },
+    "site_ambiguous": {
+      "message": "Multiple consoles contain site {site_id}; the target is ambiguous."
+    },
+    "site_consoles_ambiguous": {
+      "message": "Multiple consoles found for site {site_id}; the target is ambiguous."
+    },
+    "network_console_ambiguous": {
+      "message": "Multiple UniFi Insights consoles are configured; the target is ambiguous."
+    },
+    "console_not_found": {
+      "message": "No configured console matches {console_id}. Configured consoles: {consoles}."
+    },
+    "console_ambiguous": {
+      "message": "{console_id} matches more than one configured console. Use the entry ID of the console."
+    },
+    "protect_console_required": {
+      "message": "Multiple UniFi Protect consoles are configured and this action has no target to route on. Set the console to one of: {consoles}."
+    },
+    "protect_resource_wrong_type": {
+      "message": "Target {target} is a {actual_type}, not a {resource_type}."
+    },
+    "protect_resource_unresolved": {
+      "message": "Could not resolve target {target} to a UniFi Protect {resource_type}."
+    },
+    "protect_resource_not_found": {
+      "message": "UniFi Protect {resource_type} {resource_id} not found on any configured UniFi Protect console."
+    },
+    "protect_resource_other_console": {
+      "message": "UniFi Protect {resource_type} {resource_id} belongs to a different console than the target console."
+    },
+    "protect_resource_not_on_console": {
+      "message": "UniFi Protect {resource_type} {resource_id} does not belong to the console {console}."
+    },
+    "protect_resource_ambiguous": {
+      "message": "Multiple UniFi Protect consoles contain {resource_type} {resource_id}; the target is ambiguous."
+    },
+    "protect_resource_owner_unknown": {
+      "message": "Cannot tell which UniFi Protect console owns {resource_type} {resource_id} yet. Try again once the consoles have refreshed."
+    },
+    "protect_secondary_other_console": {
+      "message": "The {secondary_type} {secondary_id} belongs to a different UniFi Protect console than {resource_type} {resource_id}."
+    },
+    "restart_site_required": {
+      "message": "Site ID is required to restart device {device_id}."
+    },
+    "power_cycle_site_required": {
+      "message": "Site ID is required to power-cycle a port on device {device_id}."
+    },
+    "refresh_site_not_found": {
+      "message": "No UniFi Insights console is configured for site {site_id}."
+    },
+    "carrier_target_ambiguous": {
+      "message": "Target {target} matches a device in more than one config entry. Target the subscriber's entity or device instead."
     }
   }
 }

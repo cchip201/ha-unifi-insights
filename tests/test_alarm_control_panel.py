@@ -3,10 +3,8 @@
 
 Most of these set the integration up through the real config entry and call the
 real ``alarm_control_panel`` services, so a service call travels through the
-entity, the real facade and the real vendored endpoint or its mock, and only the
-Protect API client is mocked. A MagicMock coordinator would make
-``async_call_coordinator_action`` quietly take its fallback path and hide a
-facade that never calls the API.
+entity, the real facade, the real Protect command owner and the real library
+endpoint or its mock, and only the Protect API client is mocked.
 """
 
 from __future__ import annotations
@@ -27,6 +25,15 @@ from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from unifi_official_api import (
+    UniFiGlobalAlarmManagerError,
+    UniFiNotFoundError,
+    UniFiResponseError,
+)
+from unifi_official_api.protect.endpoints.arm_profiles import (
+    ArmProfilesEndpoint,
+)
+from unifi_official_api.protect.models import NVR
 
 from custom_components.unifi_insights import alarm_control_panel as panel_platform
 from custom_components.unifi_insights.alarm_control_panel import (
@@ -37,17 +44,14 @@ from custom_components.unifi_insights.alarm_control_panel import (
     _epoch_ms_to_iso,
     async_setup_entry,
 )
-from custom_components.unifi_insights.api import (
-    UniFiGlobalAlarmManagerError,
-    UniFiNotFoundError,
-    UniFiResponseError,
-)
-from custom_components.unifi_insights.api.protect.endpoints.arm_profiles import (
-    ArmProfilesEndpoint,
-)
-from custom_components.unifi_insights.api.protect.models import NVR
 from custom_components.unifi_insights.const import DOMAIN
+from tests.fixtures.facade_data import (
+    facade_data,
+    set_availability,
+    with_protect_device,
+)
 from tests.fixtures.library_responses import SAMPLE_NVR, SAMPLE_NVR_WITH_ARM_MODE
+from tests.fixtures.protect_ws import FakeProtectWebSocket
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -91,6 +95,7 @@ def protect_client(
     enable_custom_integrations: None,
 ) -> MagicMock:
     """Patch every client the integration builds and return the Protect one."""
+    mock_protect_client.websocket = FakeProtectWebSocket()
     return mock_protect_client
 
 
@@ -163,15 +168,16 @@ def _ws_frame(arm_mode: dict[str, Any], **item: Any) -> dict[str, Any]:
 async def _push(
     hass: HomeAssistant, entry: MockConfigEntry, frame: dict[str, Any]
 ) -> None:
-    """Deliver a WebSocket frame to the entry's Protect coordinator."""
-    entry.runtime_data.protect_coordinator._on_websocket_message(frame)
+    """Deliver a WebSocket frame through the Protect devices subscription."""
+    feed = entry.runtime_data.protect_coordinator.protect_client.websocket
+    await feed.wait_subscribed("devices")
+    feed.raw("devices", frame)
     await hass.async_block_till_done()
 
 
 def _unit_coordinator(nvr: dict[str, Any], **extra: Any) -> MagicMock:
     """Build a facade-coordinator mock for entities constructed without HA."""
     coordinator = MagicMock()
-    coordinator.protect_available = True
     coordinator.network_client.base_url = "https://192.168.1.1"
     coordinator.protect_client.base_url = "https://192.168.1.1"
     coordinator.data = {
@@ -190,7 +196,7 @@ def test_parallel_updates_value() -> None:
 
 
 def test_nvr_model_keeps_arm_mode() -> None:
-    """The vendored NVR model types armMode and round-trips it by alias."""
+    """The `unifi-official-api` NVR model types armMode and round-trips it by alias."""
     nvr = NVR.model_validate(SAMPLE_NVR_WITH_ARM_MODE)
 
     assert nvr.arm_mode is not None
@@ -262,12 +268,12 @@ async def test_discovery_adds_each_panel_once(hass: HomeAssistant) -> None:
     """A panel is added when armMode first shows up and never twice."""
     entry = MagicMock()
     coordinator = entry.runtime_data.coordinator
-    coordinator.data = {
-        "protect": {
+    coordinator.data = facade_data(
+        protect={
             "nvrs": {"nvr_old": {"id": "nvr_old"}},
             "global_alarm_manager": False,
         }
-    }
+    )
     add_entities = MagicMock()
     built = MagicMock()
 
@@ -278,8 +284,8 @@ async def test_discovery_adds_each_panel_once(hass: HomeAssistant) -> None:
         add_entities.assert_not_called()
 
         # The NVR gains an armMode (a firmware upgrade) on a later update.
-        coordinator.data["protect"]["nvrs"]["nvr_old"] = copy.deepcopy(
-            SAMPLE_NVR_WITH_ARM_MODE
+        coordinator.data = with_protect_device(
+            coordinator.data, "nvrs", "nvr_old", SAMPLE_NVR_WITH_ARM_MODE
         )
         (listener,) = coordinator.async_add_listener.call_args.args
         listener()
@@ -598,7 +604,7 @@ async def test_real_endpoint_turns_the_400_into_the_translated_error(
     service: str,
     action: str,
 ) -> None:
-    """The live 400 body, through the real vendored endpoint and the facade."""
+    """The live 400 body, through the real library endpoint and the facade."""
     await _setup(hass, mock_config_entry, protect_client, nvr=_nvr())
     http = MagicMock()
     http.build_api_path = lambda path, site_id=None: f"/proxy/protect/v1{path}"
@@ -701,7 +707,7 @@ def test_unavailable_when_protect_update_failed() -> None:
     panel = UnifiProtectNvrAlarmControlPanel(coordinator, "nvr_1")
     assert panel.available is True
 
-    coordinator.protect_available = False
+    set_availability(coordinator, protect=False)
 
     assert panel.available is False
 
@@ -1168,9 +1174,9 @@ async def test_a_command_refused_by_the_manager_hides_the_panel(
 
 
 async def _call_service_directly(hass: HomeAssistant) -> None:
-    """Ask the facade to arm, as the panel would if it were still there."""
+    """Ask the Protect owner to arm, as the panel would if it were still there."""
     entry = hass.config_entries.async_entries(DOMAIN)[0]
-    await entry.runtime_data.coordinator.async_arm_alarm()
+    await entry.runtime_data.coordinator.require_protect_coordinator().async_arm_alarm()
 
 
 async def test_a_flag_that_survives_polls_and_nvr_frames(

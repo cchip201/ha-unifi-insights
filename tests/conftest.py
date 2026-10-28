@@ -10,17 +10,25 @@ import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from unifi_official_api.exceptions import UniFiUnsupportedError
+from unifi_official_api.innerspace import InnerSpaceProject
 
-from custom_components.unifi_insights.api.exceptions import UniFiUnsupportedError
-from custom_components.unifi_insights.api.innerspace import InnerSpaceProject
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
     CONNECTION_TYPE_LOCAL,
     DOMAIN,
 )
 
+from .fixtures.command_owners import (
+    SeededOwners,
+    async_refresh_owners,
+    async_shutdown_owners,
+    build_seeded_owners,
+)
+from .fixtures.facade_data import facade_data
+
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import AsyncGenerator, Generator
 
     from homeassistant.core import HomeAssistant
 
@@ -347,48 +355,18 @@ def mock_api_key_auth() -> Generator[MagicMock]:
 
 @pytest.fixture
 def mock_coordinator() -> MagicMock:
-    """Return a mocked UniFi Insights coordinator."""
+    """Return a mocked UniFi Insights coordinator with a frozen facade snapshot."""
     coordinator = MagicMock()
     coordinator.last_update_success = True
     coordinator.available = True
-    coordinator.device_available = True
-    coordinator.config_available = True
-    coordinator.protect_available = True
-    coordinator.innerspace_available = True
     coordinator.network_client = _create_mock_network_client()
     coordinator.protect_client = _create_mock_protect_client()
     coordinator.innerspace_client = None
-    coordinator.data = {
-        "sites": {"default": {"id": "default", "name": "Default"}},
-        "devices": {},
-        "clients": {},
-        "stats": {},
-        "network_info": {},
-        "vouchers": {},
-        "protect": {
-            "cameras": {},
-            "lights": {},
-            "sensors": {},
-            "nvrs": {},
-            "viewers": {},
-            "chimes": {},
-            "liveviews": {},
-            "protect_info": {},
-            "events": {},
-        },
-        "innerspace": {
-            "project": None,
-            "floor_plans": {},
-            "access_points": {},
-            "switches": {},
-            "placed_devices": {},
-            "inventory": {},
-            "devices": {},
-            "correlations": {},
-            "last_update": None,
-        },
-        "last_update": None,
-    }
+    coordinator.data = facade_data(
+        sites={"default": {"id": "default", "name": "Default"}},
+        site_ids=("default",),
+        last_update=None,
+    )
     coordinator.async_refresh = AsyncMock()
     coordinator.async_request_refresh = AsyncMock()
     return coordinator
@@ -503,3 +481,12 @@ def device_config_entry_ids(device: dr.DeviceEntry) -> set[str]:
         entry_id = device.config_entry_id
         return {entry_id} if entry_id else set()
     return set(device.config_entries)
+
+
+@pytest.fixture
+async def seeded_owners(hass: HomeAssistant) -> AsyncGenerator[SeededOwners]:
+    """Real command owners over seeded autospecced clients, refreshed once."""
+    owners = build_seeded_owners(hass)
+    await async_refresh_owners(owners)
+    yield owners
+    await async_shutdown_owners(owners)

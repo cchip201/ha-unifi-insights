@@ -22,6 +22,7 @@ from .const import (
     ATTR_WILL_BE_ARMED_AT,
     DEVICE_TYPE_NVR,
 )
+from .data_transforms import owner_available, protect_collection
 from .entity import UnifiProtectEntity
 
 if TYPE_CHECKING:
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
-    from .coordinators import UnifiFacadeCoordinator
+    from .coordinators import UnifiInsightsFacadeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ ARM_MODE_TO_STATE: Final[dict[str, AlarmControlPanelState]] = {
 }
 
 
-def _global_alarm_manager_is_off(coordinator: UnifiFacadeCoordinator) -> bool:
+def _global_alarm_manager_is_off(coordinator: UnifiInsightsFacadeCoordinator) -> bool:
     """
     Return whether Protect has said the global alarm manager is not enabled.
 
@@ -81,7 +82,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up the alarm control panel for the UniFi Protect NVR."""
     _ = hass
-    coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = entry.runtime_data.coordinator
 
     # Skip if Protect API is not available
     if not coordinator.protect_client:
@@ -94,7 +95,8 @@ async def async_setup_entry(
     def async_discover_panels() -> None:
         """Add a panel for each NVR that reports an armMode."""
         new_entities: list[UnifiProtectNvrAlarmControlPanel] = []
-        for nvr_id, nvr_data in coordinator.data["protect"]["nvrs"].items():
+        nvrs = protect_collection(coordinator.data, "nvrs") or {}
+        for nvr_id, nvr_data in nvrs.items():
             # Firmware that predates the Alarm Manager has no armMode, and an
             # NVR that gains one on an upgrade is picked up on a later update.
             # While the UniFi global alarm manager is enabled (or not yet
@@ -132,7 +134,7 @@ class UnifiProtectNvrAlarmControlPanel(UnifiProtectEntity, AlarmControlPanelEnti
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         nvr_id: str,
     ) -> None:
         """Initialize the alarm control panel."""
@@ -151,7 +153,7 @@ class UnifiProtectNvrAlarmControlPanel(UnifiProtectEntity, AlarmControlPanelEnti
         base class check, which wants "CONNECTED", would never pass.
         """
         return (
-            self.coordinator.protect_available
+            owner_available(self.coordinator.data, "protect")
             and _arm_mode(self.device_data) is not None
             and _global_alarm_manager_is_off(self.coordinator)
         )
@@ -207,12 +209,12 @@ class UnifiProtectNvrAlarmControlPanel(UnifiProtectEntity, AlarmControlPanelEnti
         Arm the alarm using the console's currently selected arm profile.
 
         No state is set here: the NVR's WebSocket frame, or the refresh the
-        facade requests, reports whether Protect actually armed.
+        Protect coordinator requests, reports whether Protect actually armed.
         """
         _ = code
-        await self.coordinator.async_arm_alarm()
+        await self.coordinator.require_protect_coordinator().async_arm_alarm()
 
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         """Disarm the alarm."""
         _ = code
-        await self.coordinator.async_disarm_alarm()
+        await self.coordinator.require_protect_coordinator().async_disarm_alarm()

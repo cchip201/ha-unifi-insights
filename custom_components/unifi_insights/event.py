@@ -10,20 +10,12 @@ from homeassistant.components.event import (
     EventDeviceClass,
     EventEntity,
 )
+from homeassistant.const import EntityCategory
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .access_entity import (
-    UnifiAccessDoorEntity,
-    UnifiAccessEntity,
-    access_coordinator_for,
-    access_unique_id,
-    async_discover_access_entities,
-    door_device_info,
-    doorbell_device_info,
-)
-from .console_identity import resolve_console_namespace
+from .console_identity import async_migrate_site_entity, resolve_console_namespace
 from .const import (
     DOMAIN,
     MANUFACTURER,
@@ -33,15 +25,29 @@ from .const import (
     SMART_DETECT_VEHICLE,
 )
 from .coordinators.access import access_doorbell_signal, access_result_signal
-from .entity import get_field
-from .network_rule_audit_event import discover_network_rule_change_events
+from .coordinators.rule_audit import RULE_CHANGE_TYPES
+from .data_transforms import owner_available, protect_collection, protect_device
+from .entity import (
+    UnifiAccessDoorEntity,
+    UnifiAccessEntity,
+    UnifiSiteEntity,
+    access_coordinator_for,
+    access_unique_id,
+    async_discover_access_entities,
+    door_device_info,
+    doorbell_device_info,
+    get_field,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
-    from .coordinators import UnifiFacadeCoordinator
+    from .coordinators import UnifiInsightsFacadeCoordinator
     from .coordinators.access import UnifiInsightsAccessCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -284,68 +290,51 @@ async def async_setup_entry(
             async_add_entities(rule_events)
         if not coordinator.protect_client:
             return
-        if (
-            not coordinator.data
-            or not isinstance(coordinator.data, dict)
-            or "protect" not in coordinator.data
-            or not isinstance(coordinator.data["protect"], dict)
-        ):
-            return
-
-        protect = coordinator.data["protect"]
         entities: list[
             UnifiProtectDoorbellEventEntity
             | UnifiProtectSmartDetectEventEntity
             | UnifiProtectSensorEventEntity
         ] = []
 
-        # Get cameras data
-        cameras = protect.get("cameras", {})
-        if isinstance(cameras, dict):
-            for camera_id, camera_data in cameras.items():
-                if not isinstance(camera_data, dict):
-                    continue
-
-                # Add doorbell event entities for cameras with doorbell feature
-                if _is_doorbell_camera(camera_data):
-                    doorbell_key = (camera_id, "doorbell")
-                    if doorbell_key not in known_event_keys:
-                        known_event_keys.add(doorbell_key)
-                        entities.append(
-                            UnifiProtectDoorbellEventEntity(
-                                coordinator=coordinator,
-                                device_id=camera_id,
-                            )
-                        )
-
-                # Add smart detection event entity for all cameras
-                smart_detect_types = camera_data.get("smartDetectTypes", [])
-                if smart_detect_types:
-                    smart_key = (camera_id, "smart_detect")
-                    if smart_key not in known_event_keys:
-                        known_event_keys.add(smart_key)
-                        entities.append(
-                            UnifiProtectSmartDetectEventEntity(
-                                coordinator=coordinator,
-                                device_id=camera_id,
-                            )
-                        )
-
-        # Add sensor open/close event entities
-        sensors = protect.get("sensors", {})
-        if isinstance(sensors, dict):
-            for sensor_id, sensor_data in sensors.items():
-                if not isinstance(sensor_data, dict):
-                    continue
-                sensor_key = (sensor_id, "sensor")
-                if sensor_key not in known_event_keys:
-                    known_event_keys.add(sensor_key)
+        cameras = protect_collection(coordinator.data, "cameras") or {}
+        for camera_id, camera_data in cameras.items():
+            # Add doorbell event entities for cameras with doorbell feature
+            if _is_doorbell_camera(camera_data):
+                doorbell_key = (camera_id, "doorbell")
+                if doorbell_key not in known_event_keys:
+                    known_event_keys.add(doorbell_key)
                     entities.append(
-                        UnifiProtectSensorEventEntity(
+                        UnifiProtectDoorbellEventEntity(
                             coordinator=coordinator,
-                            device_id=sensor_id,
+                            device_id=camera_id,
                         )
                     )
+
+            # Add smart detection event entity for all cameras
+            smart_detect_types = camera_data.get("smartDetectTypes", [])
+            if smart_detect_types:
+                smart_key = (camera_id, "smart_detect")
+                if smart_key not in known_event_keys:
+                    known_event_keys.add(smart_key)
+                    entities.append(
+                        UnifiProtectSmartDetectEventEntity(
+                            coordinator=coordinator,
+                            device_id=camera_id,
+                        )
+                    )
+
+        # Add sensor open/close event entities
+        sensors = protect_collection(coordinator.data, "sensors") or {}
+        for sensor_id in sensors:
+            sensor_key = (sensor_id, "sensor")
+            if sensor_key not in known_event_keys:
+                known_event_keys.add(sensor_key)
+                entities.append(
+                    UnifiProtectSensorEventEntity(
+                        coordinator=coordinator,
+                        device_id=sensor_id,
+                    )
+                )
 
         if entities or first_setup:
             _LOGGER.info("Adding %d UniFi Protect event entities", len(entities))
@@ -374,7 +363,7 @@ def _is_doorbell_camera(camera_data: dict[str, Any]) -> bool:
 
 
 class UnifiProtectDoorbellEventEntity(
-    CoordinatorEntity["UnifiFacadeCoordinator"],
+    CoordinatorEntity["UnifiInsightsFacadeCoordinator"],
     EventEntity,
 ):
     """Event entity for UniFi Protect doorbell ring events."""
@@ -386,7 +375,7 @@ class UnifiProtectDoorbellEventEntity(
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         device_id: str,
     ) -> None:
         """Initialize the event entity."""
@@ -394,7 +383,7 @@ class UnifiProtectDoorbellEventEntity(
         self._device_id = device_id
         self._last_ring_start: int | None = None
 
-        camera_data = coordinator.data["protect"]["cameras"].get(device_id, {})
+        camera_data = protect_device(coordinator.data, "cameras", device_id) or {}
         camera_name = camera_data.get("name", f"Camera {device_id}")
 
         self._attr_unique_id = f"{DOMAIN}_camera_{device_id}_doorbell_event"
@@ -410,9 +399,9 @@ class UnifiProtectDoorbellEventEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        if not self.coordinator.protect_available:
+        if not owner_available(self.coordinator.data, "protect"):
             return False
-        camera_data = self.coordinator.data["protect"]["cameras"].get(self._device_id)
+        camera_data = protect_device(self.coordinator.data, "cameras", self._device_id)
         if not camera_data:
             return False
         return bool(camera_data.get("state") == "CONNECTED")
@@ -420,12 +409,12 @@ class UnifiProtectDoorbellEventEntity(
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        if not self.coordinator.protect_available:
+        if not owner_available(self.coordinator.data, "protect"):
             if self.hass is not None:
                 self.async_write_ha_state()
             return
-        camera_data = self.coordinator.data["protect"]["cameras"].get(
-            self._device_id, {}
+        camera_data = (
+            protect_device(self.coordinator.data, "cameras", self._device_id) or {}
         )
 
         # Check for new ring event
@@ -448,7 +437,7 @@ class UnifiProtectDoorbellEventEntity(
 
 
 class UnifiProtectSmartDetectEventEntity(
-    CoordinatorEntity["UnifiFacadeCoordinator"],
+    CoordinatorEntity["UnifiInsightsFacadeCoordinator"],
     EventEntity,
 ):
     """Event entity for UniFi Protect smart detection events."""
@@ -466,7 +455,7 @@ class UnifiProtectSmartDetectEventEntity(
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         device_id: str,
     ) -> None:
         """Initialize the event entity."""
@@ -475,7 +464,7 @@ class UnifiProtectSmartDetectEventEntity(
         self._last_motion_start: int | None = None
         self._last_smart_detect_types: list[str] = []
 
-        camera_data = coordinator.data["protect"]["cameras"].get(device_id, {})
+        camera_data = protect_device(coordinator.data, "cameras", device_id) or {}
         camera_name = camera_data.get("name", f"Camera {device_id}")
 
         self._attr_unique_id = f"{DOMAIN}_camera_{device_id}_smart_detect_event"
@@ -491,9 +480,9 @@ class UnifiProtectSmartDetectEventEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        if not self.coordinator.protect_available:
+        if not owner_available(self.coordinator.data, "protect"):
             return False
-        camera_data = self.coordinator.data["protect"]["cameras"].get(self._device_id)
+        camera_data = protect_device(self.coordinator.data, "cameras", self._device_id)
         if not camera_data:
             return False
         return bool(camera_data.get("state") == "CONNECTED")
@@ -501,12 +490,12 @@ class UnifiProtectSmartDetectEventEntity(
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        if not self.coordinator.protect_available:
+        if not owner_available(self.coordinator.data, "protect"):
             if self.hass is not None:
                 self.async_write_ha_state()
             return
-        camera_data = self.coordinator.data["protect"]["cameras"].get(
-            self._device_id, {}
+        camera_data = (
+            protect_device(self.coordinator.data, "cameras", self._device_id) or {}
         )
 
         # Check for new motion/smart detect event
@@ -542,7 +531,7 @@ class UnifiProtectSmartDetectEventEntity(
 
 
 class UnifiProtectSensorEventEntity(
-    CoordinatorEntity["UnifiFacadeCoordinator"],
+    CoordinatorEntity["UnifiInsightsFacadeCoordinator"],
     EventEntity,
 ):
     """Event entity for UniFi Protect sensor open/close events."""
@@ -556,7 +545,7 @@ class UnifiProtectSensorEventEntity(
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         device_id: str,
     ) -> None:
         """Initialize the event entity."""
@@ -565,7 +554,7 @@ class UnifiProtectSensorEventEntity(
         self._last_open_status_changed_at: int | None = None
         self._last_is_opened: bool | None = None
 
-        sensor_data = coordinator.data["protect"]["sensors"].get(device_id, {})
+        sensor_data = protect_device(coordinator.data, "sensors", device_id) or {}
         sensor_name = sensor_data.get("name", f"Sensor {device_id}")
 
         self._attr_unique_id = f"{DOMAIN}_sensor_{device_id}_event"
@@ -581,9 +570,9 @@ class UnifiProtectSensorEventEntity(
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        if not self.coordinator.protect_available:
+        if not owner_available(self.coordinator.data, "protect"):
             return False
-        sensor_data = self.coordinator.data["protect"]["sensors"].get(self._device_id)
+        sensor_data = protect_device(self.coordinator.data, "sensors", self._device_id)
         if not sensor_data:
             return False
         return bool(sensor_data.get("state") == "CONNECTED")
@@ -591,12 +580,12 @@ class UnifiProtectSensorEventEntity(
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        if not self.coordinator.protect_available:
+        if not owner_available(self.coordinator.data, "protect"):
             if self.hass is not None:
                 self.async_write_ha_state()
             return
-        sensor_data = self.coordinator.data["protect"]["sensors"].get(
-            self._device_id, {}
+        sensor_data = (
+            protect_device(self.coordinator.data, "sensors", self._device_id) or {}
         )
 
         # Check for open/close status change
@@ -626,3 +615,146 @@ class UnifiProtectSensorEventEntity(
             )
 
         self.async_write_ha_state()
+
+
+# --- Network rule changes ----------------------------------------------------
+
+# Event entity that reports UniFi network rule changes.
+
+# Translation key and unique-id suffix. It is listed in SITE_ENTITY_SUFFIXES so a
+# console identity change re-keys this entity with the other site entities.
+RULE_CHANGE_EVENT_KEY = "network_rule_changes"
+
+# The only keys of a change record that reach the event. Field values, addresses
+# and domains are never part of a change record in the first place.
+EVENT_ATTRIBUTE_KEYS: tuple[str, ...] = (
+    "site_id",
+    "rule_type",
+    "rule_id",
+    "rule_name",
+    "enabled",
+    "changed_fields",
+)
+
+
+def _event_data(change: Mapping[str, Any]) -> dict[str, Any]:
+    """Coerce event data from a change record to documented types."""
+    data: dict[str, Any] = {}
+    for key in EVENT_ATTRIBUTE_KEYS:
+        val = change.get(key)
+        if key == "changed_fields":
+            data[key] = (
+                [field for field in val if isinstance(field, str)]
+                if isinstance(val, list)
+                else []
+            )
+        elif key == "enabled":
+            data[key] = val if isinstance(val, bool) else None
+        elif key == "rule_name":
+            data[key] = val if isinstance(val, str) else None
+        else:
+            data[key] = val
+    return data
+
+
+class UnifiInsightsNetworkRuleChangeEvent(
+    UnifiSiteEntity,
+    EventEntity,
+):
+    """Event entity that fires once for each added, modified or deleted rule."""
+
+    _attr_translation_key = RULE_CHANGE_EVENT_KEY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_event_types: ClassVar[list[str]] = list(RULE_CHANGE_TYPES)  # type: ignore[misc]
+
+    def __init__(
+        self,
+        coordinator: UnifiInsightsFacadeCoordinator,
+        site_id: str,
+        *,
+        unique_id: str,
+    ) -> None:
+        """Initialize the rule change event entity."""
+        super().__init__(coordinator, site_id, unique_id=unique_id)
+        self._last_available = self.available
+        # Changes detected before this entity existed are history, not news.
+        self._last_sequence = max(
+            (change["sequence"] for change in self._site_changes()), default=0
+        )
+
+    def _site_changes(self) -> list[dict[str, Any]]:
+        """Return this site's well-formed change records, oldest first."""
+        data: Any = self.coordinator.data
+        by_site = data.get("rule_changes") if isinstance(data, dict) else None
+        changes = by_site.get(self._site_id) if isinstance(by_site, dict) else None
+        if not isinstance(changes, list):
+            return []
+        valid = [
+            change
+            for change in changes
+            if isinstance(change, dict)
+            and isinstance(change.get("sequence"), int)
+            and change.get("change_type") in RULE_CHANGE_TYPES
+        ]
+        return sorted(valid, key=lambda change: change["sequence"])
+
+    @property
+    def available(self) -> bool:
+        """Return True while the config coordinator is refreshing successfully."""
+        return owner_available(self.coordinator.data, "config")
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Fire one event for every change not reported yet."""
+        wrote_event = False
+        for change in self._site_changes():
+            if change["sequence"] <= self._last_sequence:
+                continue
+            self._last_sequence = change["sequence"]
+            self._trigger_event(
+                change["change_type"],
+                _event_data(change),
+            )
+            self.async_write_ha_state()
+            wrote_event = True
+        available = self.available
+        if not wrote_event and available != self._last_available:
+            self.async_write_ha_state()
+        self._last_available = available
+
+
+def discover_network_rule_change_events(
+    coordinator: UnifiInsightsFacadeCoordinator,
+    known_site_ids: set[str],
+    *,
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    namespace: str | None,
+) -> list[UnifiInsightsNetworkRuleChangeEvent]:
+    """
+    Return one rule change event entity for each site not seen before.
+
+    The unique id is scoped by the console namespace, like every other logical
+    site entity, because two consoles can report the same site id. A site whose
+    identity cannot be claimed safely is skipped and retried on the next tick.
+    """
+    data: Any = coordinator.data
+    sites = data.get("sites") if isinstance(data, dict) else None
+    if not isinstance(sites, dict):
+        return []
+    entities: list[UnifiInsightsNetworkRuleChangeEvent] = []
+    for site_id in sites:
+        if not isinstance(site_id, str) or site_id in known_site_ids:
+            continue
+        unique_id = async_migrate_site_entity(
+            hass, entry, "event", namespace, site_id, suffix=RULE_CHANGE_EVENT_KEY
+        )
+        if unique_id is None:
+            continue
+        known_site_ids.add(site_id)
+        entities.append(
+            UnifiInsightsNetworkRuleChangeEvent(
+                coordinator, site_id, unique_id=unique_id
+            )
+        )
+    return entities

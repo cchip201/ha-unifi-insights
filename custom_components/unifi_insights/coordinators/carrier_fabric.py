@@ -10,8 +10,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-
-from custom_components.unifi_insights.api import (
+from unifi_official_api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiError,
@@ -19,6 +18,7 @@ from custom_components.unifi_insights.api import (
     UniFiResponseError,
     UniFiTimeoutError,
 )
+
 from custom_components.unifi_insights.const import (
     CARRIER_FABRIC_SCAN_INTERVAL,
     CONF_CARRIER_ORG_ID,
@@ -28,8 +28,7 @@ from custom_components.unifi_insights.const import (
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
-
-    from custom_components.unifi_insights.api.carrier_fabric.client import (
+    from unifi_official_api.carrier_fabric.client import (
         UniFiCarrierFabricClient,
     )
 
@@ -77,7 +76,7 @@ class InvalidSubscriberIdError(HomeAssistantError, ValueError):
     """Raised when a subscriber ID is not a valid UUID string."""
 
 
-class UnifiCarrierFabricCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+class UnifiInsightsCarrierFabricCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator for UniFi Carrier Fabric API."""
 
     config_entry: ConfigEntry
@@ -228,14 +227,25 @@ class UnifiCarrierFabricCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @staticmethod
     def _validate_subscriber_uuid(subscriber_id: Any) -> None:
         """Validate that subscriber_id is a valid UUID."""
+        placeholders = {"target": str(subscriber_id)}
         if not isinstance(subscriber_id, str):
             msg = f"Invalid subscriber ID (UUID string required): {subscriber_id}"
-            raise InvalidSubscriberIdError(msg)
+            raise InvalidSubscriberIdError(
+                msg,
+                translation_domain=DOMAIN,
+                translation_key="carrier_invalid_subscriber_id",
+                translation_placeholders=placeholders,
+            )
         try:
             uuid.UUID(subscriber_id)
         except (ValueError, TypeError, AttributeError) as err:
             msg = f"Invalid subscriber ID format (valid UUID required): {subscriber_id}"
-            raise InvalidSubscriberIdError(msg) from err
+            raise InvalidSubscriberIdError(
+                msg,
+                translation_domain=DOMAIN,
+                translation_key="carrier_invalid_subscriber_id",
+                translation_placeholders=placeholders,
+            ) from err
 
     async def async_suspend_subscriber(
         self, subscriber_id: str, reason: str | None = None

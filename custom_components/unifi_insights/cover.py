@@ -11,14 +11,13 @@ from homeassistant.components.cover import (
     CoverEntityFeature,
 )
 
-from .access_entity import (
+from .entity import (
     UnifiAccessDoorEntity,
     access_coordinator_for,
     access_unique_id,
     async_discover_access_entities,
     door_device_info,
 )
-from .entity import async_call_coordinator_action
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -83,30 +82,27 @@ class UnifiAccessGateCover(UnifiAccessDoorEntity, CoverEntity):
 
     async def async_open_cover(self, **kwargs: object) -> None:  # noqa: ARG002
         """Send the open command to the gate motor."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_gate_command",
+        await self._async_command(
             "Could not open the Access gate",
+            self.coordinator.async_gate_command,
             self._door_id,
             "open",
         )
 
     async def async_close_cover(self, **kwargs: object) -> None:  # noqa: ARG002
         """Send the close command to the gate motor."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_gate_command",
+        await self._async_command(
             "Could not close the Access gate",
+            self.coordinator.async_gate_command,
             self._door_id,
             "close",
         )
 
     async def async_stop_cover(self, **kwargs: object) -> None:  # noqa: ARG002
         """Halt the gate mid-transition."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_gate_command",
+        await self._async_command(
             "Could not stop the Access gate",
+            self.coordinator.async_gate_command,
             self._door_id,
             "stop",
         )

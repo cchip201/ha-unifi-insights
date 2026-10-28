@@ -25,6 +25,8 @@ import { fireEvent } from "../ha-types";
 import { GROUP_ICON, iconFor } from "../icons";
 import type { LocalizeFunc } from "../localize";
 import {
+  ROOT_CLIENT_GROUP,
+  UNCONNECTED_GROUP,
   groupContaining,
   type GraphModel,
   type Visual,
@@ -42,11 +44,11 @@ import {
 import { nextGraphFocus } from "../model/navigation";
 import { themeTokens } from "../styles";
 import {
-  STATE_KEYS,
   describeVisual,
   linkLabel,
   truncate,
   visualState,
+  visualStateKey,
   visualTitle,
 } from "./describe";
 
@@ -332,6 +334,7 @@ export class UitGraphView extends LitElement {
     }, EXIT_MS);
   }
 
+  /** The selected node and everything above it, through a WAN's gateway too. */
   private highlightedPath(): Set<string> {
     const path = new Set<string>();
     const model = this.model;
@@ -341,7 +344,7 @@ export class UitGraphView extends LitElement {
       : groupContaining(model, this.selectedId)?.id;
     while (current !== undefined) {
       path.add(current);
-      current = model.parentOf.get(current);
+      current = model.parentOf.get(current) ?? model.uplinkOwner.get(current);
     }
     return path;
   }
@@ -398,20 +401,24 @@ export class UitGraphView extends LitElement {
     if (this.gesture.allowsMenu) fireEvent(this, "uit-context", { id });
   }
 
+  /** The pannable SVG: tree links, WAN uplinks, nodes and fading exits. */
   protected override render(): TemplateResult | typeof nothing {
     const { model, layout, localize } = this;
     if (!model || !layout || !localize) return nothing;
     const r = RADIUS[this.density];
     let ids = [...layout.positions.keys()];
     let links = [...model.links.values()];
+    let uplinks = model.uplinkLinks;
     if (this.needsCulling && this.width > 0) {
       const shown = visibleIds(layout, this.transform, this.width, this.height);
       if (this.focusId !== undefined) shown.add(this.focusId);
       if (this.selectedId !== undefined) shown.add(this.selectedId);
       ids = ids.filter((id) => shown.has(id));
-      links = links.filter(
-        (l) => shown.has(l.childId) || shown.has(l.parentId),
-      );
+      /** Keep a link when either end is drawn. */
+      const near = (l: VisualLink): boolean =>
+        shown.has(l.childId) || shown.has(l.parentId);
+      links = links.filter(near);
+      uplinks = uplinks.filter(near);
     }
     const path = this.highlightedPath();
     return html`
@@ -436,6 +443,11 @@ export class UitGraphView extends LitElement {
               links,
               (l) => l.childId,
               (l) => this.renderLink(l, layout, path),
+            )}
+            ${repeat(
+              uplinks,
+              (l) => l.parentId,
+              (l) => this.renderLink(l, layout, path, true),
             )}
           </g>
           <g class="nodes">
@@ -468,10 +480,12 @@ export class UitGraphView extends LitElement {
     `;
   }
 
+  /** A tree link is on the path through its child; a WAN uplink through its WAN. */
   private renderLink(
     link: VisualLink,
     layout: Layout,
     path: Set<string>,
+    uplink = false,
   ): SVGTemplateResult | typeof nothing {
     const a = layout.positions.get(link.parentId);
     const b = layout.positions.get(link.childId);
@@ -487,7 +501,10 @@ export class UitGraphView extends LitElement {
       "link",
       link.edge?.medium ?? "unknown",
       link.viaHidden.length > 0 ? "via-hidden" : "",
-      path.has(link.childId) ? "on-path" : "",
+      path.has(uplink ? link.parentId : link.childId) ? "on-path" : "",
+      uplink && this.model?.nodes.get(link.parentId)?.state === "offline"
+        ? "down"
+        : "",
     ];
     return svg`<path class=${classes.join(" ")} d=${d}></path>${
       label
@@ -496,6 +513,7 @@ export class UitGraphView extends LitElement {
     }`;
   }
 
+  /** One node: disc, glyph, status dot, label and state text. */
   private renderNode(
     model: GraphModel,
     visual: Visual,
@@ -546,11 +564,11 @@ export class UitGraphView extends LitElement {
         <path d=${glyph}></path>
       </svg>
       <circle class="status" cx=${r * 0.72} cy=${-r * 0.72} r=${Math.max(4, r * 0.24)}></circle>
-      ${visual.type === "group" ? svg`<text class="badge" x=${r * 0.95} y=${r + 2}>${visual.counts.total}</text>` : nothing}
+      ${visual.type === "group" && (!this.showLabels || visual.id === ROOT_CLIENT_GROUP || visual.id === UNCONNECTED_GROUP) ? svg`<text class="badge" x=${r * 0.95} y=${r + 2}>${visual.counts.total}</text>` : nothing}
       ${this.showLabels ? svg`<text class="label" y=${labelY}>${truncate(title, LABEL_CHARS)}</text>` : nothing}
       ${
         state === "offline"
-          ? svg`<text class="state-text" y=${this.showLabels ? labelY + 14 : labelY}>${localize(STATE_KEYS.offline)}</text>`
+          ? svg`<text class="state-text" y=${this.showLabels ? labelY + 14 : labelY}>${localize(visualStateKey(visual))}</text>`
           : nothing
       }
     </g>`;
@@ -690,6 +708,10 @@ export class UitGraphView extends LitElement {
       }
       .link.via-hidden {
         stroke-dasharray: 8 4;
+      }
+      .link.down {
+        stroke: var(--uit-offline);
+        stroke-dasharray: 4 4;
       }
       .link.on-path {
         stroke: var(--uit-focus);

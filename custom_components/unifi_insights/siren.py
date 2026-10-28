@@ -16,13 +16,14 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util import dt as dt_util
-
-from .api.protect.endpoints.sirens import (
+from unifi_official_api.protect.endpoints.sirens import (
     SIREN_PLAY_DURATIONS,
     SIREN_VOLUME_MAX,
     SIREN_VOLUME_MIN,
 )
+
 from .const import DEVICE_TYPE_SIREN, DOMAIN
+from .data_transforms import protect_collection
 from .entity import UnifiProtectEntity
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
-    from .coordinators import UnifiFacadeCoordinator
+    from .coordinators import UnifiInsightsFacadeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up sirens for UniFi Protect integration."""
     _ = hass
-    coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = entry.runtime_data.coordinator
 
     # Skip if Protect API is not available
     if not coordinator.protect_client:
@@ -59,11 +60,11 @@ async def async_setup_entry(
     @callback
     def async_discover_sirens() -> None:
         """Discover and add new sirens."""
-        sirens = coordinator.data["protect"]["sirens"]
+        sirens = protect_collection(coordinator.data, "sirens") or {}
 
         new_entities: list[UnifiProtectSiren] = []
-        for siren_id, siren_data in sirens.items():
-            if siren_id in known_siren_ids or not isinstance(siren_data, dict):
+        for siren_id in sirens:
+            if siren_id in known_siren_ids:
                 continue
             try:
                 siren = UnifiProtectSiren(coordinator, siren_id)
@@ -144,7 +145,7 @@ class UnifiProtectSiren(UnifiProtectEntity, SirenEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         siren_id: str,
     ) -> None:
         """Initialize the siren."""
@@ -246,13 +247,15 @@ class UnifiProtectSiren(UnifiProtectEntity, SirenEntity):
                 },
             )
 
+        protect = self.coordinator.require_protect_coordinator()
         if volume_level is not None:
-            await self.coordinator.async_set_siren_volume(
+            await protect.async_set_siren_volume(
                 self._device_id, siren_volume_from_level(volume_level)
             )
-        await self.coordinator.async_play_siren(self._device_id, duration=duration)
+        await protect.async_play_siren(self._device_id, duration=duration)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Stop the siren."""
         _ = kwargs
-        await self.coordinator.async_stop_siren(self._device_id)
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_stop_siren(self._device_id)

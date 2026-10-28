@@ -19,18 +19,12 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
-    NumberSelector,
-    NumberSelectorConfig,
-    NumberSelectorMode,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
 )
-from pydantic import ValidationError
-from yarl import URL
-
-from .api import (
+from unifi_official_api import (
     ApiKeyAuth,
     ConnectionType,
     LocalAuth,
@@ -41,12 +35,17 @@ from .api import (
     UniFiTimeoutError,
     UniFiValidationError,
 )
-from .api.access import UniFiAccessClient
-from .api.carrier_fabric.client import UniFiCarrierFabricClient
-from .api.network import UniFiNetworkClient
-from .api.protect import UniFiProtectClient
+from unifi_official_api.access import UniFiAccessClient
+from unifi_official_api.carrier_fabric.client import UniFiCarrierFabricClient
+from unifi_official_api.network import UniFiNetworkClient
+from unifi_official_api.protect import UniFiProtectClient
+from yarl import URL
+
 from .console_identity import (
     DEFAULT_SITE_ID,
+    SiteEntityIdentityError,
+    async_rekey_site_entities,
+    async_restore_site_entity_identities,
     device_fields,
     normalize_console_namespace,
     normalize_mac,
@@ -68,7 +67,6 @@ from .const import (
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
-    CONF_POLL_INTERVAL,
     CONF_SITE_IDS,
     CONF_TRACK_CLIENTS,
     CONF_TRACK_SUBSCRIBERS,
@@ -85,14 +83,6 @@ from .const import (
     DEFAULT_TRACK_CLIENTS,
     DEFAULT_TRACK_SUBSCRIBERS,
     DOMAIN,
-    MAX_POLL_INTERVAL,
-    MIN_POLL_INTERVAL,
-    poll_interval_seconds,
-)
-from .helpers import (
-    SiteEntityIdentityError,
-    async_rekey_site_entities,
-    async_restore_site_entity_identities,
 )
 from .probe import (
     ProbeResult,
@@ -102,13 +92,14 @@ from .probe import (
     async_probe_network,
     async_probe_protect,
     async_probe_with_client,
+    is_malformed_response,
     is_transient_error,
 )
-from .topology_contract import normalize_mac as normalize_hardware_mac
+from .topology import normalize_mac as normalize_hardware_mac
 
 # Schemas are typed against probatio, the library HA 2026.10 annotates its schema
 # arguments with. Runtime still imports voluptuous: HA 2026.10 aliases it to probatio,
-# and the 2026.6 minimum ships real voluptuous, so only the type checker sees probatio.
+# and the 2026.9 minimum ships real voluptuous, so only the type checker sees probatio.
 if TYPE_CHECKING:
     import probatio as vol
 else:
@@ -246,11 +237,11 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
 
         A temporary failure wins, so a correct key is never reported as
         invalid while the console is restarting or answering 5xx. Then a
-        rejected key, a response that failed to parse, other unexpected
-        errors, and a 404 or "NVR not found" (api_unsupported). Anything
-        else - no sites, or a web-UI page in place of the API - keeps the
-        historical "invalid_auth": the console commonly answers that way for
-        a key it does not accept.
+        rejected key, a record that failed to parse, other unexpected
+        errors, and a 404 or a Protect answer without an NVR record
+        (api_unsupported). Anything else - no sites, or a web-UI page in
+        place of the API - keeps the historical "invalid_auth": the console
+        commonly answers that way for a key it does not accept.
         """
         statuses = {probe.status for probe in probes}
         if ProbeStatus.UNREACHABLE in statuses:
@@ -258,17 +249,14 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
         if ProbeStatus.AUTH_FAILED in statuses:
             return "invalid_auth"
         errors = [probe.error for probe in probes if probe.status is ProbeStatus.ERROR]
-        if any(isinstance(error, ValidationError) for error in errors):
+        if any(is_malformed_response(error) for error in errors):
             return "site_parse_error"
         if errors:
             return "unknown"
         # 404 from the integration API, or Protect answering without an NVR
-        # record ("NVR not found"), as before this probe refactor.
-        if any(
-            isinstance(probe.error, UniFiNotFoundError)
-            or type(probe.error) is ValueError
-            for probe in probes
-        ):
+        # record (UniFiNotFoundError with status 200), as before this probe
+        # refactor.
+        if any(isinstance(probe.error, UniFiNotFoundError) for probe in probes):
             return "api_unsupported"
         return "invalid_auth"
 
@@ -803,12 +791,15 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                     "Integration API."
                 )
                 errors["base"] = "api_unsupported"
-            except ValidationError:
-                _LOGGER.exception("Failed to parse site data from remote UniFi console")
-                errors["base"] = "site_parse_error"
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception during console selection")
-                errors["base"] = "unknown"
+            except Exception as err:  # pylint: disable=broad-except
+                if is_malformed_response(err):
+                    _LOGGER.exception(
+                        "Failed to parse site data from remote UniFi console"
+                    )
+                    errors["base"] = "site_parse_error"
+                else:
+                    _LOGGER.exception("Unexpected exception during console selection")
+                    errors["base"] = "unknown"
 
         options: list[SelectOptionDict] = [
             SelectOptionDict(value=console_id, label=label)
@@ -1019,12 +1010,12 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                 if is_transient_error(err):
                     _LOGGER.warning("UniFi API temporarily unavailable: %s", err)
                     errors["base"] = "cannot_connect"
+                elif is_malformed_response(err):
+                    _LOGGER.exception("Failed to parse site data during reauth")
+                    errors["base"] = "site_parse_error"
                 else:
                     _LOGGER.exception("Unexpected UniFi API response")
                     errors["base"] = "unknown"
-            except ValidationError:
-                _LOGGER.exception("Failed to parse site data during reauth")
-                errors["base"] = "site_parse_error"
             except Exception:
                 errors["base"] = "unknown"
 
@@ -1312,12 +1303,14 @@ class UnifiInsightsConfigFlow(ConfigFlow, domain=DOMAIN):
                 if is_transient_error(err):
                     _LOGGER.warning("UniFi API temporarily unavailable: %s", err)
                     errors["base"] = "cannot_connect"
+                elif is_malformed_response(err):
+                    _LOGGER.exception(
+                        "Failed to parse site data during reconfiguration"
+                    )
+                    errors["base"] = "site_parse_error"
                 else:
                     _LOGGER.exception("Unexpected UniFi API response")
                     errors["base"] = "unknown"
-            except ValidationError:
-                _LOGGER.exception("Failed to parse site data during reconfiguration")
-                errors["base"] = "site_parse_error"
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception during reconfiguration")
                 errors["base"] = "unknown"
@@ -1407,10 +1400,6 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
         current_site_ids: list[str] = list(
             self.config_entry.options.get(CONF_SITE_IDS) or []
         )
-        connection_type = self.config_entry.data.get(CONF_CONNECTION_TYPE)
-        current_poll_interval = poll_interval_seconds(
-            connection_type, self.config_entry.options
-        )
         # Sites are only known while the entry is loaded. Offer the picker for
         # multi-site consoles, or whenever a filter is already saved so it can
         # be cleared.
@@ -1420,14 +1409,6 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
 
         if user_input is not None:
             options = dict(user_input)
-            # cmcore (backlog 663): store whole seconds within the bounds; a cleared
-            # field stores nothing, so the connection type's default applies again.
-            if options.get(CONF_POLL_INTERVAL) in (None, ""):
-                options.pop(CONF_POLL_INTERVAL, None)
-            else:
-                options[CONF_POLL_INTERVAL] = poll_interval_seconds(
-                    connection_type, {CONF_POLL_INTERVAL: options[CONF_POLL_INTERVAL]}
-                )
             if not show_site_picker:
                 # The picker was not shown (entry not loaded, or a single-site
                 # console), so keep whatever filter was saved before.
@@ -1466,17 +1447,6 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
                 CONF_CLIENT_CONTROL,
                 default=default_client_control,
             ): bool,
-            # Suggested, not a default (like the site picker): an entry stores no
-            # interval until one is chosen, so its connection type's default holds.
-            vol.Optional(CONF_POLL_INTERVAL): NumberSelector(
-                NumberSelectorConfig(
-                    min=MIN_POLL_INTERVAL,
-                    max=MAX_POLL_INTERVAL,
-                    step=15,
-                    unit_of_measurement="s",
-                    mode=NumberSelectorMode.BOX,
-                )
-            ),
         }
         if self._access_webhook_available():
             schema[
@@ -1513,11 +1483,7 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(schema),
-                {
-                    CONF_SITE_IDS: current_site_ids,
-                    CONF_POLL_INTERVAL: current_poll_interval,
-                },
+                vol.Schema(schema), {CONF_SITE_IDS: current_site_ids}
             ),
         )
 

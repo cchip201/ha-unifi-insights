@@ -16,7 +16,8 @@ from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, Device
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
-from .coordinators import UnifiFacadeCoordinator
+from .coordinators import UnifiInsightsFacadeCoordinator
+from .data_transforms import network_device, owner_available, section_by_site
 from .entity import get_field
 
 if TYPE_CHECKING:
@@ -45,20 +46,13 @@ async def async_setup_entry(
     def async_discover_updates() -> None:
         """Discover and add new update entities."""
         nonlocal first_setup
-        if not coordinator.data or not isinstance(coordinator.data, dict):
-            return
-
-        devices_by_site = coordinator.data.get("devices", {})
-        if not isinstance(devices_by_site, dict):
+        devices_by_site = section_by_site(coordinator.data, "devices")
+        if devices_by_site is None:
             return
 
         new_entities: list[UnifiNetworkDeviceUpdate] = []
         for site_id, devices in devices_by_site.items():
-            if not isinstance(devices, dict):
-                continue
-            for device_id, device_data in devices.items():
-                if not isinstance(device_data, dict):
-                    continue
+            for device_id in devices:
                 key = (site_id, device_id)
                 if key in known_device_keys:
                     continue
@@ -80,7 +74,9 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(async_discover_updates))
 
 
-class UnifiNetworkDeviceUpdate(CoordinatorEntity[UnifiFacadeCoordinator], UpdateEntity):
+class UnifiNetworkDeviceUpdate(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], UpdateEntity
+):
     """Update entity for UniFi network devices."""
 
     _attr_has_entity_name = True
@@ -90,7 +86,7 @@ class UnifiNetworkDeviceUpdate(CoordinatorEntity[UnifiFacadeCoordinator], Update
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         device_id: str,
     ) -> None:
@@ -100,7 +96,7 @@ class UnifiNetworkDeviceUpdate(CoordinatorEntity[UnifiFacadeCoordinator], Update
         self._device_id = device_id
 
         # Get device data
-        device_data = coordinator.data["devices"][site_id][device_id]
+        device_data = network_device(coordinator.data, site_id, device_id) or {}
         device_name = get_field(
             device_data, "name", default=f"UniFi Device {device_id}"
         )
@@ -130,13 +126,12 @@ class UnifiNetworkDeviceUpdate(CoordinatorEntity[UnifiFacadeCoordinator], Update
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return bool(self.coordinator.device_available)
+        return owner_available(self.coordinator.data, "device")
 
     @property
     def _device_data(self) -> dict[str, Any] | None:
         """Return device data."""
-        devices = self.coordinator.data["devices"].get(self._site_id, {})
-        result = devices.get(self._device_id)
+        result = network_device(self.coordinator.data, self._site_id, self._device_id)
         return result if isinstance(result, dict) else None
 
     @property

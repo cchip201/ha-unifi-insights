@@ -3,6 +3,18 @@
  * it. (The integration's translations/ folder is backend-only.)
  */
 const en = {
+  "dashboard.loading": "Loading {title}…",
+  "dashboard.error":
+    "Could not load this card. Check the integration and connection.",
+  "dashboard.unavailable":
+    "Data is temporarily unavailable. Check the UniFi Insights integration and connection.",
+  "dashboard.no_protect":
+    "UniFi Protect is not configured for this integration.",
+  "dashboard.partial":
+    "Some data is unavailable or needs attention. Available readings are shown below.",
+  "dashboard.stale":
+    "Updates are delayed. Showing the last available readings.",
+  "dashboard.no_events": "No recent events are available.",
   "card.name": "UniFi Topology",
   "card.description":
     "Interactive network topology of a UniFi site, from UniFi Insights.",
@@ -18,6 +30,8 @@ const en = {
   "state.online": "Online",
   "state.offline": "Offline",
   "state.unknown": "Unknown",
+  "state.connected": "Connected",
+  "state.disconnected": "Disconnected",
   "issue.site_unavailable":
     "Site data temporarily unavailable; will recover automatically.",
   "issue.devices_unavailable":
@@ -49,6 +63,7 @@ const en = {
   "zoom.out": "Zoom out",
   "zoom.fit": "Fit to view",
   "zoom.hint": "Use Ctrl + scroll to zoom",
+  "kind.wan": "WAN",
   "kind.gateway": "Gateway",
   "kind.switch": "Switch",
   "kind.access_point": "Access point",
@@ -69,6 +84,7 @@ const en = {
   "node.client_one": "1 client",
   "node.uplink": "uplink port {port}",
   "node.uplink_speed": "uplink port {port} at {speed}",
+  "node.wan_of": "internet connection of {device}",
   "list.label": "{site} devices and clients",
   "list.search": "Search",
   "list.no_matches": "No matches",
@@ -110,6 +126,7 @@ const en = {
   "editor.layout": "Layout",
   "editor.show_site_selector": "Show site selector",
   "editor.show_labels": "Show labels",
+  "editor.show_wan": "Show internet connections (WAN)",
   "editor.max_clients": "Maximum clients",
   "clients.collapsed": "Grouped",
   "clients.expanded": "Expanded",

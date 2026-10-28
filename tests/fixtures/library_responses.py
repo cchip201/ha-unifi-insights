@@ -1,27 +1,16 @@
 # Copyright 2026 UniFi Insights contributors
 """Sample library response data for testing."""
 
+import copy
+from typing import Any
+
+from unifi_official_api.network.models.device import Device
+
 # Network API responses
 SAMPLE_SITE = {
     "id": "default",
     "name": "Default",
     "desc": "Default Site",
-}
-
-SAMPLE_NETWORK_DEVICE = {
-    "id": "test_device_1",
-    "mac": "AA:BB:CC:DD:EE:FF",
-    "model": "USW-24-POE",
-    "name": "Test Switch",
-    "status": "online",
-    "adopted": True,
-    "firmware_version": "6.5.55",
-    "uptime_seconds": 864000,
-    "cpu_percent": 15.2,
-    "memory_percent": 42.8,
-    "tx_bytes": 1024000000,
-    "rx_bytes": 2048000000,
-    "site": "default",
 }
 
 SAMPLE_CLIENT = {
@@ -30,6 +19,15 @@ SAMPLE_CLIENT = {
     "name": "Test Device",
     "ip": "192.168.1.100",
     "site": "default",
+}
+
+SAMPLE_WIRED_CLIENT = {
+    "id": "client_wired_1",
+    "macAddress": "aa:bb:cc:dd:ee:33",
+    "name": "Test Wired Client",
+    "type": "WIRED",
+    "connectedAt": "2026-10-25T12:00:00Z",
+    "ipAddress": "192.168.1.133",
 }
 
 SAMPLE_PDU_DEVICE = {
@@ -97,39 +95,157 @@ SAMPLE_PDU_LEGACY_DEVICE = {
     ],
 }
 
+
+# --- Complete PDU outlet data for the #376 payload-integrity tests ---
+#
+# ``SAMPLE_PDU_LEGACY_DEVICE`` is deliberately sparse (one override for three
+# table rows) and stays the cold-start rejection case. The variants below give
+# the coordinator a structurally complete baseline. They are constructed, not
+# captures: the 21-overrides/20-table shape mirrors the live diagnostics that
+# showed the two arrays can differ, a difference a length or count rule cannot
+# judge.
+def _pdu_outlet_rows(count: int) -> list[dict[str, Any]]:
+    """Return ``count`` complete outlet_overrides rows with mixed values."""
+    return [
+        {
+            "index": index,
+            "name": f"Outlet {index}",
+            "relay_state": index % 2 == 1,
+            "cycle_enabled": index % 2 == 1,
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+_COMPLETE_OUTLET_TABLE = [
+    {
+        "index": 1,
+        "name": "Main Server",
+        "relay_state": True,
+        "cycle_enabled": True,
+        "outlet_caps": 3,
+        "outlet_voltage": "120.2",
+        "outlet_current": "1.25",
+        "outlet_power": "150.0",
+        "outlet_power_factor": "0.98",
+    },
+    {
+        "index": 2,
+        "name": "Backup Server",
+        "relay_state": False,
+        "cycle_enabled": True,
+        "outlet_caps": 3,
+        "outlet_voltage": "120.1",
+        "outlet_current": "0.00",
+        "outlet_power": "0.0",
+        "outlet_power_factor": "0.00",
+    },
+    {
+        "index": 3,
+        "name": "Unmetered Switch",
+        "relay_state": True,
+        "cycle_enabled": False,
+        "outlet_caps": 1,
+        "outlet_voltage": None,
+        "outlet_current": None,
+        "outlet_power": None,
+        "outlet_power_factor": None,
+    },
+]
+
+_COMPLETE_OUTLET_OVERRIDES = [
+    {
+        "index": 1,
+        "name": "Main Server",
+        "relay_state": True,
+        "cycle_enabled": True,
+    },
+    {
+        "index": 2,
+        "name": "Backup Server",
+        "relay_state": False,
+        "cycle_enabled": True,
+    },
+    {
+        "index": 3,
+        "name": "Unmetered Switch",
+        "relay_state": True,
+        "cycle_enabled": False,
+    },
+]
+
+SAMPLE_PDU_LEGACY_DEVICE_COMPLETE = {
+    **SAMPLE_PDU_LEGACY_DEVICE,
+    "outlet_table": copy.deepcopy(_COMPLETE_OUTLET_TABLE),
+    "outlet_overrides": copy.deepcopy(_COMPLETE_OUTLET_OVERRIDES),
+}
+
+SAMPLE_PDU_LEGACY_DEVICE_SUPERSET = {
+    **SAMPLE_PDU_LEGACY_DEVICE,
+    "outlet_table": [{**row, "cycle_enabled": True} for row in _pdu_outlet_rows(20)],
+    "outlet_overrides": _pdu_outlet_rows(21),
+}
+
+# --- Network device read model (#337) ---
+#
+# Constructed (not a capture): a switch in the compatibility snake_case shape
+# (``mac``, ``status``, ``firmware_version``, ``site_id``) that older code
+# paths and hand-written test data use.
+SAMPLE_NETWORK_DEVICE = {
+    "id": "network_device_1",
+    "mac": "00:11:22:33:44:66",
+    "model": "USW Pro 24 PoE",
+    "name": "Core Switch",
+    "status": "online",
+    "adopted": True,
+    "features": ["switching"],
+    "firmware_version": "7.1.26",
+    "site": "default",
+    "site_id": "default",
+}
+
+# Captured (redacted) from the maintainer's UDM Pro through the official
+# Network API (GET /v1/sites/{site}/devices, 2026-10-19). It reports no v1
+# ``type``, only ``features: ["switching"]`` and a list-shaped ``interfaces``.
+# Only the id, MAC, IP and name are replaced with placeholders. This is the raw
+# v1 overview item; SAMPLE_UDM_PRO_OVERVIEW is what the coordinator stores
+# from it (``model_dump(by_alias=True)``, which adds ``type: None`` and an
+# empty ``ports``).
+SAMPLE_UDM_PRO_OVERVIEW_API = {
+    "id": "00000000-0000-4000-8000-0000000000d1",
+    "macAddress": "aa:bb:cc:00:00:d1",
+    "ipAddress": "192.168.1.1",
+    "name": "UDM-Pro",
+    "model": "UDM Pro",
+    "state": "ONLINE",
+    "supported": True,
+    "firmwareVersion": "5.1.33",
+    "firmwareUpdatable": False,
+    "features": ["switching"],
+    "interfaces": ["ports"],
+}
+SAMPLE_UDM_PRO_OVERVIEW = Device.model_validate(SAMPLE_UDM_PRO_OVERVIEW_API).model_dump(
+    by_alias=True
+)
+
+# Captured (redacted) from the same UDM Pro (GET
+# /v1/sites/{site}/devices/{id}/statistics/latest, 2026-10-19). The record has
+# no identifiers, so it is verbatim. ``uplink`` rates are bits/s (#337).
+SAMPLE_UDM_PRO_STATS = {
+    "uptimeSec": 3333412,
+    "lastHeartbeatAt": "2026-10-19T06:10:15Z",
+    "nextHeartbeatAt": "2026-10-19T06:10:39Z",
+    "loadAverage1Min": 1.18,
+    "loadAverage5Min": 1.3,
+    "loadAverage15Min": 1.4,
+    "cpuUtilizationPct": 14.6,
+    "memoryUtilizationPct": 62.5,
+    "uplink": {"txRateBps": 35072, "rxRateBps": 74016},
+    "interfaces": {},
+}
+
+
 # Protect API responses
-SAMPLE_PROTECT_CAMERA = {
-    "id": "test_camera_1",
-    "name": "Front Door Camera",
-    "model": "UVC-G4-PRO",
-    "status": "connected",
-    "recording": True,
-    "motion": False,
-    "hdr": "auto",
-    "video_mode": "default",
-    "is_dark": False,
-}
-
-SAMPLE_PROTECT_LIGHT = {
-    "id": "test_light_1",
-    "name": "Garage Light",
-    "model": "UP-LIGHT",
-    "on": True,
-    "brightness": 80,
-    "light_mode": "motion",
-    "dark": False,
-}
-
-SAMPLE_PROTECT_SENSOR = {
-    "id": "test_sensor_1",
-    "name": "Kitchen Sensor",
-    "model": "UP-SENSE",
-    "temperature": 22.5,
-    "humidity": 45,
-    "light": 750,
-    "battery": 85,
-}
-
 SAMPLE_USL_ENTRY_SENSOR = {
     "id": "test_sensor_usl",
     "name": "Front Door Sensor",
@@ -142,15 +258,6 @@ SAMPLE_USL_ENTRY_SENSOR = {
     "temperature": None,
     "humidity": None,
     "lightValue": None,
-}
-
-SAMPLE_PROTECT_CHIME = {
-    "id": "test_chime_1",
-    "name": "Doorbell Chime",
-    "model": "UP-CHIME",
-    "volume": 60,
-    "repeat": 2,
-    "ringtone": "DEFAULT",
 }
 
 # A doorbell camera and a chime shaped like the public Integration API returns

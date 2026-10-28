@@ -6,14 +6,19 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.device_tracker import ScannerEntity
-from homeassistant.components.device_tracker.const import SourceType
+from homeassistant.components.device_tracker import (
+    ScannerEntity,
+    SourceType,
+    TrackerEntity,
+)
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityDescription
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .console_identity import async_get_device_entry
 from .const import (
     CONF_TRACK_CLIENTS,
     CONF_TRACK_WIFI_CLIENTS,
@@ -23,17 +28,22 @@ from .const import (
     MANUFACTURER,
     MOBILITY_DEVICE_PREFIX,
 )
-from .coordinators import UnifiFacadeCoordinator
+from .coordinators import UnifiInsightsFacadeCoordinator
+from .data_transforms import client_is_connected, section_by_site
+from .entity import (
+    UnifiMobilityRouterEntity,
+    async_add_mobility_router_entities,
+    get_field,
+)
 from .entity import get_client_type as _get_client_type
-from .entity import get_field, is_ephemeral_client
-from .helpers import async_get_device_entry
-from .mobility_entity import async_setup_mobility_trackers
 
 if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
+    from .coordinators.mobility import UnifiInsightsMobilityCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,7 +68,7 @@ def _client_should_be_tracked(
 
 
 def _partition_connected_clients(
-    coordinator: UnifiFacadeCoordinator,
+    coordinator: UnifiInsightsFacadeCoordinator,
     *,
     track_wifi: bool,
     track_wired: bool,
@@ -66,17 +76,11 @@ def _partition_connected_clients(
     """Split connected clients into tracked (MAC -> site_id) and untracked MACs."""
     wanted: dict[str, str] = {}
     untracked: set[str] = set()
-    for site_id, clients in coordinator.data.get("clients", {}).items():
-        if not isinstance(clients, dict):
-            continue
+    clients_by_site = section_by_site(coordinator.data, "clients") or {}
+    for site_id, clients in clients_by_site.items():
         for client_data in clients.values():
             mac = get_field(client_data, "macAddress", "mac_address", "mac", default="")
             if not mac:
-                continue
-            if is_ephemeral_client(client_data):
-                # cmcore fork (backlog 529): no new tracker for a randomized,
-                # unnamed client, and not "untracked" either - that set removes
-                # registry entries.
                 continue
             if _client_should_be_tracked(
                 client_data, track_wifi=track_wifi, track_wired=track_wired
@@ -88,7 +92,7 @@ def _partition_connected_clients(
 
 
 def _connected_clients_to_track(
-    coordinator: UnifiFacadeCoordinator,
+    coordinator: UnifiInsightsFacadeCoordinator,
     *,
     track_wifi: bool,
     track_wired: bool,
@@ -191,34 +195,6 @@ def _restored_name(
     return device.name_by_user or device.name
 
 
-def _uplink_identifiers(
-    device_registry: dr.DeviceRegistry, reg_entry: er.RegistryEntry
-) -> set[tuple[str, str]] | None:
-    """
-    Return the AP or switch this tracker was last grouped under (cmcore).
-
-    A client that is offline when the entry sets up has no uplink in the live
-    payload, and upstream then files its tracker under a standalone
-    ``client_<mac>`` device - no area, and left behind empty once the client
-    returns and the tracker moves back under its uplink at the next reload.
-    39 such devices appeared on one day of planned outages (2026-10-01).
-    Returning the identifiers of the device the registry entry already points
-    at keeps the tracker where it was. None when that device is itself a
-    ``client_`` placeholder, or no longer exists.
-    """
-    if not reg_entry.device_id:
-        return None
-    device = device_registry.async_get(reg_entry.device_id)
-    if device is None:
-        return None
-    ids = {
-        (domain, ident)
-        for domain, ident in device.identifiers
-        if domain == DOMAIN and not str(ident).startswith("client_")
-    }
-    return ids or None
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: UnifiInsightsConfigEntry,
@@ -300,7 +276,6 @@ async def async_setup_entry(
     # `async_add_clients` adding a second entity with the same unique_id when a
     # retained client comes back.
     retained: list[UnifiClientTracker] = []
-    device_registry = dr.async_get(hass) if surviving else None
     for reg_entry in surviving:
         mac = _mac_from_unique_id(reg_entry.unique_id)
         retained.append(
@@ -310,11 +285,6 @@ async def async_setup_entry(
                 site_id=connected_macs.get(mac),
                 restored_name=_restored_name(hass, reg_entry, mac),
                 unique_id=reg_entry.unique_id,
-                previous_device_identifiers=(
-                    _uplink_identifiers(device_registry, reg_entry)
-                    if device_registry
-                    else None
-                ),
             )
         )
         tracked.add(mac)
@@ -344,20 +314,20 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(async_add_clients))
 
 
-class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntity):
+class UnifiClientTracker(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ScannerEntity
+):
     """Representation of a UniFi network client."""
 
     _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         mac: str,
         site_id: str | None = None,
         restored_name: str | None = None,
         unique_id: str | None = None,
-        *,
-        previous_device_identifiers: set[tuple[str, str]] | None = None,
     ) -> None:
         """
         Initialize the tracker.
@@ -367,9 +337,6 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
         `restored_name` is the name the registry kept for such a tracker.
         `unique_id` overrides the default DOMAIN_mac id format, used when
         restoring legacy entries that could not be migrated due to collision.
-        `previous_device_identifiers` (cmcore) are the identifiers of the AP or
-        switch device the registry entry already sits under; an offline client's
-        tracker stays there instead of getting a standalone client device.
         """
         super().__init__(coordinator)
         self._site_id = site_id
@@ -411,12 +378,6 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
             self._device_info = DeviceInfo(
                 identifiers={(DOMAIN, f"{self._site_id}_{uplink_device_id}")},
             )
-            self._attr_name = display_name
-        elif previous_device_identifiers:
-            # cmcore: offline at setup, but the registry entry already sits under an
-            # AP or switch - stay there rather than minting a standalone client
-            # device (see _uplink_identifiers). The next connection regroups it.
-            self._device_info = DeviceInfo(identifiers=set(previous_device_identifiers))
             self._attr_name = display_name
         else:
             # Fallback: a standalone device representing the client itself.
@@ -494,11 +455,16 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
 
     @property
     def is_connected(self) -> bool:
-        """Return true if the client is connected."""
-        client_data = self._get_client_data()
-        if not client_data:
-            return False
-        return bool(get_field(client_data, "connected", default=False))
+        """
+        Return true if the client is connected.
+
+        Uses the snapshot membership rule: clients returned by the official
+        connected-clients API lack a connected field and are considered
+        connected by presence in the snapshot. An explicit connected=False
+        overrides membership and reports disconnected. A missing client
+        record returns False.
+        """
+        return client_is_connected(self._get_client_data())
 
     @property
     def source_type(self) -> SourceType:
@@ -550,3 +516,57 @@ class UnifiClientTracker(CoordinatorEntity[UnifiFacadeCoordinator], ScannerEntit
             "authorized": get_field(client_data, "authorized", default=True),
             "blocked": get_field(client_data, "blocked", default=False),
         }
+
+
+# --- Mobility ----------------------------------------------------------------
+
+LOCATION_DESCRIPTION = EntityDescription(
+    key="location",
+    translation_key="mobility_location",
+)
+
+
+class UnifiMobilityLocationTracker(UnifiMobilityRouterEntity, TrackerEntity):
+    """GPS position of a Mobility router."""
+
+    _attr_source_type = SourceType.GPS
+
+    def _coordinate(self, key: str) -> float | None:
+        """Return a coordinate of the last GPS fix, if there is one."""
+        router = self.router or {}
+        location = router.get("location")
+        value = location.get(key) if isinstance(location, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    @property
+    def latitude(self) -> float | None:
+        """Return the router's latitude."""
+        return self._coordinate("latitude")
+
+    @property
+    def longitude(self) -> float | None:
+        """Return the router's longitude."""
+        return self._coordinate("longitude")
+
+
+@callback
+def async_setup_mobility_trackers(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: UnifiInsightsMobilityCoordinator,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Mobility router GPS trackers."""
+    async_add_mobility_router_entities(
+        hass,
+        entry,
+        coordinator,
+        async_add_entities,
+        lambda device_id, workspace_device_id: [
+            UnifiMobilityLocationTracker(
+                coordinator, LOCATION_DESCRIPTION, device_id, workspace_device_id
+            )
+        ],
+    )

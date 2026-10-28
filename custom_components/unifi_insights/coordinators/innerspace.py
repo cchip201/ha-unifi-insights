@@ -8,37 +8,34 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.helpers import device_registry as dr
-
-from custom_components.unifi_insights.api import (
+from unifi_official_api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiResponseError,
     UniFiTimeoutError,
 )
-from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_INNERSPACE
+
+from custom_components.unifi_insights.const import SCAN_INTERVAL_INNERSPACE
 from custom_components.unifi_insights.data_transforms import (
     normalize_innerspace_snapshot,
 )
-from custom_components.unifi_insights.helpers import async_get_device_entry
 
-from .base import UnifiBaseCoordinator
+from .base import UnifiInsightsBaseCoordinator
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
+    from unifi_official_api.innerspace import UniFiInnerSpaceClient
+    from unifi_official_api.network import UniFiNetworkClient
+    from unifi_official_api.protect import UniFiProtectClient
 
-    from custom_components.unifi_insights.api.innerspace import UniFiInnerSpaceClient
-    from custom_components.unifi_insights.api.network import UniFiNetworkClient
-    from custom_components.unifi_insights.api.protect import UniFiProtectClient
-
-    from .device import UnifiDeviceCoordinator
-    from .protect import UnifiProtectCoordinator
+    from .device import UnifiInsightsDeviceCoordinator
+    from .protect import UnifiInsightsProtectCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class UnifiInsightsInnerSpaceCoordinator(UnifiBaseCoordinator):
+class UnifiInsightsInnerSpaceCoordinator(UnifiInsightsBaseCoordinator):
     """
     Coordinator for UniFi InnerSpace floor plans, placed devices, and inventory.
 
@@ -55,8 +52,8 @@ class UnifiInsightsInnerSpaceCoordinator(UnifiBaseCoordinator):
         innerspace_client: UniFiInnerSpaceClient,
         entry: ConfigEntry,
         *,
-        device_coordinator: UnifiDeviceCoordinator | None = None,
-        protect_coordinator: UnifiProtectCoordinator | None = None,
+        device_coordinator: UnifiInsightsDeviceCoordinator | None = None,
+        protect_coordinator: UnifiInsightsProtectCoordinator | None = None,
     ) -> None:
         """Initialize the InnerSpace coordinator."""
         super().__init__(
@@ -91,21 +88,8 @@ class UnifiInsightsInnerSpaceCoordinator(UnifiBaseCoordinator):
             for plan_id, plan in self.data.get("floor_plans", {}).items()
             if isinstance(plan, dict) and plan.get("image_url")
         }
-        device_registry = dr.async_get(self.hass)
         for plan_id in self._previous_floor_plan_ids - current_ids:
-            identifier = f"innerspace_floor_plan_{plan_id}"
-            device = async_get_device_entry(
-                device_registry, (DOMAIN, identifier), self.config_entry.entry_id
-            )
-            if device:
-                _LOGGER.info(
-                    "InnerSpace coordinator: Removing stale floor plan device: %s",
-                    identifier,
-                )
-                device_registry.async_update_device(
-                    device_id=device.id,
-                    remove_config_entry_id=self.config_entry.entry_id,
-                )
+            self._remove_stale_device(f"innerspace_floor_plan_{plan_id}")
         self._previous_floor_plan_ids = current_ids
 
     async def _async_update_data(self) -> dict[str, Any]:

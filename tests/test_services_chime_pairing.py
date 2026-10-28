@@ -27,26 +27,26 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-
-from custom_components.unifi_insights.api import UniFiResponseError
-from custom_components.unifi_insights.api.protect.endpoints.chimes import (
+from unifi_official_api import UniFiResponseError
+from unifi_official_api.protect.endpoints.chimes import (
     ChimesEndpoint,
 )
-from custom_components.unifi_insights.api.protect.models import Camera, Chime
+from unifi_official_api.protect.models import Camera, Chime
+
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
     CONNECTION_TYPE_LOCAL,
     DOMAIN,
     SERVICE_SET_CHIME_PAIRED_DOORBELLS,
 )
-from custom_components.unifi_insights.helpers import is_doorbell_camera_model
+from custom_components.unifi_insights.data_transforms import is_doorbell_camera_model
+from custom_components.unifi_insights.service_targets import _doorbell_camera_id
 from custom_components.unifi_insights.services import (
-    _doorbell_camera_id,
-    _entry_id_for_coordinator,
     async_setup_services,
     async_unload_services,
 )
 from tests.conftest import _create_mock_protect_client
+from tests.fixtures.facade_data import with_protect_collection, without_sections
 from tests.fixtures.library_responses import SAMPLE_DOORBELL_CAMERA, SAMPLE_PUBLIC_CHIME
 
 if TYPE_CHECKING:
@@ -171,21 +171,6 @@ def test_doorbell_camera_id_reads_only_this_integrations_ring_sensors() -> None:
     )
     # Nothing between the prefix and the suffix means no camera id.
     assert _doorbell_camera_id(entry(f"{DOMAIN}_camera_{RING_SUFFIX}")) is None
-
-
-def test_entry_id_for_coordinator_finds_the_owner_or_none() -> None:
-    """The console is found by identity, and a stranger matches nothing."""
-    owned = MagicMock()
-    other = MagicMock()
-    hass = MagicMock()
-    hass.config_entries.async_entries.return_value = [
-        MagicMock(entry_id="no_runtime_data", runtime_data=None),
-        MagicMock(entry_id="entry_b", runtime_data=MagicMock(coordinator=other)),
-        MagicMock(entry_id="entry_a", runtime_data=MagicMock(coordinator=owned)),
-    ]
-
-    assert _entry_id_for_coordinator(hass, owned) == "entry_a"
-    assert _entry_id_for_coordinator(hass, MagicMock()) is None
 
 
 async def test_pairs_the_selected_doorbell_with_exact_arguments(
@@ -422,9 +407,9 @@ async def test_console_without_loaded_cameras_raises_translated_error(
     if unloaded == "data":
         coordinator.data = None
     elif unloaded == "protect":
-        del coordinator.data["protect"]
+        coordinator.data = without_sections(coordinator.data, "protect")
     else:
-        coordinator.data["protect"]["cameras"] = None
+        coordinator.data = with_protect_collection(coordinator.data, "cameras", None)
 
     with pytest.raises(HomeAssistantError) as err:
         await _call(hass, chime_id="chime_1", doorbells={"entity_id": ring})
@@ -440,10 +425,11 @@ async def test_missing_chime_raises(
     """A chime no console has is refused before any doorbell is looked at."""
     await _setup(hass, mock_config_entry, protect_client)
 
-    with pytest.raises(ServiceValidationError, match="not found on any configured"):
+    with pytest.raises(ServiceValidationError) as raised:
         await _call(
             hass, chime_id="no_such_chime", doorbells={"entity_id": _ring(hass)}
         )
+    assert raised.value.translation_key == "protect_resource_not_found"
 
     protect_client.chimes.update.assert_not_awaited()
 
@@ -454,8 +440,9 @@ async def test_chime_target_is_required(
     """Without a chime id or a target there is nothing to pair."""
     await _setup(hass, mock_config_entry, protect_client)
 
-    with pytest.raises(ServiceValidationError, match="Chime ID or target is required"):
+    with pytest.raises(ServiceValidationError) as raised:
         await _call(hass, doorbells={"entity_id": _ring(hass)})
+    assert raised.value.translation_key == "protect_target_required"
 
     protect_client.chimes.update.assert_not_awaited()
 
@@ -767,13 +754,19 @@ async def test_setup_registers_and_unload_removes_the_action(
 
 
 def test_services_yaml_defines_the_action_with_hassfest_safe_targets() -> None:
-    """The service target is entity-only; doorbells filter on ring sensors."""
+    """The chime is one entity or device; doorbells filter on ring sensors."""
     definitions = yaml.safe_load((COMPONENT_DIR / "services.yaml").read_text())
     service = definitions[SERVICE_SET_CHIME_PAIRED_DOORBELLS]
 
-    # hassfest rejects device filters on a service target.
-    assert service["target"] == {"entity": {"integration": DOMAIN}}
-    assert set(service["fields"]) == {"chime_id", "doorbells"}
+    # The chime is a single target, so no area-offering action target.
+    assert "target" not in service
+    assert set(service["fields"]) == {"entity_id", "device_id", "chime_id", "doorbells"}
+    assert service["fields"]["entity_id"]["selector"] == {
+        "entity": {"integration": DOMAIN}
+    }
+    assert service["fields"]["device_id"]["selector"] == {
+        "device": {"integration": DOMAIN}
+    }
     selector = service["fields"]["doorbells"]["selector"]["target"]
     assert selector == {
         "entity": {

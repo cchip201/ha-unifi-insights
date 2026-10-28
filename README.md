@@ -1,14 +1,14 @@
 # UniFi Insights integration for Home Assistant
 
-[![HACS Integration](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/custom-components/hacs)
+<!-- BADGES:START -->
+
+[![Marketplace and HACS](https://img.shields.io/badge/Marketplace%20%7C%20HACS-Default-orange.svg)](https://www.hacs.xyz/docs/marketplace/)
 [![GitHub Last Commit](https://img.shields.io/github/last-commit/tinkerologie/ha-unifi-insights)](https://github.com/tinkerologie/ha-unifi-insights/commits/main)
 [![GitHub Release](https://img.shields.io/github/v/release/tinkerologie/ha-unifi-insights)](https://github.com/tinkerologie/ha-unifi-insights/releases)
-[![GitHub Issues](https://img.shields.io/github/issues/tinkerologie/ha-unifi-insights)](https://github.com/tinkerologie/ha-unifi-insights/issues)
-[![GitHub Sponsors](https://img.shields.io/github/sponsors/ruaan-deysel)](https://github.com/sponsors/ruaan-deysel)
-[![Community Forum](https://img.shields.io/badge/community-forum-brightgreen.svg)](https://community.home-assistant.io/t/unifi-insights-integration)
 [![codecov](https://codecov.io/gh/tinkerologie/ha-unifi-insights/graph/badge.svg)](https://codecov.io/gh/tinkerologie/ha-unifi-insights)
 [![License](https://img.shields.io/github/license/tinkerologie/ha-unifi-insights)](./LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tinkerologie/ha-unifi-insights)
+
+<!-- BADGES:END -->
 
 Monitor and control your UniFi system from Home Assistant: UniFi Network, UniFi Protect, UniFi Access, UniFi InnerSpace, UniFi Mobility, UniFi Site Manager and UniFi Carrier Fabric, in one integration.
 
@@ -26,7 +26,7 @@ Monitor and control your UniFi system from Home Assistant: UniFi Network, UniFi 
 
 ## Overview
 
-UniFi Insights is a custom integration that you install from HACS. It connects with an API key, not a user name and password. It mainly uses the official UniFi APIs that Ubiquiti publishes at [developer.ui.com](https://developer.ui.com/). For some UniFi Network features that the official API doesn't cover yet, such as Wi-Fi QR codes, VPN, route, port forward, traffic rule, NAT rule and static route switches, and internet traffic history, it uses the console's classic Network endpoints with the same API key.
+UniFi Insights is a custom integration that you install from the Home Assistant Marketplace (Home Assistant 2026.11 and newer) or from HACS (Home Assistant 2026.9 and 2026.10). It connects with an API key, not a user name and password. It mainly uses the official UniFi APIs that Ubiquiti publishes at [developer.ui.com](https://developer.ui.com/). For some UniFi Network features that the official API doesn't cover yet, such as Wi-Fi QR codes, VPN, route, port forward, traffic rule, NAT rule and static route switches, and internet traffic history, it uses the console's classic Network endpoints with the same API key.
 
 - **One integration for your UniFi system.** One console entry covers that console's Network, Protect and InnerSpace applications. Local entries can also connect to Access using its separate token. A cloud API key adds Mobility and Site Manager data. ISPs can add a Carrier Fabric entry.
 - **API key setup, local or remote.** Connect to a console on your network, or choose any console on your UniFi account through UniFi Cloud. You don't need a local user account.
@@ -51,7 +51,7 @@ The integration only creates entities for the applications your console runs. A 
 
 ## Requirements
 
-- Home Assistant 2026.6.0 or newer.
+- Home Assistant 2026.9.0 or newer.
 - For Local and Remote entries: a UniFi OS console (for example a UDM, UDR, UCG or Cloud Key Gen2+) with UniFi Network, UniFi Protect or UniFi InnerSpace. The console must provide the official UniFi Integration API. Self-hosted UniFi Network Application installs (Linux, Docker, Proxmox) don't provide it, so they can't be added as Local entries.
 - For Remote entries, Mobility and Site Manager: a cloud API key from [UniFi Site Manager](https://unifi.ui.com).
 - For Carrier Fabric: an ISP API key.
@@ -59,7 +59,18 @@ The integration only creates entities for the applications your console runs. A 
 
 ## Installation
 
-### HACS (recommended)
+### Marketplace (Home Assistant 2026.11 and newer, recommended)
+
+Starting with Home Assistant 2026.11, HACS is built into Home Assistant as the Marketplace, so there is nothing else to install first.
+
+[![Open your Home Assistant instance and open a repository in the Marketplace.](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=tinkerologie&repository=ha-unifi-insights&category=integration)
+
+1. Select the button above, or go to **Settings** → **Marketplace** and search for "UniFi Insights".
+2. Install it. The integration loads right away. If Home Assistant shows a repair that asks for a restart, restart Home Assistant.
+
+If you installed UniFi Insights with HACS before you upgraded to Home Assistant 2026.11, you don't need to do anything. The Marketplace takes over HACS installs, and UniFi Insights keeps getting updates.
+
+### HACS (Home Assistant 2026.9 and 2026.10)
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=tinkerologie&repository=ha-unifi-insights&category=integration)
 
@@ -104,7 +115,6 @@ To change these settings after setup, go to **Settings** → **Devices & service
 | Track Wired Clients   | Off     | Creates a device tracker for each wired client.                                                                                                                                    |
 | Enable Client Control | On      | Creates client allow/block switches, reconnect buttons and disabled-by-default Wake-on-LAN buttons for wired clients. Turn off for read-only monitoring.                           |
 | Sites                 | All     | Only shown when the console has more than one site. Choose the sites to poll. Sites you don't choose are not queried at all, which reduces API traffic. Leave empty for all sites. |
-| Poll interval (s)     | 30/120  | How often devices, clients and Protect are polled, 30-900 s. Cloud entries default to 120 s because UniFi's remote connector times out (HTTP 408) under faster polling; local entries default to 30 s. Clear the field to return to the default. |
 
 Carrier Fabric entries have their own options. See [Carrier Fabric setup](#carrier-fabric-setup).
 
@@ -146,7 +156,7 @@ Carrier Fabric entries have their own options. See [Carrier Fabric setup](#carri
 | _Tunnel name_ Site-to-Site VPN                      | Binary sensor  | Connection state of each site-to-site VPN tunnel                                       |
 | WAN IP Address, WAN Uptime                          | Sensor         | Gateway, disabled by default                                                           |
 | WiFi _network name_                                 | Switch         | Turn a Wi-Fi network on or off                                                         |
-| _Policy name_                                       | Switch         | Turn a user-defined firewall policy on or off. A console-generated "(Return)" policy gets no switch: it follows its parent, and its id changes whenever a policy is deleted |
+| _Policy name_                                       | Switch         | Turn a user-defined firewall policy on or off                                          |
 | _Route name_                                        | Switch         | Turn a policy-based route on or off                                                    |
 | _VPN client name_                                   | Switch         | Turn a VPN client (WireGuard, OpenVPN, Privado VPN) on or off                          |
 | Port forward _rule name_                            | Switch         | Turn a port forwarding rule on or off                                                  |
@@ -261,6 +271,7 @@ UniFi has no Wake-on-LAN function, so the **Wake** buttons send the packet from 
 - **Same network:** Home Assistant must be on the same network (VLAN) as the device. UniFi gateways usually don't forward wake packets between VLANs. The packet goes to the broadcast address of the client's network when the console reports it, and to 255.255.255.255 otherwise.
 - **The device:** it needs Wake-on-LAN enabled in its BIOS/UEFI and in its operating system or network adapter settings. The button can't tell whether the device woke up.
 - **Home Assistant:** it must use host networking (Home Assistant OS does). In a Docker bridge network the packet doesn't reach your network.
+- **Availability:** Wake and reconnect buttons are unavailable while the console is unreachable and return when it recovers. A Wake button stays available for an offline client while the console is reachable.
 - **Debug logging:** turn on debug logging for `homeassistant.components.wake_on_lan` to see each packet.
 - Remote (cloud) entries work the same way: the packet is sent from Home Assistant, not through the console.
 
@@ -391,23 +402,48 @@ refer to are not included, and there is no import action.
 
 ### Protect actions
 
-| Action                                      | Description                                                              |
-| ------------------------------------------- | ------------------------------------------------------------------------ |
-| `unifi_insights.set_hdr_mode`               | Set a camera's HDR mode (`auto`, `on`, `off`)                            |
-| `unifi_insights.set_video_mode`             | Set a camera's video mode (`default`, `highFps`, `sport`, `slowShutter`) |
-| `unifi_insights.set_mic_volume`             | Set a camera's microphone volume (1–100)                                 |
-| `unifi_insights.ptz_move`                   | Move a PTZ camera to a preset (0–15)                                     |
-| `unifi_insights.ptz_patrol`                 | Start or stop a PTZ patrol                                               |
-| `unifi_insights.set_light_mode`             | Set a light's mode (`always`, `motion`, `off`)                           |
-| `unifi_insights.set_light_level`            | Set a light's brightness (0–100)                                         |
-| `unifi_insights.play_chime_ringtone`        | Always raises a not supported error; sends no request                    |
-| `unifi_insights.set_chime_volume`           | Set a chime's volume (0–100)                                             |
-| `unifi_insights.set_chime_ringtone`         | Set an opaque Protect ringtone ID for every paired doorbell              |
-| `unifi_insights.set_chime_repeat_times`     | Set how many times a chime repeats (1–10)                                |
-| `unifi_insights.set_chime_paired_doorbells` | Choose which doorbells ring a chime (replaces its current pairing)       |
-| `unifi_insights.trigger_alarm`              | Trigger an Alarm Manager webhook alarm                                   |
-| `unifi_insights.create_liveview`            | Create a live view                                                       |
-| `unifi_insights.set_liveview`               | Set the live view shown on a viewer                                      |
+The camera **Video Mode** dropdown uses plain-English labels. Its stored select keys and the values accepted by `unifi_insights.set_video_mode` are listed below. The `video_mode` attribute keeps the raw API value.
+
+| Label                           | Select state / `select.select_option` | `unifi_insights.set_video_mode` value |
+| ------------------------------- | ------------------------------------- | ------------------------------------- |
+| Normal                          | `default`                             | `default`                             |
+| High frame rate                 | `high_fps`                            | `highFps`                             |
+| Fast motion                     | `sport`                               | `sport`                               |
+| Low light                       | `slow_shutter`                        | `slowShutter`                         |
+| License plates (reflective)     | `lpr_reflex`                          | `lprReflex`                           |
+| License plates (non-reflective) | `lpr_none_reflex`                     | `lprNoneReflex`                       |
+
+**Migration:** Update state comparisons and `select.select_option` calls that use `highFps`, `slowShutter`, `lprReflex` or `lprNoneReflex` to the select keys above. Entity IDs and `unifi_insights.set_video_mode` calls are unchanged. Recorder history retains the old values; the migration applies to future states and calls.
+
+For example, a native select action now uses the normalized key:
+
+```yaml
+action: select.select_option
+target:
+  entity_id: select.my_camera_video_mode
+data:
+  option: lpr_none_reflex
+```
+
+A `unifi_insights.set_video_mode` action continues to use `mode: lprNoneReflex`.
+
+| Action                                      | Description                                                                                            |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `unifi_insights.set_hdr_mode`               | Set a camera's HDR mode (`auto`, `on`, `off`)                                                          |
+| `unifi_insights.set_video_mode`             | Set a camera's video mode (`default`, `highFps`, `sport`, `slowShutter`, `lprReflex`, `lprNoneReflex`) |
+| `unifi_insights.set_mic_volume`             | Set a camera's microphone volume (1–100)                                                               |
+| `unifi_insights.ptz_move`                   | Move a PTZ camera to a preset (0–15)                                                                   |
+| `unifi_insights.ptz_patrol`                 | Start or stop a PTZ patrol                                                                             |
+| `unifi_insights.set_light_mode`             | Set a light's mode (`always`, `motion`, `off`)                                                         |
+| `unifi_insights.set_light_level`            | Set a light's brightness (0–100)                                                                       |
+| `unifi_insights.play_chime_ringtone`        | Always raises a not supported error; sends no request                                                  |
+| `unifi_insights.set_chime_volume`           | Set a chime's volume (0–100)                                                                           |
+| `unifi_insights.set_chime_ringtone`         | Set an opaque Protect ringtone ID for every paired doorbell                                            |
+| `unifi_insights.set_chime_repeat_times`     | Set how many times a chime repeats (1–10)                                                              |
+| `unifi_insights.set_chime_paired_doorbells` | Choose which doorbells ring a chime (replaces its current pairing)                                     |
+| `unifi_insights.trigger_alarm`              | Trigger an Alarm Manager webhook alarm                                                                 |
+| `unifi_insights.create_liveview`            | Create a live view                                                                                     |
+| `unifi_insights.set_liveview`               | Set the live view shown on a viewer                                                                    |
 
 ```yaml
 # Move a PTZ camera to a preset position
@@ -676,7 +712,7 @@ The integration does not assign plans, create or change subscribers, or attach o
 
 ## Automation blueprints
 
-This repository includes three automation blueprints for network health alerts. They are native Home Assistant YAML and need no external service or API. They use the entities that UniFi Insights creates, and they need Home Assistant 2026.6.0 or newer, like the integration. Each one runs the actions you choose.
+This repository includes three automation blueprints for network health alerts. They are native Home Assistant YAML and need no external service or API. They use the entities that UniFi Insights creates, and they need Home Assistant 2026.9.0 or newer, like the integration. Each one runs the actions you choose.
 
 | Blueprint                      | Runs your actions when                                                                                      | Needs                                                                                                                            |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
@@ -686,7 +722,7 @@ This repository includes three automation blueprints for network health alerts. 
 
 ### Install the blueprints
 
-HACS installs the integration only. It does not install blueprints, so add them yourself in one of two ways:
+The Marketplace and HACS install the integration only. They don't install blueprints, so add them yourself in one of two ways:
 
 - **Import from GitHub.** Select an **Import Blueprint** badge below, or go to **Settings** → **Automations & scenes** → **Blueprints**, select **Import blueprint** and paste the URL.
 - **Copy the files.** Download the YAML files from [`blueprints/automation/unifi_insights`](https://github.com/tinkerologie/ha-unifi-insights/tree/main/blueprints/automation/unifi_insights) and put them in `<config>/blueprints/automation/unifi_insights/`. `<config>` is your Home Assistant configuration folder, the one that contains `configuration.yaml`.
@@ -736,50 +772,52 @@ The integration installs six dashboard cards. There is no separate download and 
 
 ### Network topology card
 
-The **UniFi Topology** card draws each site's network: the gateway, switches and access points, and the clients connected to them. With a single UniFi site the card works without any configuration. With several sites, choose the site in the card editor.
+The **UniFi Topology** card draws each site's network: the gateway's internet connections (WANs), the gateway, switches and access points, and the clients connected to them. With a single UniFi site the card works without any configuration. With several sites, choose the site in the card editor.
 
 **Use it:**
 
 - **Graph** view: drag to pan, pinch or Ctrl + scroll to zoom (plain scroll zooms in panel view), and use the zoom buttons or `+` / `-` / `0` keys. Select a device to see its uplink port, link speed, PoE draw and client counts, with a link to its Home Assistant device page.
 - **List** view: the same network as an indented list with search. It is the recommended view for screen readers.
 - Clients are grouped under their switch or access point ("12 clients"). Select a group to expand it.
-- The filter buttons hide gateways, switches, access points, clients or other devices. Devices under a hidden one stay visible, linked with a dashed line.
+- Each WAN the gateway reports (the same WANs as its **Connection** sensors) is drawn above the gateway with its name and state. A disconnected WAN is dimmed, marked **Disconnected** and linked with a red dashed line. WANs follow the gateway: hiding gateways hides them too.
+- The filter buttons hide WANs, gateways, switches, access points, clients or other devices. Devices under a hidden one stay visible, linked with a dashed line.
 - Select a device or client and use the **Actions** menu in its details, or use a context-menu gesture. See **Actions menu** below.
 
 **Options** (all optional, all available in the card editor):
 
-| Option                 | Values                                                        | Default                             |
-| ---------------------- | ------------------------------------------------------------- | ----------------------------------- |
-| `entry_id` + `site_id` | the site to show                                              | the only site, if there is one      |
-| `title`                | text                                                          | the site name                       |
-| `view`                 | `graph`, `list`                                               | `graph`                             |
-| `show_site_selector`   | `true`, `false`                                               | `false`                             |
-| `clients`              | `collapsed`, `expanded`, `hidden`                             | `collapsed`                         |
-| `kinds`                | any of `gateway`, `switch`, `access_point`, `client`, `other` | all                                 |
-| `density`              | `comfortable`, `compact`                                      | automatic (compact on narrow cards) |
-| `orientation`          | `vertical`, `horizontal`                                      | `vertical`                          |
-| `layout`               | `tree`, `tiered`                                              | `tree`                              |
-| `show_labels`          | `true`, `false`                                               | `true`                              |
-| `max_clients`          | 1–500                                                         | 500                                 |
+| Option                 | Values                                                               | Default                             |
+| ---------------------- | -------------------------------------------------------------------- | ----------------------------------- |
+| `entry_id` + `site_id` | the site to show                                                     | the only site, if there is one      |
+| `title`                | text                                                                 | the site name                       |
+| `view`                 | `graph`, `list`                                                      | `graph`                             |
+| `show_site_selector`   | `true`, `false`                                                      | `false`                             |
+| `clients`              | `collapsed`, `expanded`, `hidden`                                    | `collapsed`                         |
+| `kinds`                | any of `wan`, `gateway`, `switch`, `access_point`, `client`, `other` | all                                 |
+| `density`              | `comfortable`, `compact`                                             | automatic (compact on narrow cards) |
+| `orientation`          | `vertical`, `horizontal`                                             | `vertical`                          |
+| `layout`               | `tree`, `tiered`                                                     | `tree`                              |
+| `show_labels`          | `true`, `false`                                                      | `true`                              |
+| `show_wan`             | `true`, `false`; `false` removes WAN nodes and their filter button   | `true`                              |
+| `max_clients`          | 1–500                                                                | 500                                 |
 
-**Layout:** `tree` places every device one level below the device it connects through. `tiered` gives each device role its own row: gateways at the top, then switches, access points, other devices and, at the bottom, the clients. A device whose own row is at or above its parent's row, such as a switch behind an access point, goes on a row just below the parent. Empty rows take no space. With `orientation: horizontal` the rows become columns. Only the graph view uses `layout`; the list view ignores it.
+**Layout:** `tree` places every device one level below the device it connects through, and each gateway's WANs one level above it. `tiered` gives each device role its own row: WANs at the top, then gateways, switches, access points, other devices and, at the bottom, the clients. A device whose own row is at or above its parent's row, such as a switch behind an access point, goes on a row just below the parent. Empty rows take no space. With `orientation: horizontal` the rows become columns. Only the graph view uses `layout`; the list view ignores it.
 
 ### Actions menu
 
 The **Actions** menu is for administrators and its button appears in a node's details when at least one action is available. Right-click a node, long-press it on a touch screen in browsers that send a context-menu event on a long-press, or focus it and press the ContextMenu key or Shift+F10 to select it and open the menu. Otherwise, use the **Actions** button in the node details. These gestures work in graph and list views. Client groups ("12 clients") have no menu. Non-administrators may still see the separate **Open device** link in node details when a device page is available.
 
-| Action           | Who can use it | What it does                                                                                |
-| ---------------- | -------------- | ------------------------------------------------------------------------------------------- |
-| Copy IP address  | Administrators | Copies the node's IP address to the clipboard                                               |
-| Copy MAC address | Administrators | Copies the node's MAC address to the clipboard                                              |
-| Open device      | Administrators | Opens the node's Home Assistant device page                                                 |
-| Open entity      | Administrators | Opens the more-info dialog of a device's **Status** sensor, or of a client's device tracker |
+| Action           | Who can use it | What it does                                                                                                            |
+| ---------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Copy IP address  | Administrators | Copies the node's IP address to the clipboard                                                                           |
+| Copy MAC address | Administrators | Copies the node's MAC address to the clipboard                                                                          |
+| Open device      | Administrators | Opens the node's Home Assistant device page                                                                             |
+| Open entity      | Administrators | Opens the more-info dialog of a device's **Status** sensor, a WAN's **Connection** sensor, or a client's device tracker |
 
 An action is omitted when no target is available, for example when there is no IP address or a client has no tracker (see **Track WiFi Clients** and **Track Wired Clients** in [Options](#options)).
 
 Use the Up and Down arrow keys, Home and End to move through the menu, Enter to choose an action and Escape to close it. Escape closes only the menu and restores focus to its button. The Up and Down arrow keys on the button open the menu. If copying fails, the card shows the value as selectable text for manual copying.
 
-**Privacy:** the topology data that every user receives contains names, models, states, ports and VLANs. MAC addresses, IP addresses, hostnames and firmware versions are never included. For an administrator, the card requests one selected node's details through the admin-only `unifi_insights/topology/node_details` command. The response includes IP and MAC addresses plus Home Assistant's `device_id` and `entity_id` when available. Non-administrators cannot call the command. Hostnames and firmware versions are not sent, and the card does not keep an address after the selection changes.
+**Privacy:** the topology data that every user receives contains names, models, states, ports and VLANs. MAC addresses, IP addresses, hostnames and firmware versions are never included. For an administrator, the card requests one selected node's details through the admin-only `unifi_insights/topology/node_details` command. The response includes IP and MAC addresses (for a WAN, its WAN IP address) plus Home Assistant's `device_id` and `entity_id` when available. Non-administrators cannot call the command. Hostnames and firmware versions are not sent, and the card does not keep an address after the selection changes.
 
 ## Troubleshooting
 

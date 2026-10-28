@@ -6,47 +6,62 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components import websocket_api
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import ConfigEntryDisabler, ConfigEntryState
 from homeassistant.const import CONF_API_KEY, CONF_HOST, Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-
-if TYPE_CHECKING:
-    from homeassistant.core import HomeAssistant
-    from homeassistant.helpers.entity_registry import EntityRegistry
-    from pytest_homeassistant_custom_component.typing import WebSocketGenerator
-
-from custom_components.unifi_insights import (
-    PLATFORMS,
-    SETUP_PROBE_RETRIES,
-    UnifiInsightsData,
-    _migrate_fork_site_unique_ids,
-    _raise_for_setup_probes,
-    async_remove_config_entry_device,
-    async_unload_entry,
-)
-from custom_components.unifi_insights.api import (
+from unifi_official_api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiNotFoundError,
     UniFiResponseError,
     UniFiTimeoutError,
 )
-from custom_components.unifi_insights.api.innerspace import (
+from unifi_official_api.innerspace import (
     InnerSpaceFloorPlan,
     InnerSpaceInventoryDevice,
     InnerSpaceProject,
     InnerSpaceProjectIdentity,
 )
+
+from custom_components.unifi_insights import (
+    _SETUP_PROBE_ATTEMPTS,
+    CARRIER_FABRIC_PLATFORMS,
+    PLATFORMS,
+    SETUP_PROBE_RETRIES,
+    CarrierFabricData,
+    UnifiInsightsData,
+    _raise_for_setup_probes,
+    async_remove_config_entry_device,
+    async_unload_entry,
+)
 from custom_components.unifi_insights.const import (
+    CONF_CARRIER_ORG_ID,
+    CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_SITE_IDS,
+    CONF_TRACK_SUBSCRIBERS,
+    CONNECTION_TYPE_CARRIER_FABRIC,
     DOMAIN,
 )
+from custom_components.unifi_insights.data_transforms import (
+    owner_available,
+    site_section_available,
+)
 from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+from tests.fixtures.mobility_responses import (
+    OFFICE_ROUTER_ID,
+    WORKSPACE_ID,
+    serve_spec_examples,
+)
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+    from homeassistant.helpers.entity_registry import EntityRegistry
+    from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 
 
 async def test_setup_entry_success(
@@ -367,7 +382,7 @@ async def test_setup_entry_no_sites_found(
     # first; once the retries are used up it asks for reauth as before.
     assert mock_config_entry.state == ConfigEntryState.SETUP_RETRY
 
-    hass.data[DOMAIN]["setup_probe_attempts"][mock_config_entry.entry_id] = {
+    hass.data[_SETUP_PROBE_ATTEMPTS][mock_config_entry.entry_id] = {
         "inconclusive": SETUP_PROBE_RETRIES
     }
     await hass.config_entries.async_reload(mock_config_entry.entry_id)
@@ -619,27 +634,6 @@ def _device_entry(*identifiers: str) -> MagicMock:
     return device
 
 
-def _hold_an_entity(
-    hass: HomeAssistant, device: MagicMock, *, disabled: bool = False
-) -> MagicMock:
-    """Register the stub's device with one entity, as a live client device does."""
-    config_entry = MockConfigEntry(domain=DOMAIN)
-    config_entry.add_to_hass(hass)
-    real = dr.async_get(hass).async_get_or_create(
-        config_entry_id=config_entry.entry_id, identifiers=set(device.identifiers)
-    )
-    device.id = real.id
-    er.async_get(hass).async_get_or_create(
-        "device_tracker",
-        DOMAIN,
-        f"tracker-{real.id}",
-        config_entry=config_entry,
-        device_id=real.id,
-        disabled_by=er.RegistryEntryDisabler.USER if disabled else None,
-    )
-    return device
-
-
 def _entry_with_sites(
     available: dict[str, str],
     polled: list[str],
@@ -684,102 +678,11 @@ async def test_remove_config_entry_device_only_for_deselected_sites(
 ) -> None:
     """Devices of a site dropped from the filter can be removed; nothing else (#128)."""
     entry = _entry_with_sites({"default": "Default", "site2": "Branch"}, ["default"])
-    device = _hold_an_entity(hass, _device_entry(*identifiers))
 
-    assert await async_remove_config_entry_device(hass, entry, device) is expected
-
-
-def _client_device(
-    mac: str, name: str | None, name_by_user: str | None = None
-) -> MagicMock:
-    """Build a client device registry entry stub (cmcore fork, backlog 529)."""
-    device = _device_entry(f"client_{mac}")
-    device.name = name
-    device.name_by_user = name_by_user
-    return device
-
-
-@pytest.mark.parametrize(
-    ("mac", "name", "name_by_user", "expected"),
-    [
-        # randomized (locally administered) and unnamed: removable
-        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c0", None, True),
-        ("1e:fc:1f:19:57:7e", "", None, True),
-        ("be:cf:ed:fa:7a:1e", None, None, True),
-        # randomized but named, in UniFi or in Home Assistant: refused
-        ("a6:32:49:91:9b:c0", "Colin's Pixel", None, False),
-        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c0", "Kitchen tablet", False),
-        # a global (burned-in) MAC is never ephemeral, named or not
-        ("98:e2:55:40:0c:ad", "98:e2:55:40:0c:ad", None, False),
-    ],
-)
-async def test_remove_config_entry_device_for_ephemeral_client(
-    hass: HomeAssistant,
-    mac: str,
-    name: str | None,
-    name_by_user: str | None,
-    expected: bool,  # noqa: FBT001
-) -> None:
-    """The fork lets a randomized, unnamed client's device be deleted, nothing else."""
-    entry = _entry_with_sites({"default": "Default"}, ["default"])
-    device = _hold_an_entity(hass, _client_device(mac, name, name_by_user))
-
-    assert await async_remove_config_entry_device(hass, entry, device) is expected
-
-
-async def test_remove_config_entry_device_for_empty_client_device(
-    hass: HomeAssistant,
-) -> None:
-    """A client device that holds no entity can be deleted (cmcore, backlog 643)."""
-    entry = _entry_with_sites({"default": "Default"}, ["default"])
-    named = _client_device("98:e2:55:40:0c:ad", "Kitchen tablet")
-    named.id = "device-empty"
-
-    # the placeholder left behind once the client's tracker moved back to its uplink
-    assert await async_remove_config_entry_device(hass, entry, named) is True
-
-    # the same device while it holds the client's tracker, enabled or not
     assert (
-        await async_remove_config_entry_device(
-            hass, entry, _hold_an_entity(hass, named)
-        )
-        is False
+        await async_remove_config_entry_device(hass, entry, _device_entry(*identifiers))
+        is expected
     )
-    disabled = _hold_an_entity(
-        hass, _client_device("98:e2:55:40:0c:ae", "Hall tablet"), disabled=True
-    )
-    assert await async_remove_config_entry_device(hass, entry, disabled) is False
-
-    # an empty device that is not a client device is not covered by this rule
-    network = _device_entry("default_device-1")
-    network.id = "device-empty-network"
-    assert await async_remove_config_entry_device(hass, entry, network) is False
-
-
-@pytest.mark.parametrize(
-    "identifier",
-    [
-        "innerspace_dcba8527-f206-450a-87da-5691f873f9d9",
-        "innerspace_floor_plan_1cf17015-9d46-41f0-af10-e20646881ffc",
-    ],
-)
-async def test_remove_config_entry_device_for_innerspace_without_innerspace(
-    hass: HomeAssistant, identifier: str
-) -> None:
-    """An InnerSpace device of an entry without InnerSpace can go (cmcore, 1374)."""
-    entry = _entry_with_sites({"default": "Default"}, ["default"])
-    device = _hold_an_entity(hass, _device_entry(identifier))
-
-    # the entry reads InnerSpace: the device and its placement stay
-    assert await async_remove_config_entry_device(hass, entry, device) is False
-
-    # the entry set up without InnerSpace: nothing can update the device again
-    entry.runtime_data.innerspace_coordinator = None
-    assert await async_remove_config_entry_device(hass, entry, device) is True
-
-    # a device that is not InnerSpace's is not covered by this rule
-    network = _hold_an_entity(hass, _device_entry("default_device-1"))
-    assert await async_remove_config_entry_device(hass, entry, network) is False
 
 
 @pytest.mark.parametrize(
@@ -833,6 +736,173 @@ async def test_remove_config_entry_device_refuses_wifi_a_polled_site_serves(
         await async_remove_config_entry_device(
             hass, entry, _device_entry("wifi_wifi-main")
         )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("identifiers", "expected"),
+    [
+        # A site deleted on the console is in no site list at all.
+        (("gone_device-1",), True),
+        (("gone_site_device_1",), True),
+        (("site_gone",), True),
+        (("firewall_policies_gone",), True),
+        (("policy_based_routes_gone",), True),
+        (("vpn_clients_gone",), True),
+        # Deselected sites stay removable, polled sites stay live.
+        (("site2_device-1",), True),
+        (("default_device-1",), False),
+        (("site_default",), False),
+        # Other identifier families are not site-scoped.
+        (("protect_camera_cam-1",), False),
+        (("client_aa:bb:cc:dd:ee:ff",), False),
+        (("access_console_ns",), False),
+        (("innerspace_r1",), False),
+        (("mobility_router-1",), False),
+        (("carrier_subscriber_x",), False),
+        # The console device and identifiers without a site part.
+        (("controller-id",), False),
+        (("console-mac",), False),
+        (("gone_",), False),
+        # A merged device with a live or non-site identifier is kept.
+        (("gone_dev", "default_dev2"), False),
+        (("gone_dev", "protect_camera_x"), False),
+        # Identifiers of other integrations neither allow nor block.
+        (("gone_dev", ("other", "default_dev")), True),
+        ((("other", "gone_dev"),), False),
+    ],
+)
+async def test_remove_config_entry_device_of_a_deleted_site(
+    hass: HomeAssistant,
+    identifiers: tuple[str | tuple[str, str], ...],
+    expected: bool,  # noqa: FBT001
+) -> None:
+    """Devices of a site the console no longer lists can be removed (#394)."""
+    entry = _entry_with_sites({"default": "Default", "site2": "Branch"}, ["default"])
+    entry.unique_id = "controller-id"
+    entry.entry_id = "entry-1"
+    entry.runtime_data.mobility_coordinator.last_update_success = False
+    device = MagicMock()
+    device.identifiers = {
+        item if isinstance(item, tuple) else ("unifi_insights", item)
+        for item in identifiers
+    }
+
+    assert await async_remove_config_entry_device(hass, entry, device) is expected
+
+
+@pytest.mark.parametrize(
+    ("protect_data", "expected"),
+    [
+        # Protect still reports the camera or NVR merged into the device.
+        ({"cameras": {"cam-1": {"mac": "AA-BB-CC-DD-EE-FF"}}, "nvrs": {}}, False),
+        ({"cameras": {}, "nvrs": {"nvr-1": {"mac": "aa:bb:cc:dd:ee:ff"}}}, False),
+        # Protect no longer reports it.
+        ({"cameras": {"cam-2": {"mac": "11:22:33:44:55:66"}}, "nvrs": {}}, True),
+        ({"cameras": {"cam-1": "not-a-record"}, "nvrs": None}, True),
+        ({}, True),
+    ],
+)
+async def test_remove_config_entry_device_of_a_deleted_site_shared_with_protect(
+    hass: HomeAssistant,
+    protect_data: dict[str, Any],
+    expected: bool,  # noqa: FBT001
+) -> None:
+    """A deleted site's device that Protect still reports is kept (#394)."""
+    entry = _entry_with_sites({"default": "Default"}, ["default"])
+    entry.runtime_data.protect_coordinator.data = protect_data
+    entry.runtime_data.mobility_coordinator.last_update_success = False
+    device = _device_entry("gone_device-1")
+    device.connections = {
+        (dr.CONNECTION_NETWORK_MAC, "aa:bb:cc:dd:ee:ff"),
+        ("zigbee", "00:11"),
+    }
+
+    assert await async_remove_config_entry_device(hass, entry, device) is expected
+
+
+@pytest.mark.parametrize(
+    ("connections", "protect_coordinator"),
+    [
+        # A device without a MAC connection holds no Protect camera or NVR.
+        (set(), MagicMock(data={"cameras": {"c": {"mac": "aa:bb:cc:dd:ee:ff"}}})),
+        # An entry without Protect has nothing to keep alive.
+        ({(dr.CONNECTION_NETWORK_MAC, "aa:bb:cc:dd:ee:ff")}, None),
+    ],
+    ids=["no-mac", "no-protect"],
+)
+async def test_remove_config_entry_device_of_a_deleted_site_without_protect_link(
+    hass: HomeAssistant,
+    connections: set[tuple[str, str]],
+    protect_coordinator: MagicMock | None,
+) -> None:
+    """Without a MAC or a Protect coordinator the deleted site rule applies."""
+    entry = _entry_with_sites({"default": "Default"}, ["default"])
+    entry.runtime_data.mobility_coordinator.last_update_success = False
+    entry.runtime_data.protect_coordinator = protect_coordinator
+    device = _device_entry("gone_device-1")
+    device.connections = connections
+
+    assert await async_remove_config_entry_device(hass, entry, device) is True
+
+
+@pytest.mark.parametrize(
+    ("unique_id", "entry_id", "identifier"),
+    [
+        ("console_mac", "entry-1", "console_mac"),
+        ("console-mac", "entry_1", "entry_1"),
+    ],
+)
+async def test_remove_config_entry_device_refuses_the_console_of_a_deleted_site(
+    hass: HomeAssistant,
+    unique_id: str,
+    entry_id: str,
+    identifier: str,
+) -> None:
+    """A console id shaped like ``{site}_{device}`` is not a deleted site's (#394)."""
+    entry = _entry_with_sites({"default": "Default"}, ["default"])
+    entry.unique_id = unique_id
+    entry.entry_id = entry_id
+    entry.runtime_data.mobility_coordinator.last_update_success = False
+
+    assert (
+        await async_remove_config_entry_device(hass, entry, _device_entry(identifier))
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("available", "last_update_success"),
+    [({}, True), ({"default": "Default"}, False)],
+    ids=["no-site-listed", "refresh-failed"],
+)
+async def test_remove_config_entry_device_needs_a_site_list_to_trust(
+    hass: HomeAssistant,
+    available: dict[str, str],
+    last_update_success: bool,  # noqa: FBT001
+) -> None:
+    """An empty site list or a failed refresh proves no site was deleted."""
+    entry = _entry_with_sites(
+        available, ["default"], last_update_success=last_update_success
+    )
+
+    assert (
+        await async_remove_config_entry_device(
+            hass, entry, _device_entry("gone_device-1")
+        )
+        is False
+    )
+
+
+async def test_remove_config_entry_device_refuses_a_prefix_of_a_polled_site(
+    hass: HomeAssistant,
+) -> None:
+    """A device of polled site ``a_b`` is not taken for one of a site ``a``."""
+    entry = _entry_with_sites({"a_b": "A B"}, ["a_b"])
+
+    assert (
+        await async_remove_config_entry_device(hass, entry, _device_entry("a_b_dev"))
         is False
     )
 
@@ -1009,31 +1079,31 @@ async def test_failed_wifi_refresh_marks_wifi_unavailable(
     )
     await config_coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert facade.wifi_available("default") is False
-    assert facade.firewall_available("default") is True
-    assert facade.config_available is True
-    assert facade.device_available is True
+    assert site_section_available(facade.data, "default", "wifi") is False
+    assert site_section_available(facade.data, "default", "firewall_rules") is True
+    assert owner_available(facade.data, "config") is True
+    assert owner_available(facade.data, "device") is True
 
     mock_network_client.wifi.get_all = AsyncMock(return_value=[])
     await config_coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert facade.wifi_available("default") is True
+    assert site_section_available(facade.data, "default", "wifi") is True
 
 
 @pytest.mark.parametrize(
-    ("namespace", "method", "error", "flag"),
+    ("namespace", "method", "error", "section"),
     [
         (
             "firewall",
             "list_rules",
             UniFiResponseError("Bad gateway", status_code=502),
-            "firewall_available",
+            "firewall_rules",
         ),
         (
             "wifi",
             "get_all",
             UniFiConnectionError("Connection reset"),
-            "wifi_available",
+            "wifi",
         ),
     ],
     ids=["firewall-502", "wifi-connection"],
@@ -1049,7 +1119,7 @@ async def test_optional_section_failure_does_not_block_setup(
     namespace: str,
     method: str,
     error: Exception,
-    flag: str,
+    section: str,
 ) -> None:
     """A WiFi/firewall outage at startup loads the entry, flagging only it."""
     mock_network_client.sites.get_all.return_value = [{"id": "default"}]
@@ -1063,8 +1133,8 @@ async def test_optional_section_failure_does_not_block_setup(
 
     assert mock_config_entry.state == ConfigEntryState.LOADED
     facade = mock_config_entry.runtime_data.coordinator
-    assert getattr(facade, flag)("default") is False
-    assert facade.config_available is True
+    assert site_section_available(facade.data, "default", section) is False
+    assert owner_available(facade.data, "config") is True
 
 
 async def test_site_forbidden_at_setup_does_not_start_reauth(
@@ -1133,7 +1203,14 @@ _SITES = [{"id": "default", "name": "Default"}]
             False,
         ),
         # Network-only console: Protect answers without an NVR.
-        (_SITES, [], ValueError("NVR not found"), "loaded", False, False),
+        (
+            _SITES,
+            [],
+            UniFiNotFoundError("NVR not found", status_code=200),
+            "loaded",
+            False,
+            False,
+        ),
         # Protect-only console with an NVR and no cameras yet.
         (
             UniFiResponseError("HTML page", status_code=200),
@@ -1258,7 +1335,7 @@ async def test_setup_probe_retries_then_loads_available_application(
             _raise_for_setup_probes(hass, "entry", network, protect)
 
     _raise_for_setup_probes(hass, "entry", network, protect)
-    assert "entry" not in hass.data[DOMAIN]["setup_probe_attempts"]
+    assert "entry" not in hass.data[_SETUP_PROBE_ATTEMPTS]
 
 
 async def test_setup_probe_unreachable_console_always_retries(
@@ -1295,9 +1372,7 @@ async def test_setup_probe_rejected_key_reauths_immediately(
     hass: HomeAssistant,
 ) -> None:
     """A 401 with nothing usable goes straight to reauth and clears the count."""
-    hass.data.setdefault(DOMAIN, {})["setup_probe_attempts"] = {
-        "entry": {"inconclusive": 2, "partial": 1}
-    }
+    hass.data[_SETUP_PROBE_ATTEMPTS] = {"entry": {"inconclusive": 2, "partial": 1}}
     network = _probe(
         ProbeStatus.AUTH_FAILED, UniFiAuthenticationError("x", status_code=401)
     )
@@ -1305,7 +1380,7 @@ async def test_setup_probe_rejected_key_reauths_immediately(
     with pytest.raises(ConfigEntryAuthFailed):
         _raise_for_setup_probes(hass, "entry", network, _probe(ProbeStatus.UNSUPPORTED))
 
-    assert "entry" not in hass.data[DOMAIN]["setup_probe_attempts"]
+    assert "entry" not in hass.data[_SETUP_PROBE_ATTEMPTS]
 
 
 @pytest.mark.parametrize(
@@ -1358,7 +1433,7 @@ async def test_unload_and_remove_clear_retry_budget(
     hass: HomeAssistant, init_integration: MockConfigEntry
 ) -> None:
     """Unloading or deleting an entry forgets its setup retry budget."""
-    attempts = hass.data.setdefault(DOMAIN, {}).setdefault("setup_probe_attempts", {})
+    attempts = hass.data.setdefault(_SETUP_PROBE_ATTEMPTS, {})
     entry_id = init_integration.entry_id
 
     attempts[entry_id] = {"inconclusive": 2}
@@ -1411,320 +1486,6 @@ async def test_setup_entry_innerspace_only_console(
 
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
     mock_innerspace_client.close.assert_awaited()
-
-
-# ---- cmcore (backlog 648, carried into v2026.10.2 by 1015): fork site rows ----------
-SITE = "88f7af54-98f8-306a-a1c7-c9349722b1f6"  # every console's default site id
-CMCORE_NS = "e0:63:da:88:c0:bb"  # a local entry's console id: its MAC
-CMCORE_GW = "e0:63:da:88:c0:bb"  # the live CMCoreUDMP rows carry the MAC here too
-OFFSITE_CONSOLE_ID = "D021F96BFF0F0000000000000000:1234567"  # a cloud console id
-OFFSITE_NS = OFFSITE_CONSOLE_ID.lower()
-OFFSITE_GW = "b7f61bd0-0093-3616-bef4-a1acb2ad59f7"  # a v1 gateway device id
-
-
-def _fork_console(
-    hass: HomeAssistant, entry_id: str, console_id: str | None
-) -> MockConfigEntry:
-    """Register a config entry the way each console's entry is stored."""
-    data: dict[str, Any] = {CONF_API_KEY: "synthetic_credential"}
-    if console_id is not None:
-        data[CONF_CONSOLE_ID] = console_id
-    entry = MockConfigEntry(
-        domain=DOMAIN, data=data, entry_id=entry_id, title=f"console {entry_id}"
-    )
-    entry.add_to_hass(hass)
-    return entry
-
-
-def _fork_row(
-    reg: EntityRegistry,
-    entry: MockConfigEntry,
-    unique_id: str,
-    key: str | None,
-    object_id: str,
-) -> er.RegistryEntry:
-    """Create a registry row as the fork's site-level sensors left it."""
-    return reg.async_get_or_create(
-        "sensor",
-        DOMAIN,
-        unique_id,
-        config_entry=entry,
-        translation_key=key,
-        suggested_object_id=object_id,
-    )
-
-
-async def test_fork_site_rows_move_to_console_scoped_ids(hass: HomeAssistant) -> None:
-    """
-    Each entry moves its own gateway-keyed rows to `<namespace>_<site>_<key>`.
-
-    v2026.9.10-cmcore.5 keyed the site-level sensors `<site>_<gateway>_<key>`;
-    upstream v2026.10.2 keys them by the console namespace and migrates only
-    `<site>_<key>`. The rows keep their entity_id, so history and dashboards
-    stay, and a row another console owns is left for that console's entry.
-    """
-    reg = er.async_get(hass)
-    cmcore = _fork_console(hass, "cmcore", CMCORE_NS)
-    offsite = _fork_console(hass, "offsite", OFFSITE_CONSOLE_ID)
-    total = _fork_row(
-        reg,
-        cmcore,
-        f"{SITE}_{CMCORE_GW}_site_total_clients",
-        "site_total_clients",
-        "network_cmcoreudmp_total_clients",
-    )
-    download = _fork_row(
-        reg,
-        cmcore,
-        f"{SITE}_{CMCORE_GW}_internet_download_1h",
-        "internet_download_1h",
-        "network_cmcoreudmp_internet_download_last_hour",
-    )
-    offsite_total = _fork_row(
-        reg,
-        offsite,
-        f"{SITE}_{OFFSITE_GW}_site_total_clients",
-        "site_total_clients",
-        "offsite_chipcityudmp_total_clients",
-    )
-
-    assert _migrate_fork_site_unique_ids(hass, cmcore) == 2
-    moved = reg.async_get(total.entity_id)
-    assert moved.unique_id == f"{CMCORE_NS}_{SITE}_site_total_clients"
-    assert moved.entity_id == "sensor.network_cmcoreudmp_total_clients"
-    assert moved.config_entry_id == cmcore.entry_id
-    assert (
-        reg.async_get(download.entity_id).unique_id
-        == f"{CMCORE_NS}_{SITE}_internet_download_1h"
-    )
-    # the offsite console's row is its own entry's to move
-    assert (
-        reg.async_get(offsite_total.entity_id).unique_id
-        == f"{SITE}_{OFFSITE_GW}_site_total_clients"
-    )
-
-    assert _migrate_fork_site_unique_ids(hass, offsite) == 1
-    assert (
-        reg.async_get(offsite_total.entity_id).unique_id
-        == f"{OFFSITE_NS}_{SITE}_site_total_clients"
-    )
-    # a second run moves nothing
-    assert _migrate_fork_site_unique_ids(hass, cmcore) == 0
-    assert _migrate_fork_site_unique_ids(hass, offsite) == 0
-    assert len(reg.entities) == 3
-
-
-async def test_fork_site_migration_leaves_every_other_row(
-    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Only an owned, gateway-keyed site row with a free target moves."""
-    reg = er.async_get(hass)
-    entry = _fork_console(hass, "cmcore", CMCORE_NS)
-    rows = {
-        # upstream migrates its own legacy shape itself
-        "legacy": _fork_row(
-            reg, entry, f"{SITE}_site_wired_clients", "site_wired_clients", "legacy"
-        ),
-        # a gateway's own per-device sensor has the same shape and another key
-        "device": _fork_row(
-            reg, entry, f"{SITE}_{CMCORE_GW}_wired_clients", "wired_clients", "device"
-        ),
-        # no translation key: not provably a site sensor
-        "no_key": _fork_row(
-            reg, entry, f"{SITE}_{CMCORE_GW}_site_wireless_clients", None, "no_key"
-        ),
-        # already console-scoped
-        "upstream": _fork_row(
-            reg,
-            entry,
-            f"{CMCORE_NS}_{SITE}_internet_upload_1h",
-            "internet_upload_1h",
-            "upstream",
-        ),
-        # not a site id in front of the gateway
-        "not_site": _fork_row(
-            reg,
-            entry,
-            f"site_shared_{CMCORE_GW}_internet_upload_1d",
-            "internet_upload_1d",
-            "not_site",
-        ),
-        # the gateway part may not hold another separator
-        "two_parts": _fork_row(
-            reg,
-            entry,
-            f"{SITE}_a_b_internet_download_1d",
-            "internet_download_1d",
-            "two_parts",
-        ),
-        # its key is not the end of its unique id
-        "other_ending": _fork_row(
-            reg,
-            entry,
-            f"{SITE}_{CMCORE_GW}_site_total_clients_old",
-            "site_total_clients",
-            "other_ending",
-        ),
-    }
-    # its target is already registered
-    rows["occupied"] = _fork_row(
-        reg,
-        entry,
-        f"{SITE}_{CMCORE_GW}_internet_download_1w",
-        "internet_download_1w",
-        "occupied",
-    )
-    _fork_row(
-        reg,
-        entry,
-        f"{CMCORE_NS}_{SITE}_internet_download_1w",
-        "internet_download_1w",
-        "occupied_target",
-    )
-    # a legacy row of the same key exists: upstream's own migration takes that one
-    rows["legacy_twin"] = _fork_row(
-        reg,
-        entry,
-        f"{SITE}_{CMCORE_GW}_site_wired_clients",
-        "site_wired_clients",
-        "legacy_twin",
-    )
-    before = {name: row.unique_id for name, row in rows.items()}
-
-    assert _migrate_fork_site_unique_ids(hass, entry) == 0
-    assert {
-        name: reg.async_get(row.entity_id).unique_id for name, row in rows.items()
-    } == before
-    assert "sensor.occupied" in caplog.text
-    assert "sensor.legacy_twin" in caplog.text
-
-
-async def test_fork_site_migration_needs_a_namespace(hass: HomeAssistant) -> None:
-    """An entry with no console id yet keeps its rows until it has one."""
-    reg = er.async_get(hass)
-    entry = _fork_console(hass, "cmcore", None)
-    row = _fork_row(
-        reg,
-        entry,
-        f"{SITE}_{CMCORE_GW}_site_total_clients",
-        "site_total_clients",
-        "network_cmcoreudmp_total_clients",
-    )
-    assert _migrate_fork_site_unique_ids(hass, entry) == 0
-    assert reg.async_get(row.entity_id).unique_id == row.unique_id
-
-
-async def test_fork_site_migration_survives_a_registry_refusal(
-    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A row the registry refuses to move is left, and the others still move."""
-    reg = er.async_get(hass)
-    entry = _fork_console(hass, "cmcore", CMCORE_NS)
-    first = _fork_row(
-        reg,
-        entry,
-        f"{SITE}_{CMCORE_GW}_site_total_clients",
-        "site_total_clients",
-        "first",
-    )
-    second = _fork_row(
-        reg,
-        entry,
-        f"{SITE}_{CMCORE_GW}_site_wired_clients",
-        "site_wired_clients",
-        "second",
-    )
-    real_update = reg.async_update_entity
-
-    def _refuse_first(entity_id: str, **kwargs: Any) -> er.RegistryEntry:
-        if entity_id == first.entity_id:
-            msg = "refused"
-            raise ValueError(msg)
-        return real_update(entity_id, **kwargs)
-
-    with patch.object(reg, "async_update_entity", side_effect=_refuse_first):
-        assert _migrate_fork_site_unique_ids(hass, entry) == 1
-    assert reg.async_get(first.entity_id).unique_id == first.unique_id
-    assert (
-        reg.async_get(second.entity_id).unique_id
-        == f"{CMCORE_NS}_{SITE}_site_wired_clients"
-    )
-    assert "Could not move sensor.first" in caplog.text
-
-
-async def test_fork_site_rows_are_the_rows_upstream_sensors_use(
-    hass: HomeAssistant, mock_coordinator: MagicMock
-) -> None:
-    """
-    After the move, the site sensors build on the existing rows: no new row.
-
-    The proof that the merge keeps the live entity_ids: every site-level sensor
-    the platform creates resolves to a moved row, and the dashboard lookup of
-    the internet-activity sensors finds the same entity_ids.
-    """
-    from types import SimpleNamespace  # noqa: PLC0415
-
-    from custom_components.unifi_insights import (  # noqa: PLC0415
-        sensor as sensor_platform,
-    )
-    from custom_components.unifi_insights.internet_activity_snapshot import (  # noqa: PLC0415
-        _resolve_entity_ids,
-    )
-    from custom_components.unifi_insights.sensor import (  # noqa: PLC0415
-        SITE_CLIENT_SENSOR_TYPES,
-    )
-    from custom_components.unifi_insights.site_internet_activity_sensor import (  # noqa: PLC0415
-        SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
-    )
-
-    reg = er.async_get(hass)
-    entry = _fork_console(hass, "cmcore", CMCORE_NS)
-    keys = [d.key for d in SITE_CLIENT_SENSOR_TYPES] + [
-        d.key for d in SITE_INTERNET_ACTIVITY_SENSOR_TYPES
-    ]
-    entity_ids = {
-        key: _fork_row(
-            reg, entry, f"{SITE}_{CMCORE_GW}_{key}", key, f"network_cmcoreudmp_{key}"
-        ).entity_id
-        for key in keys
-    }
-    assert _migrate_fork_site_unique_ids(hass, entry) == len(keys) == 11
-
-    mock_coordinator.protect_client = None
-    mock_coordinator.data = {
-        "sites": {SITE: {"id": SITE, "name": "Default"}},
-        "clients": {SITE: {}},
-        "internet_activity": {
-            SITE: {
-                window: {"rx_bytes": 1, "tx_bytes": 2}
-                for window in ("1h", "1d", "1w", "1m")
-            }
-        },
-    }
-    mock_coordinator.hass = hass
-    entry.runtime_data = SimpleNamespace(
-        coordinator=mock_coordinator, mobility_coordinator=None
-    )
-    entities: list[Any] = []
-    await sensor_platform.async_setup_entry(hass, entry, entities.extend)
-
-    site_entities = {
-        entity.translation_key: entity
-        for entity in entities
-        if entity.translation_key in entity_ids
-    }
-    assert set(site_entities) == set(keys)
-    for key, entity in site_entities.items():
-        assert entity.unique_id == f"{CMCORE_NS}_{SITE}_{key}"
-        row_entity_id = reg.async_get_entity_id("sensor", DOMAIN, entity.unique_id)
-        assert row_entity_id == entity_ids[key]
-    assert len(reg.entities) == len(keys)
-    activity = _resolve_entity_ids(
-        reg, site_id=SITE, entry_id=entry.entry_id, namespace=CMCORE_NS
-    )
-    assert sorted(activity.values()) == sorted(
-        entity_ids[d.key] for d in SITE_INTERNET_ACTIVITY_SENSOR_TYPES
-    )
 
 
 def test_platforms_include_media_player() -> None:
@@ -1804,3 +1565,657 @@ async def test_unload_entry_platform_unload_fails_keeps_clients_open(
     # Clean up entry cleanly
     assert await hass.config_entries.async_unload(init_integration.entry_id)
     await hass.async_block_till_done()
+
+
+# --- Carrier Fabric lifecycle ------------------------------------------------
+
+# Tests for UniFi Carrier Fabric integration setup, unload, and lifecycle.
+
+
+@pytest.fixture
+def carrier_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """Create a mock Carrier Fabric config entry."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Carrier Fabric",
+        unique_id="carrier_org_test123",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_CARRIER_FABRIC,
+            CONF_API_KEY: "isp_secret_key",
+            CONF_CARRIER_ORG_ID: "org_test123",
+        },
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_setup_and_unload_success(
+    hass: HomeAssistant, carrier_entry: MockConfigEntry
+) -> None:
+    """Test full setup, platform forwarding, and unload sequence."""
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.service_plans = MagicMock()
+    mock_client.service_plans.get_all = AsyncMock(return_value=[])
+    mock_client.subscribers = MagicMock()
+    mock_client.subscribers.get_all = AsyncMock(return_value=[])
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.AVAILABLE,
+                org_id="org_test123",
+            ),
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ) as mock_forward,
+    ):
+        assert await hass.config_entries.async_setup(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert carrier_entry.state == ConfigEntryState.LOADED
+        assert isinstance(carrier_entry.runtime_data, CarrierFabricData)
+        assert carrier_entry.runtime_data.client is mock_client
+
+        # Verify only Platform.SENSOR was forwarded
+        mock_forward.assert_called_once_with(carrier_entry, [Platform.SENSOR])
+
+        # Test unload
+        assert await hass.config_entries.async_unload(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert carrier_entry.state == ConfigEntryState.NOT_LOADED
+        mock_client.close.assert_awaited_once()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_setup_probe_auth_failed(
+    hass: HomeAssistant, carrier_entry: MockConfigEntry
+) -> None:
+    """Test setup raises ConfigEntryAuthFailed when probe reports AUTH_FAILED."""
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.AUTH_FAILED,
+                error=Exception("401 unauthorized"),
+            ),
+        ),
+    ):
+        await hass.config_entries.async_setup(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert carrier_entry.state == ConfigEntryState.SETUP_ERROR
+        # ConfigEntryAuthFailed, not any setup error: reauthentication starts.
+        assert any(
+            flow["context"].get("source") == "reauth"
+            and flow["context"].get("entry_id") == carrier_entry.entry_id
+            for flow in hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        )
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_setup_probe_unreachable(
+    hass: HomeAssistant, carrier_entry: MockConfigEntry
+) -> None:
+    """Test setup raises ConfigEntryNotReady when probe reports UNREACHABLE."""
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.UNREACHABLE,
+                error=Exception("Connection refused"),
+            ),
+        ),
+    ):
+        await hass.config_entries.async_setup(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert carrier_entry.state == ConfigEntryState.SETUP_RETRY
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_setup_first_refresh_failure_closes_client(
+    hass, carrier_entry
+):
+    """Test client is closed when coordinator first refresh fails during setup."""
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.service_plans = MagicMock()
+    mock_client.service_plans.get_all = AsyncMock(
+        side_effect=Exception("Failed to load plans")
+    )
+    mock_client.subscribers = MagicMock()
+    mock_client.subscribers.get_all = AsyncMock(return_value=[])
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.AVAILABLE,
+                org_id="org_test123",
+            ),
+        ),
+    ):
+        await hass.config_entries.async_setup(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert carrier_entry.state == ConfigEntryState.SETUP_RETRY
+        mock_client.close.assert_awaited()
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_options_update_listener(
+    hass: HomeAssistant, carrier_entry: MockConfigEntry
+) -> None:
+    """Test updating options triggers reload of entry."""
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.service_plans = MagicMock()
+    mock_client.service_plans.get_all = AsyncMock(return_value=[])
+    mock_client.subscribers = MagicMock()
+    mock_client.subscribers.get_all = AsyncMock(return_value=[])
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.AVAILABLE,
+                org_id="org_test123",
+            ),
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        assert await hass.config_entries.async_setup(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        with patch.object(
+            hass.config_entries, "async_reload", new_callable=AsyncMock
+        ) as mock_reload:
+            hass.config_entries.async_update_entry(
+                carrier_entry,
+                options={CONF_TRACK_SUBSCRIBERS: True},
+            )
+            await hass.async_block_till_done()
+            mock_reload.assert_called_once_with(carrier_entry.entry_id)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_device_removal(
+    hass: HomeAssistant, carrier_entry: MockConfigEntry
+) -> None:
+    """Test device removal rules for Carrier Fabric."""
+    mock_coordinator = MagicMock()
+    mock_coordinator.data = {
+        "subscribers": {
+            "sub_active_1": {"id": "sub_active_1", "name": "Active 1"},
+        }
+    }
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+
+    carrier_entry.runtime_data = CarrierFabricData(
+        client=mock_client,
+        coordinator=mock_coordinator,
+    )
+
+    # 1. Organization device (refuse removal)
+    dev_reg = dr.async_get(hass)
+    org_device = dev_reg.async_get_or_create(
+        config_entry_id=carrier_entry.entry_id,
+        identifiers={(DOMAIN, carrier_entry.unique_id)},
+    )
+    assert not await async_remove_config_entry_device(hass, carrier_entry, org_device)
+
+    # 2. Subscriber device still in coordinator data (refuse removal)
+    active_sub_device = dev_reg.async_get_or_create(
+        config_entry_id=carrier_entry.entry_id,
+        identifiers={(DOMAIN, "carrier_subscriber_sub_active_1")},
+    )
+    assert not await async_remove_config_entry_device(
+        hass, carrier_entry, active_sub_device
+    )
+
+    # 3. Subscriber device no longer in coordinator data (allow removal)
+    stale_sub_device = dev_reg.async_get_or_create(
+        config_entry_id=carrier_entry.entry_id,
+        identifiers={(DOMAIN, "carrier_subscriber_sub_removed_2")},
+    )
+    assert await async_remove_config_entry_device(hass, carrier_entry, stale_sub_device)
+
+    # 4. Unknown device identifier format (refuse removal)
+    other_device = dev_reg.async_get_or_create(
+        config_entry_id=carrier_entry.entry_id,
+        identifiers={(DOMAIN, "some_unknown_device_id")},
+    )
+    assert not await async_remove_config_entry_device(hass, carrier_entry, other_device)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_device_removal_ignores_other_integrations_identifiers(
+    hass, carrier_entry
+):
+    """Identifiers of other integrations on a shared device are never ours to judge."""
+    mock_coordinator = MagicMock()
+    mock_coordinator.data = {"subscribers": {}}
+    carrier_entry.runtime_data = CarrierFabricData(
+        client=MagicMock(), coordinator=mock_coordinator
+    )
+    dev_reg = dr.async_get(hass)
+
+    # A device only another integration identifies is refused, not removed.
+    foreign_only = dev_reg.async_get_or_create(
+        config_entry_id=carrier_entry.entry_id,
+        identifiers={("other_integration", "carrier_subscriber_sub_gone")},
+    )
+    assert not await async_remove_config_entry_device(hass, carrier_entry, foreign_only)
+
+    # A stale subscriber device that another integration also identifies is still
+    # removable, whichever identifier is looked at first.
+    shared_stale = dev_reg.async_get_or_create(
+        config_entry_id=carrier_entry.entry_id,
+        identifiers={
+            ("other_integration", "some_serial"),
+            (DOMAIN, "carrier_subscriber_sub_gone"),
+        },
+    )
+    assert await async_remove_config_entry_device(hass, carrier_entry, shared_stale)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_setup_backfills_missing_org_id_from_probe(
+    hass,
+):
+    """An entry stored without an organisation learns it from the setup probe."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="UniFi Carrier Fabric",
+        unique_id="carrier_key_abc123",
+        data={
+            CONF_CONNECTION_TYPE: CONNECTION_TYPE_CARRIER_FABRIC,
+            CONF_API_KEY: "isp_secret_key",
+            CONF_CARRIER_ORG_ID: None,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+    mock_client.service_plans = MagicMock()
+    mock_client.service_plans.get_all = AsyncMock(return_value=[])
+    mock_client.subscribers = MagicMock()
+    mock_client.subscribers.get_all = AsyncMock(return_value=[])
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.AVAILABLE,
+                org_id="org_discovered",
+            ),
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+            new_callable=AsyncMock,
+        ),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.state == ConfigEntryState.LOADED
+    assert entry.data[CONF_CARRIER_ORG_ID] == "org_discovered"
+    assert entry.data[CONF_API_KEY] == "isp_secret_key"
+    assert entry.data[CONF_CONNECTION_TYPE] == CONNECTION_TYPE_CARRIER_FABRIC
+    # The coordinator resolves the same organisation from the updated entry.
+    assert entry.runtime_data.coordinator.data["org_id"] == "org_discovered"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_setup_probe_unsupported(
+    hass: HomeAssistant, carrier_entry: MockConfigEntry
+) -> None:
+    """Test setup raises ConfigEntryNotReady when probe reports UNSUPPORTED."""
+    mock_client = MagicMock()
+    mock_client.close = AsyncMock()
+
+    with (
+        patch(
+            "custom_components.unifi_insights.UniFiCarrierFabricClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.unifi_insights.async_probe_carrier_fabric",
+            return_value=ProbeResult(
+                status=ProbeStatus.UNSUPPORTED,
+                error=Exception("Unsupported API endpoint"),
+            ),
+        ),
+    ):
+        await hass.config_entries.async_setup(carrier_entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert carrier_entry.state == ConfigEntryState.SETUP_RETRY
+        # A 4xx is not an outage: the retry reason names the real probe status.
+        assert carrier_entry.reason is not None
+        assert "probe failed (unsupported)" in carrier_entry.reason
+        assert "unreachable" not in carrier_entry.reason
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_carrier_fabric_unload_with_connection_type_in_entry_data(
+    hass, carrier_entry
+):
+    """Test unload uses CARRIER_FABRIC_PLATFORMS even when runtime_data is None (B3)."""
+    carrier_entry.runtime_data = None
+    with patch(
+        "homeassistant.config_entries.ConfigEntries.async_unload_platforms",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as mock_unload:
+        assert await async_unload_entry(hass, carrier_entry)
+        mock_unload.assert_called_once_with(carrier_entry, CARRIER_FABRIC_PLATFORMS)
+
+
+# --- Mobility setup ----------------------------------------------------------
+
+# Tests for setting up UniFi Mobility on remote config entries.
+
+
+def _remote_entry(entry_id: str, console_id: str = "console") -> MockConfigEntry:
+    """Return a remote (cloud) entry using the shared test API key."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "connection_type": "remote",
+            "console_id": console_id,
+            "api_key": "cloud-key",
+        },
+        unique_id=console_id,
+        entry_id=entry_id,
+    )
+
+
+async def _setup_mobility(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Set up an entry and wait for its background Mobility refresh."""
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_key_without_mobility_scope_loads_without_reauth(
+    hass: HomeAssistant, mock_mobility_client: MagicMock
+) -> None:
+    """A 403 from Mobility leaves the remote entry working and asks nothing."""
+    mock_mobility_client.list_workspaces.side_effect = UniFiAuthenticationError(
+        "Access forbidden", status_code=403
+    )
+    entry = _remote_entry("01REMOTE")
+
+    await _setup_mobility(hass, entry)
+
+    assert entry.state is ConfigEntryState.LOADED
+    coordinator = entry.runtime_data.mobility_coordinator
+    assert coordinator is not None
+    assert coordinator.data["access"] == "denied"
+    assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    mock_mobility_client.close.assert_awaited_once()
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_local_entry_never_uses_mobility(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+    mock_mobility_client: MagicMock,
+) -> None:
+    """Console-local keys cannot reach the cloud Mobility API."""
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert init_integration.runtime_data.mobility_coordinator is None
+    mock_mobility_client.list_workspaces.assert_not_awaited()
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_only_one_remote_entry_per_key_polls_mobility(
+    hass: HomeAssistant, mock_mobility_client: MagicMock
+) -> None:
+    """Two consoles behind one cloud key share a single Mobility poller."""
+    serve_spec_examples(mock_mobility_client)
+    owner = _remote_entry("01A", "console-a")
+    second = _remote_entry("01B", "console-b")
+    second.add_to_hass(hass)
+
+    # Setting up the integration loads every entry of the domain.
+    await _setup_mobility(hass, owner)
+
+    assert second.state is ConfigEntryState.LOADED
+    assert owner.runtime_data.mobility_coordinator is not None
+    assert second.runtime_data.mobility_coordinator is None
+    mock_mobility_client.list_workspaces.assert_awaited_once()
+
+
+def _device(identifier: str) -> Any:
+    """Return a device registry entry stand-in with one identifier."""
+    return MagicMock(identifiers={(DOMAIN, identifier)})
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_mobility_devices_are_removable_only_once_confirmed_gone(
+    hass: HomeAssistant, mock_mobility_client: MagicMock
+) -> None:
+    """A router or workspace can be deleted once Mobility no longer reports it."""
+    serve_spec_examples(mock_mobility_client)
+    entry = _remote_entry("01REMOTE")
+    await _setup_mobility(hass, entry)
+    coordinator = entry.runtime_data.mobility_coordinator
+    gone_router = _device("mobility_00000000-0000-0000-0000-000000000000")
+    gone_workspace = _device("mobility_workspace_00000000-0000-0000-0000-00000000")
+
+    assert not await async_remove_config_entry_device(
+        hass, entry, _device(f"mobility_{OFFICE_ROUTER_ID}")
+    )
+    assert not await async_remove_config_entry_device(
+        hass, entry, _device(f"mobility_workspace_{WORKSPACE_ID}")
+    )
+    assert await async_remove_config_entry_device(hass, entry, gone_router)
+    assert await async_remove_config_entry_device(hass, entry, gone_workspace)
+
+    # A failed poll proves nothing about what Mobility still has.
+    coordinator.last_update_success = False
+    assert not await async_remove_config_entry_device(hass, entry, gone_router)
+
+    # Nor does a coordinator that has not answered yet.
+    coordinator.last_update_success = True
+    coordinator.data = {**coordinator.data, "access": "unknown", "devices": {}}
+    assert not await async_remove_config_entry_device(hass, entry, gone_router)
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_mobility_devices_are_removable_from_a_non_owner_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Devices left behind on an entry that no longer owns Mobility can go."""
+    owner = _remote_entry("01A", "console-a")
+    second = _remote_entry("01B", "console-b")
+    second.add_to_hass(hass)
+    await _setup_mobility(hass, owner)
+
+    assert second.runtime_data.mobility_coordinator is None
+    assert await async_remove_config_entry_device(
+        hass, second, _device(f"mobility_{OFFICE_ROUTER_ID}")
+    )
+
+
+def _mobility_owners(hass: HomeAssistant) -> dict[str, list[str]]:
+    """Map each Mobility unique id to the entries its registry rows belong to."""
+    owners: dict[str, list[str]] = {}
+    for entity in er.async_get(hass).entities.values():
+        if entity.platform == DOMAIN and entity.unique_id.startswith("mobility_"):
+            owners.setdefault(entity.unique_id, []).append(entity.config_entry_id or "")
+    return owners
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_re_enabled_older_entry_does_not_duplicate_mobility(
+    hass: HomeAssistant,
+    mock_mobility_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The entry already polling Mobility keeps it when an older one comes back."""
+    serve_spec_examples(mock_mobility_client)
+    older = _remote_entry("01A", "console-a")
+    older.disabled_by = ConfigEntryDisabler.USER
+    newer = _remote_entry("01B", "console-b")
+    older.add_to_hass(hass)
+    await _setup_mobility(hass, newer)
+    assert newer.runtime_data.mobility_coordinator is not None
+
+    await hass.config_entries.async_set_disabled_by(older.entry_id, None)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert older.state is ConfigEntryState.LOADED
+    assert older.runtime_data.mobility_coordinator is None
+    assert newer.runtime_data.mobility_coordinator is not None
+    assert "does not generate unique IDs" not in caplog.text
+    assert mock_mobility_client.list_workspaces.await_count == 1
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+@pytest.mark.parametrize("leave", ["disable", "remove"])
+async def test_mobility_moves_to_the_next_entry_when_the_owner_leaves(
+    hass: HomeAssistant,
+    mock_mobility_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    leave: str,
+) -> None:
+    """Disabling or deleting the owner hands Mobility to the next entry."""
+    serve_spec_examples(mock_mobility_client)
+    owner = _remote_entry("01A", "console-a")
+    successor = _remote_entry("01B", "console-b")
+    successor.add_to_hass(hass)
+    await _setup_mobility(hass, owner)
+    owned = _mobility_owners(hass)
+    assert owned
+    assert {tuple(entries) for entries in owned.values()} == {(owner.entry_id,)}
+
+    if leave == "disable":
+        await hass.config_entries.async_set_disabled_by(
+            owner.entry_id, ConfigEntryDisabler.USER
+        )
+    else:
+        await hass.config_entries.async_remove(owner.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert successor.state is ConfigEntryState.LOADED
+    assert successor.runtime_data.mobility_coordinator is not None
+    moved = _mobility_owners(hass)
+    assert set(moved) == set(owned)
+    assert {tuple(entries) for entries in moved.values()} == {(successor.entry_id,)}
+    registry = er.async_get(hass)
+    router_clients = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"mobility_{OFFICE_ROUTER_ID}_clients"
+    )
+    assert router_clients is not None
+    assert registry.async_get(router_clients).disabled_by is None
+    assert hass.states.get(router_clients).state == "5"
+    assert "does not generate unique IDs" not in caplog.text
+
+
+@pytest.mark.usefixtures(
+    "mock_network_client",
+    "mock_protect_client",
+    "enable_custom_integrations",
+    "mock_site_manager_client",
+)
+async def test_owner_reload_keeps_mobility_and_leaves_siblings_alone(
+    hass: HomeAssistant, mock_mobility_client: MagicMock
+) -> None:
+    """Reloading the owner (an options change) does not reload other entries."""
+    serve_spec_examples(mock_mobility_client)
+    owner = _remote_entry("01A", "console-a")
+    sibling = _remote_entry("01B", "console-b")
+    sibling.add_to_hass(hass)
+    await _setup_mobility(hass, owner)
+    sibling_data = sibling.runtime_data
+
+    assert await hass.config_entries.async_reload(owner.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert owner.runtime_data.mobility_coordinator is not None
+    assert sibling.runtime_data is sibling_data
+    assert sibling.runtime_data.mobility_coordinator is None

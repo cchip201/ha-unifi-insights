@@ -14,19 +14,20 @@ from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-
-from custom_components.unifi_insights.api import (
+from unifi_official_api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
     UniFiNotFoundError,
     UniFiResponseError,
     UniFiValidationError,
 )
+
 from custom_components.unifi_insights.config_flow import (
     _access_server_moved,
     _clear_access_field,
     _host_key,
 )
+from custom_components.unifi_insights.console_identity import SiteEntityIdentityError
 from custom_components.unifi_insights.const import (
     CONF_ACCESS_PORT,
     CONF_ACCESS_TOKEN,
@@ -42,7 +43,6 @@ from custom_components.unifi_insights.const import (
     DEFAULT_ACCESS_PORT,
     DOMAIN,
 )
-from custom_components.unifi_insights.helpers import SiteEntityIdentityError
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry, ConfigFlowResult

@@ -1,21 +1,26 @@
 # Copyright 2026 UniFi Insights contributors
 """Tests for UniFi Protect select entities."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
 
 import pytest
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 
-from custom_components.unifi_insights.api import ApiKeyAuth, ConnectionType
-from custom_components.unifi_insights.api.protect import UniFiProtectClient
 from custom_components.unifi_insights.const import (
     DEVICE_TYPE_CAMERA,
     DEVICE_TYPE_CHIME,
     DEVICE_TYPE_VIEWER,
+    DOMAIN,
     HDR_MODE_AUTO,
     HDR_MODE_ON,
+    VIDEO_MODE_API_TO_OPTION,
     VIDEO_MODE_DEFAULT,
-    VIDEO_MODE_HIGH_FPS,
+    VIDEO_MODE_OPTIONS,
+    VIDEO_MODES,
 )
 from custom_components.unifi_insights.select import (
     PARALLEL_UPDATES,
@@ -25,7 +30,22 @@ from custom_components.unifi_insights.select import (
     UnifiProtectVideoModeSelect,
     UnifiProtectViewerLiveviewSelect,
     async_setup_entry,
+    observed_ringtone_ids,
+    require_observed_ringtone,
+    resolve_liveview_id,
 )
+from tests.fixtures.command_owners import autospec_command_owners, protect_owner
+from tests.fixtures.facade_data import with_protect_collection, with_protect_fields
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+
+@pytest.fixture
+def mock_coordinator(mock_coordinator: MagicMock) -> MagicMock:
+    """Give the shared facade mock strict autospecs of its command owners."""
+    return autospec_command_owners(mock_coordinator)
 
 
 class TestParallelUpdates:
@@ -337,7 +357,9 @@ class TestUnifiProtectHDRModeSelect:
 
         assert entity._attr_current_option == "on"
 
-    async def test_async_select_option_success(self, mock_coordinator):
+    async def test_async_select_option_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test selecting HDR mode option successfully."""
         mock_coordinator.data = {
             "sites": {},
@@ -359,9 +381,6 @@ class TestUnifiProtectHDRModeSelect:
                 "liveviews": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.set_hdr_mode = AsyncMock()
-
         entity = UnifiProtectHDRModeSelect(
             coordinator=mock_coordinator,
             camera_id="cam1",
@@ -370,9 +389,14 @@ class TestUnifiProtectHDRModeSelect:
 
         await entity.async_select_option("on")
 
-        mock_coordinator.protect_client.set_hdr_mode.assert_called_once_with(
-            camera_id="cam1", mode="on"
+        protect_owner(mock_coordinator).async_set_hdr_mode.assert_awaited_once_with(
+            "cam1", "on"
         )
+        # The owner publishes hdrType; the option follows from the data.
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", hdrType="on"
+        )
+        entity._update_from_data()
         assert entity._attr_current_option == "on"
 
     async def test_async_select_option_error(self, mock_coordinator):
@@ -397,9 +421,10 @@ class TestUnifiProtectHDRModeSelect:
                 "liveviews": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.set_hdr_mode = AsyncMock(
-            side_effect=Exception("API Error")
+        protect_owner(
+            mock_coordinator
+        ).async_set_hdr_mode.side_effect = HomeAssistantError(
+            "Unable to set HDR mode for camera cam1"
         )
 
         entity = UnifiProtectHDRModeSelect(
@@ -414,6 +439,13 @@ class TestUnifiProtectHDRModeSelect:
 
 class TestUnifiProtectVideoModeSelect:
     """Tests for UnifiProtectVideoModeSelect entity."""
+
+    def test_option_mapping_is_bijective(self) -> None:
+        """Every HA option must round-trip to exactly one supported API mode."""
+        assert tuple(VIDEO_MODE_OPTIONS.values()) == VIDEO_MODES
+        assert len(set(VIDEO_MODE_OPTIONS.values())) == len(VIDEO_MODE_OPTIONS)
+        for option, mode in VIDEO_MODE_OPTIONS.items():
+            assert VIDEO_MODE_API_TO_OPTION[mode] == option
 
     def test_initialization(self, mock_coordinator):
         """Test video mode select initialization."""
@@ -448,9 +480,22 @@ class TestUnifiProtectVideoModeSelect:
         assert entity._attr_translation_key == "video_mode"
         assert entity._attr_current_option == "default"
         assert VIDEO_MODE_DEFAULT in entity._attr_options
-        assert VIDEO_MODE_HIGH_FPS in entity._attr_options
+        assert "high_fps" in entity._attr_options
 
-    async def test_async_select_option_success(self, mock_coordinator):
+    @pytest.mark.parametrize(
+        ("option", "mode"),
+        [
+            ("default", "default"),
+            ("high_fps", "highFps"),
+            ("sport", "sport"),
+            ("slow_shutter", "slowShutter"),
+            ("lpr_reflex", "lprReflex"),
+            ("lpr_none_reflex", "lprNoneReflex"),
+        ],
+    )
+    async def test_async_select_option_success(
+        self, mock_coordinator: MagicMock, option: str, mode: str
+    ) -> None:
         """Test selecting video mode option successfully."""
         mock_coordinator.data = {
             "sites": {},
@@ -472,58 +517,23 @@ class TestUnifiProtectVideoModeSelect:
                 "liveviews": {},
             },
         }
-        mock_coordinator.async_set_video_mode = AsyncMock()
-
         entity = UnifiProtectVideoModeSelect(
             coordinator=mock_coordinator,
             camera_id="cam1",
         )
         entity.async_write_ha_state = MagicMock()
 
-        await entity.async_select_option("highFps")
+        await entity.async_select_option(option)
 
-        mock_coordinator.async_set_video_mode.assert_called_once_with("cam1", "highFps")
-        assert entity._attr_current_option == "highFps"
-
-    async def test_async_select_option_fallback(self, mock_coordinator):
-        """Test video mode takes fallback when coordinator action is non-coroutine."""
-        mock_coordinator.data = {
-            "sites": {},
-            "devices": {},
-            "protect": {
-                "cameras": {
-                    "cam1": {
-                        "id": "cam1",
-                        "name": "Test Camera",
-                        "state": "CONNECTED",
-                        "videoMode": "default",
-                    },
-                },
-                "lights": {},
-                "sensors": {},
-                "nvrs": {},
-                "chimes": {},
-                "viewers": {},
-                "liveviews": {},
-            },
-        }
-        mock_coordinator.async_set_video_mode = MagicMock()
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.cameras = MagicMock()
-        mock_coordinator.protect_client.cameras.set_video_mode = AsyncMock()
-
-        entity = UnifiProtectVideoModeSelect(
-            coordinator=mock_coordinator,
-            camera_id="cam1",
+        protect_owner(mock_coordinator).async_set_video_mode.assert_awaited_once_with(
+            "cam1", mode
         )
-        entity.async_write_ha_state = MagicMock()
-
-        await entity.async_select_option("highFps")
-
-        mock_coordinator.protect_client.cameras.set_video_mode.assert_awaited_once_with(
-            "cam1", "highFps"
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "cam1", videoMode=mode
         )
-        assert entity._attr_current_option == "highFps"
+        entity._update_from_data()
+        assert entity._attr_current_option == option
+        assert entity.extra_state_attributes["video_mode"] == mode
 
     async def test_async_select_option_error(self, mock_coordinator):
         """Test selecting video mode option with error."""
@@ -547,8 +557,10 @@ class TestUnifiProtectVideoModeSelect:
                 "liveviews": {},
             },
         }
-        mock_coordinator.async_set_video_mode = AsyncMock(
-            side_effect=Exception("API Error")
+        protect_owner(
+            mock_coordinator
+        ).async_set_video_mode.side_effect = HomeAssistantError(
+            "Unable to set video mode for camera cam1"
         )
 
         entity = UnifiProtectVideoModeSelect(
@@ -558,50 +570,130 @@ class TestUnifiProtectVideoModeSelect:
         entity.async_write_ha_state = MagicMock()
 
         with pytest.raises(HomeAssistantError, match="Unable to set video mode"):
-            await entity.async_select_option("highFps")
+            await entity.async_select_option("high_fps")
 
-    async def test_async_select_option_sends_spec_patch_body(self):
-        """Test selecting video mode sends spec-compliant videoMode PATCH body."""
-        coordinator = MagicMock()
-        client = UniFiProtectClient(
-            auth=ApiKeyAuth(api_key="test-key"),
-            base_url="https://192.168.1.1",
-            connection_type=ConnectionType.LOCAL,
+    @pytest.mark.parametrize(
+        "mode", [None, 123, ["invalid"], "unsupported", "high_fps", "slow_shutter"]
+    )
+    def test_unknown_api_mode_stays_unknown(
+        self, mock_coordinator: MagicMock, mode: object
+    ) -> None:
+        """Malformed or unsupported API values must not become a valid mode."""
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {"cam1": {"id": "cam1", "state": "CONNECTED", "videoMode": mode}},
         )
-        client._patch = AsyncMock(
-            return_value={"id": "cam1", "mac": "00:11:22:33:44:55"}
-        )
-        coordinator.protect_client = client
-        coordinator.async_set_video_mode = AsyncMock(
-            side_effect=client.cameras.set_video_mode
-        )
-        coordinator.data = {
-            "sites": {},
-            "devices": {},
-            "protect": {
-                "cameras": {
-                    "cam1": {
-                        "id": "cam1",
-                        "name": "Test Camera",
-                        "state": "CONNECTED",
-                        "videoMode": "default",
-                    },
-                },
-            },
-        }
+        entity = UnifiProtectVideoModeSelect(mock_coordinator, "cam1")
+        assert entity.state is None
+        assert entity.extra_state_attributes["video_mode"] == mode
 
-        entity = UnifiProtectVideoModeSelect(
-            coordinator=coordinator,
-            camera_id="cam1",
+    def test_missing_api_mode_uses_default(self, mock_coordinator: MagicMock) -> None:
+        """An omitted API field retains the established default fallback."""
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {"cam1": {"id": "cam1", "state": "CONNECTED"}},
         )
-        entity.async_write_ha_state = MagicMock()
+        entity = UnifiProtectVideoModeSelect(mock_coordinator, "cam1")
+        assert entity.state == "default"
+        assert entity.extra_state_attributes["video_mode"] == "default"
 
-        await entity.async_select_option("highFps")
-        client._patch.assert_awaited_once_with(
-            client.build_api_path("/cameras/cam1"),
-            json_data={"videoMode": "highFps"},
+
+class TestLprVideoModeStates:
+    """Exercise camera API responses through the real HA state machine."""
+
+    @pytest.fixture
+    def mock_protect_client(
+        self, mock_protect_client: MagicMock, mode: str
+    ) -> MagicMock:
+        """Seed the API boundary before the integration builds its snapshots."""
+        mock_protect_client.cameras.get_all.return_value = [
+            {
+                "id": "lpr_camera",
+                "name": "LPR Camera",
+                "state": "CONNECTED",
+                "model": "UVC-G5-Bullet",
+                "mac": "11:22:33:44:55:66",
+                "videoMode": mode,
+                "featureFlags": {},
+            }
+        ]
+        return mock_protect_client
+
+    @pytest.mark.parametrize(
+        ("mode", "option"),
+        [
+            ("default", "default"),
+            ("highFps", "high_fps"),
+            ("sport", "sport"),
+            ("slowShutter", "slow_shutter"),
+            ("lprReflex", "lpr_reflex"),
+            ("lprNoneReflex", "lpr_none_reflex"),
+        ],
+    )
+    async def test_lpr_mode_serializes_as_reported(
+        self,
+        hass: HomeAssistant,
+        init_integration: MockConfigEntry,
+        mock_protect_client: MagicMock,
+        mode: str,
+        option: str,
+    ) -> None:
+        """A documented LPR mode must serialize as its value, never unknown."""
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id(
+            "select", DOMAIN, "unifi_insights_camera_lpr_camera_video_mode"
         )
-        assert entity._attr_current_option == "highFps"
+        assert entity_id is not None
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == option
+        assert state.attributes["video_mode"] == mode
+        assert state.attributes["options"] == [
+            "default",
+            "high_fps",
+            "sport",
+            "slow_shutter",
+            "lpr_reflex",
+            "lpr_none_reflex",
+        ]
+
+        # Public HA service validation rejects legacy select keys before I/O.
+        with pytest.raises(ServiceValidationError):
+            await hass.services.async_call(
+                "select",
+                "select_option",
+                {"entity_id": entity_id, "option": "highFps"},
+                blocking=True,
+            )
+        mock_protect_client.cameras.set_video_mode.assert_not_awaited()
+        await hass.services.async_call(
+            "select",
+            "select_option",
+            {"entity_id": entity_id, "option": option},
+            blocking=True,
+        )
+        mock_protect_client.cameras.set_video_mode.assert_awaited_once_with(
+            "lpr_camera", mode
+        )
+
+        # A fresh API response must publish the new translated state through HA.
+        raw_update = "highFps" if mode == "default" else "default"
+        key_update = "high_fps" if mode == "default" else "default"
+        mock_protect_client.cameras.get_all.return_value = [
+            {
+                **mock_protect_client.cameras.get_all.return_value[0],
+                "videoMode": raw_update,
+            }
+        ]
+        owner = init_integration.runtime_data.coordinator.require_protect_coordinator()
+        await owner.async_refresh()
+        await hass.async_block_till_done()
+        updated = hass.states.get(entity_id)
+        assert updated is not None
+        assert updated.state == key_update
+        assert updated.attributes["video_mode"] == raw_update
 
 
 class TestUnifiProtectChimeRingtoneSelect:
@@ -610,22 +702,25 @@ class TestUnifiProtectChimeRingtoneSelect:
     @pytest.fixture
     def ringtone_coordinator(self, mock_coordinator: MagicMock) -> MagicMock:
         """Provide two console-local ringtone IDs and a facade action."""
-        mock_coordinator.data["protect"]["chimes"] = {
-            "chime1": {
-                "id": "chime1",
-                "name": "Test Chime",
-                "state": "CONNECTED",
-                "ringSettings": [{"ringtoneId": "tone-2"}],
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "chimes",
+            {
+                "chime1": {
+                    "id": "chime1",
+                    "name": "Test Chime",
+                    "state": "CONNECTED",
+                    "ringSettings": [{"ringtoneId": "tone-2"}],
+                },
+                "chime2": {
+                    "id": "chime2",
+                    "ringSettings": [
+                        {"ringtoneId": "tone-1"},
+                        {"ringtoneId": "tone-2"},
+                    ],
+                },
             },
-            "chime2": {
-                "id": "chime2",
-                "ringSettings": [
-                    {"ringtoneId": "tone-1"},
-                    {"ringtoneId": "tone-2"},
-                ],
-            },
-        }
-        mock_coordinator.async_set_chime_ringtone = AsyncMock()
+        )
         return mock_coordinator
 
     def test_initialization(self, ringtone_coordinator: MagicMock) -> None:
@@ -669,8 +764,8 @@ class TestUnifiProtectChimeRingtoneSelect:
         self, ringtone_coordinator: MagicMock, settings: object
     ) -> None:
         """Missing or malformed settings have no fabricated current ringtone."""
-        ringtone_coordinator.data["protect"]["chimes"]["chime1"]["ringSettings"] = (
-            settings
+        ringtone_coordinator.data = with_protect_fields(
+            ringtone_coordinator.data, "chimes", "chime1", ringSettings=settings
         )
         entity = UnifiProtectChimeRingtoneSelect(
             coordinator=ringtone_coordinator,
@@ -686,22 +781,34 @@ class TestUnifiProtectChimeRingtoneSelect:
     ) -> None:
         """Malformed neighbouring chimes do not crash or add invalid options."""
         chimes = ringtone_coordinator.data["protect"]["chimes"]
-        chimes["bad-chime"] = None
-        chimes["bad-settings"] = {"ringSettings": {"ringtoneId": "foreign-tone"}}
-        chimes["bad-entries"] = {
-            "ringSettings": [None, "bad", {}, {"ringtoneId": False}]
-        }
+        ringtone_coordinator.data = with_protect_collection(
+            ringtone_coordinator.data,
+            "chimes",
+            {
+                **chimes,
+                "bad-chime": None,
+                "bad-settings": {"ringSettings": {"ringtoneId": "foreign-tone"}},
+                "bad-entries": {
+                    "ringSettings": [None, "bad", {}, {"ringtoneId": False}]
+                },
+            },
+        )
         entity = UnifiProtectChimeRingtoneSelect(
             coordinator=ringtone_coordinator,
             chime_id="chime1",
         )
         assert entity._attr_options == ["tone-1", "tone-2"]
 
-        chimes["chime1"] = None
+        chimes = ringtone_coordinator.data["protect"]["chimes"]
+        ringtone_coordinator.data = with_protect_collection(
+            ringtone_coordinator.data, "chimes", {**chimes, "chime1": None}
+        )
         entity._update_from_data()
         assert entity._attr_current_option is None
 
-        ringtone_coordinator.data["protect"]["chimes"] = []
+        ringtone_coordinator.data = with_protect_collection(
+            ringtone_coordinator.data, "chimes", []
+        )
         entity._update_from_data()
         assert entity._attr_options == []
         assert entity._attr_current_option is None
@@ -725,11 +832,19 @@ class TestUnifiProtectChimeRingtoneSelect:
         assert other_entity._attr_options == ["foreign-tone"]
         assert "foreign-tone" not in entity._attr_options
 
-        ringtone_coordinator.data["protect"]["chimes"]["chime1"]["ringSettings"] = [
-            {"ringtoneId": "tone-new"},
-            {"ringtoneId": "tone-1"},
-        ]
-        ringtone_coordinator.data["protect"]["chimes"].pop("chime2")
+        ringtone_coordinator.data = with_protect_collection(
+            ringtone_coordinator.data,
+            "chimes",
+            {
+                "chime1": {
+                    **ringtone_coordinator.data["protect"]["chimes"]["chime1"],
+                    "ringSettings": [
+                        {"ringtoneId": "tone-new"},
+                        {"ringtoneId": "tone-1"},
+                    ],
+                }
+            },
+        )
         entity._update_from_data()
         assert entity._attr_options == ["tone-1", "tone-new"]
         assert entity._attr_current_option is None
@@ -737,33 +852,22 @@ class TestUnifiProtectChimeRingtoneSelect:
     async def test_async_select_option_success(
         self, ringtone_coordinator: MagicMock
     ) -> None:
-        """A valid observed ID reaches the facade and updates state after success."""
-        entity = UnifiProtectChimeRingtoneSelect(
-            coordinator=ringtone_coordinator, chime_id="chime1"
-        )
-        with patch.object(entity, "async_write_ha_state") as write_state:
-            await entity.async_select_option("tone-1")
-        ringtone_coordinator.async_set_chime_ringtone.assert_awaited_once_with(
-            "chime1", "tone-1"
-        )
-        assert entity._attr_current_option == "tone-1"
-        write_state.assert_called_once()
-
-    async def test_async_select_option_legacy_fallback(
-        self, ringtone_coordinator: MagicMock
-    ) -> None:
-        """The fallback uses the real vendored ringtone endpoint."""
-        del ringtone_coordinator.async_set_chime_ringtone
-        ringtone_coordinator.protect_client.chimes.set_ringtone = AsyncMock()
+        """A valid observed ID reaches the owner; state follows its overlay."""
         entity = UnifiProtectChimeRingtoneSelect(
             coordinator=ringtone_coordinator, chime_id="chime1"
         )
         with patch.object(entity, "async_write_ha_state"):
             await entity.async_select_option("tone-1")
-        ringtone_coordinator.protect_client.chimes.set_ringtone.assert_awaited_once_with(
-            chime_id="chime1", ringtone_id="tone-1"
+        protect = protect_owner(ringtone_coordinator)
+        protect.async_set_chime_ringtone.assert_awaited_once_with("chime1", "tone-1")
+        ringtone_coordinator.data = with_protect_fields(
+            ringtone_coordinator.data,
+            "chimes",
+            "chime1",
+            ringSettings=[{"ringtoneId": "tone-1"}],
         )
-        ringtone_coordinator.protect_client.set_chime_ringtone.assert_not_called()
+        entity._update_from_data()
+        assert entity._attr_current_option == "tone-1"
 
     @pytest.mark.parametrize(
         "data",
@@ -790,7 +894,9 @@ class TestUnifiProtectChimeRingtoneSelect:
         self, ringtone_coordinator: MagicMock
     ) -> None:
         """A failed write leaves state unchanged and propagates the API error."""
-        ringtone_coordinator.async_set_chime_ringtone.side_effect = HomeAssistantError(
+        protect_owner(
+            ringtone_coordinator
+        ).async_set_chime_ringtone.side_effect = HomeAssistantError(
             "Unable to set ringtone"
         )
         entity = UnifiProtectChimeRingtoneSelect(
@@ -809,9 +915,17 @@ class TestUnifiProtectChimeRingtoneSelect:
         entity = UnifiProtectChimeRingtoneSelect(
             coordinator=ringtone_coordinator, chime_id="chime1"
         )
-        with pytest.raises(HomeAssistantError, match="Ringtone ID not found"):
+        with pytest.raises(
+            ServiceValidationError, match="Ringtone ID not found"
+        ) as caught:
             await entity.async_select_option("unobserved-tone")
-        ringtone_coordinator.async_set_chime_ringtone.assert_not_called()
+        assert caught.value.translation_domain == DOMAIN
+        assert caught.value.translation_key == "ringtone_not_found"
+        assert caught.value.translation_placeholders == {
+            "ringtone_id": "unobserved-tone",
+            "chime_id": "chime1",
+        }
+        protect_owner(ringtone_coordinator).async_set_chime_ringtone.assert_not_called()
 
 
 class TestUnifiProtectPTZPresetSelect:
@@ -852,7 +966,9 @@ class TestUnifiProtectPTZPresetSelect:
         assert entity._attr_current_option == "2"
         assert "0" in entity._attr_options
 
-    async def test_async_select_option_success(self, mock_coordinator):
+    async def test_async_select_option_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test selecting PTZ preset option successfully."""
         mock_coordinator.data = {
             "sites": {},
@@ -875,9 +991,6 @@ class TestUnifiProtectPTZPresetSelect:
                 "liveviews": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.ptz_move_to_preset = AsyncMock()
-
         entity = UnifiProtectPTZPresetSelect(
             coordinator=mock_coordinator,
             camera_id="cam1",
@@ -886,9 +999,8 @@ class TestUnifiProtectPTZPresetSelect:
 
         await entity.async_select_option("3")
 
-        mock_coordinator.protect_client.ptz_move_to_preset.assert_called_once_with(
-            camera_id="cam1", slot=3
-        )
+        protect = protect_owner(mock_coordinator)
+        protect.async_move_ptz_to_preset.assert_awaited_once_with("cam1", 3)
         assert entity._attr_current_option == "3"
 
     async def test_async_select_option_error(self, mock_coordinator):
@@ -914,9 +1026,10 @@ class TestUnifiProtectPTZPresetSelect:
                 "liveviews": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.ptz_move_to_preset = AsyncMock(
-            side_effect=Exception("API Error")
+        protect_owner(
+            mock_coordinator
+        ).async_move_ptz_to_preset.side_effect = HomeAssistantError(
+            "Unable to move camera cam1 to PTZ preset 3"
         )
 
         entity = UnifiProtectPTZPresetSelect(
@@ -1001,7 +1114,9 @@ class TestUnifiProtectViewerLiveviewSelect:
 
         assert entity._attr_current_option is None
 
-    async def test_async_select_option_success(self, mock_coordinator):
+    async def test_async_select_option_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test selecting liveview option successfully."""
         mock_coordinator.data = {
             "sites": {},
@@ -1026,9 +1141,6 @@ class TestUnifiProtectViewerLiveviewSelect:
                 "nvrs": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.update_viewer = AsyncMock()
-
         entity = UnifiProtectViewerLiveviewSelect(
             coordinator=mock_coordinator,
             viewer_id="viewer1",
@@ -1037,9 +1149,14 @@ class TestUnifiProtectViewerLiveviewSelect:
 
         await entity.async_select_option("All Cameras")
 
-        mock_coordinator.protect_client.update_viewer.assert_called_once_with(
-            viewer_id="viewer1", data={"liveview": "lv2"}
+        # The owner takes the native liveview ID, not the display name.
+        protect_owner(mock_coordinator).async_update_viewer.assert_awaited_once_with(
+            "viewer1", liveview="lv2"
         )
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "viewers", "viewer1", liveview="lv2"
+        )
+        entity._update_from_data()
         assert entity._attr_current_option == "All Cameras"
 
     async def test_async_select_option_error(self, mock_coordinator):
@@ -1067,9 +1184,10 @@ class TestUnifiProtectViewerLiveviewSelect:
                 "nvrs": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.update_viewer = AsyncMock(
-            side_effect=Exception("API Error")
+        protect_owner(
+            mock_coordinator
+        ).async_update_viewer.side_effect = HomeAssistantError(
+            "Unable to update viewer viewer1"
         )
 
         entity = UnifiProtectViewerLiveviewSelect(
@@ -1078,7 +1196,7 @@ class TestUnifiProtectViewerLiveviewSelect:
         )
         entity.async_write_ha_state = MagicMock()
 
-        with pytest.raises(HomeAssistantError, match="Unable to set liveview"):
+        with pytest.raises(HomeAssistantError, match="Unable to update viewer"):
             await entity.async_select_option("All Cameras")
 
     async def test_async_select_option_liveview_not_found(self, mock_coordinator):
@@ -1102,16 +1220,48 @@ class TestUnifiProtectViewerLiveviewSelect:
                 "nvrs": {},
             },
         }
-        mock_coordinator.protect_client = MagicMock()
-        mock_coordinator.protect_client.update_viewer = AsyncMock()
-
         entity = UnifiProtectViewerLiveviewSelect(
             coordinator=mock_coordinator,
             viewer_id="viewer1",
         )
         entity.async_write_ha_state = MagicMock()
 
-        with pytest.raises(HomeAssistantError, match="Liveview not found"):
+        with pytest.raises(ServiceValidationError, match="Liveview not found") as err:
             await entity.async_select_option("NonExistent")
 
-        mock_coordinator.protect_client.update_viewer.assert_not_called()
+        assert err.value.translation_domain == DOMAIN
+        assert err.value.translation_key == "liveview_not_found"
+        assert err.value.translation_placeholders == {"liveview": "NonExistent"}
+        protect_owner(mock_coordinator).async_update_viewer.assert_not_called()
+
+
+class TestNameAndRingtoneResolution:
+    """The select-side translation of observed values into native IDs."""
+
+    def test_observed_ringtone_ids_skip_malformed_entries(self) -> None:
+        """Only non-blank string IDs of dict entries are collected, sorted."""
+        chimes = {
+            "a": {"ringSettings": [{"ringtoneId": "t2"}, "junk", {"ringtoneId": " "}]},
+            "b": {"ringSettings": "junk"},
+            "c": "junk",
+            "d": {"ringSettings": [{"ringtoneId": "t1"}, {"ringtoneId": 5}]},
+        }
+        assert observed_ringtone_ids(chimes) == ["t1", "t2"]
+        assert observed_ringtone_ids(None) == []
+
+    def test_require_observed_ringtone_accepts_known_ids(self) -> None:
+        """A ringtone another chime uses is accepted."""
+        chimes = {"b": {"ringSettings": [{"ringtoneId": "t1"}]}}
+        require_observed_ringtone(chimes, "a", "t1")
+
+    def test_resolve_liveview_id(self) -> None:
+        """A name resolves to its ID; malformed entries are skipped."""
+        liveviews = {"x": "junk", "lv2": {"name": "All"}}
+        assert resolve_liveview_id(liveviews, "All") == "lv2"
+        with pytest.raises(ServiceValidationError):
+            resolve_liveview_id(None, "All")
+
+    def test_resolve_liveview_id_matches_unnamed_by_id(self) -> None:
+        """An unnamed liveview is offered by its ID, so its ID resolves too."""
+        liveviews = {"lv3": {"id": "lv3"}, "lv2": {"name": "All"}}
+        assert resolve_liveview_id(liveviews, "lv3") == "lv3"

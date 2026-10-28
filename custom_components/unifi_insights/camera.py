@@ -16,9 +16,9 @@ from .const import (
     ATTR_CAMERA_TYPE,
     ATTR_IS_PACKAGE_CAMERA,
     ATTR_PARENT_CAMERA_ID,
-    CAMERA_STATE_CONNECTED,
     DEVICE_TYPE_CAMERA,
 )
+from .data_transforms import protect_collection, protect_device
 from .entity import UnifiProtectEntity
 
 if TYPE_CHECKING:
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
     from . import UnifiInsightsConfigEntry
-    from .coordinators import UnifiFacadeCoordinator
+    from .coordinators import UnifiInsightsFacadeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up cameras for UniFi Protect integration."""
-    coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = entry.runtime_data.coordinator
     _ = hass  # hass is unused but kept for HA signature
 
     # Skip if Protect API is not available
@@ -53,22 +53,9 @@ async def async_setup_entry(
     @callback
     def async_discover_cameras() -> None:
         """Discover and add new cameras."""
-        if (
-            not coordinator.data
-            or not isinstance(coordinator.data, dict)
-            or "protect" not in coordinator.data
-            or not isinstance(coordinator.data["protect"], dict)
-        ):
-            return
-
-        cameras = coordinator.data["protect"].get("cameras", {})
-        if not isinstance(cameras, dict):
-            return
-
+        cameras = protect_collection(coordinator.data, "cameras") or {}
         new_entities: list[Camera] = []
         for camera_id, camera_data in cameras.items():
-            if not isinstance(camera_data, dict):
-                continue
             if camera_id in known_camera_ids:
                 continue
             _LOGGER.debug(
@@ -98,7 +85,7 @@ class UnifiProtectCamera(UnifiProtectEntity, Camera):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the camera."""
@@ -117,12 +104,9 @@ class UnifiProtectCamera(UnifiProtectEntity, Camera):
 
     def _update_from_data(self) -> None:
         """Update entity from data."""
-        camera_data = self.coordinator.data["protect"]["cameras"].get(
-            self._device_id, {}
+        camera_data = (
+            protect_device(self.coordinator.data, "cameras", self._device_id) or {}
         )
-
-        # Set availability
-        self._attr_available = camera_data.get("state") == CAMERA_STATE_CONNECTED
 
         # Set attributes
         self._attr_extra_state_attributes = {
@@ -142,15 +126,8 @@ class UnifiProtectCamera(UnifiProtectEntity, Camera):
         # The Protect snapshot endpoint does not accept width/height params
         # (they cause an HTTP 500). HA scales the returned image as needed.
         _ = (width, height)
-
-        try:
-            snapshot = await self.coordinator.protect_client.cameras.get_snapshot(  # type: ignore[union-attr]
-                self._device_id,
-            )
-            return snapshot if isinstance(snapshot, bytes) else None
-        except Exception:
-            _LOGGER.debug("Error getting camera snapshot", exc_info=True)
-            return None
+        protect = self.coordinator.require_protect_coordinator()
+        return await protect.async_get_camera_snapshot(self._device_id)
 
     async def stream_source(self) -> str | None:
         """
@@ -163,32 +140,17 @@ class UnifiProtectCamera(UnifiProtectEntity, Camera):
         _LOGGER.debug("Getting stream source for %s", self._device_id)
 
         # Try to use the API to create a dynamic RTSPS stream (preferred method)
-        if self.coordinator.protect_client:
-            try:
-                stream = (
-                    await self.coordinator.protect_client.cameras.create_rtsps_stream(
-                        self._device_id,
-                        qualities=["high"],
-                    )
-                )
-                if stream and stream.high:
-                    _LOGGER.debug(
-                        "Using dynamic stream URL for camera %s", self._device_id
-                    )
-                    stream_url: str = stream.high
-                    return stream_url
-            except Exception:
-                _LOGGER.debug(
-                    "Failed to create dynamic stream, falling back to static URL",
-                    exc_info=True,
-                )
+        protect = self.coordinator.require_protect_coordinator()
+        if dynamic_url := await protect.async_create_camera_stream_url(self._device_id):
+            _LOGGER.debug("Using dynamic stream URL for camera %s", self._device_id)
+            return dynamic_url
 
         # Fallback: Construct static RTSPS URL
         nvr_host = None
 
         # Try to get from NVR data
-        nvr_data = self.coordinator.data["protect"].get("nvrs", {})
-        for nvr in nvr_data.values():
+        nvrs = protect_collection(self.coordinator.data, "nvrs") or {}
+        for nvr in nvrs.values():
             if nvr.get("host"):
                 nvr_host = nvr["host"]
                 break

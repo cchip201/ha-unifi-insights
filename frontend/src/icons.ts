@@ -4,6 +4,7 @@ import {
   mdiLanConnect,
   mdiRouterNetwork,
   mdiSwitch,
+  mdiWeb,
   mdiWifi,
 } from "@mdi/js";
 import { html, type TemplateResult } from "lit";
@@ -30,8 +31,11 @@ export {
 
 export const GROUP_ICON = mdiDevices;
 
+/** MDI icon path for a node: by kind, and by connection for clients. */
 export function iconFor(node: TopologyNode): string {
   switch (node.kind) {
+    case "wan":
+      return mdiWeb;
     case "gateway":
       return mdiRouterNetwork;
     case "switch":

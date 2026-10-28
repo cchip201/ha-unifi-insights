@@ -3,9 +3,8 @@
 
 Most of these set the integration up through the real config entry and call the
 real ``siren`` services, so a service call travels through the entity, the real
-facade and the Protect coordinator, and only the Protect API client is mocked.
-That is deliberate: a MagicMock coordinator makes ``async_call_coordinator_action``
-quietly take its fallback path and would hide a facade that never calls the API.
+facade and the Protect coordinator that owns the siren commands, and only the
+Protect API client is mocked.
 """
 
 from __future__ import annotations
@@ -31,13 +30,13 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
-
-from custom_components.unifi_insights import siren as siren_platform
-from custom_components.unifi_insights.api import (
+from unifi_official_api import (
     UniFiNotFoundError,
     UniFiResponseError,
 )
-from custom_components.unifi_insights.api.protect.models import Siren
+from unifi_official_api.protect.models import Siren
+
+from custom_components.unifi_insights import siren as siren_platform
 from custom_components.unifi_insights.const import DOMAIN
 from custom_components.unifi_insights.siren import (
     PARALLEL_UPDATES,
@@ -46,6 +45,7 @@ from custom_components.unifi_insights.siren import (
     siren_volume_from_level,
 )
 from tests.fixtures.library_responses import SAMPLE_SIREN
+from tests.fixtures.protect_ws import FakeProtectWebSocket
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -132,8 +132,10 @@ def _ws_frame(siren_id: str, status: dict[str, Any]) -> dict[str, Any]:
 async def _push(
     hass: HomeAssistant, entry: MockConfigEntry, frame: dict[str, Any]
 ) -> None:
-    """Deliver a WebSocket frame to the entry's Protect coordinator."""
-    entry.runtime_data.protect_coordinator._on_websocket_message(frame)
+    """Deliver a WebSocket frame through the Protect devices subscription."""
+    feed = entry.runtime_data.protect_coordinator.protect_client.websocket
+    await feed.wait_subscribed("devices")
+    feed.raw("devices", frame)
     await hass.async_block_till_done()
 
 
@@ -145,6 +147,7 @@ def protect_client(
     enable_custom_integrations: None,
 ) -> MagicMock:
     """Patch every client the integration builds and return the Protect one."""
+    mock_protect_client.websocket = FakeProtectWebSocket()
     return mock_protect_client
 
 

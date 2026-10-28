@@ -21,15 +21,16 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ServiceValidationError
 
 from .const import DEVICE_TYPE_CAMERA, DOMAIN
+from .data_transforms import protect_collection
 from .entity import UnifiProtectEntity, camera_supports_speaker
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
+    from unifi_official_api.protect.talkback import TalkbackStream
 
     from . import UnifiInsightsConfigEntry
-    from .api.protect.talkback import TalkbackStream
-    from .coordinators import UnifiFacadeCoordinator
+    from .coordinators import UnifiInsightsFacadeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up media player entities for UniFi Protect integration."""
     _ = hass
-    coordinator: UnifiFacadeCoordinator = entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = entry.runtime_data.coordinator
 
     # Skip if Protect API is not available
     if not coordinator.protect_client:
@@ -57,29 +58,16 @@ async def async_setup_entry(
     @callback
     def async_discover_speakers() -> None:
         """Discover and add speaker entities for speaker-capable cameras."""
-        if (
-            not coordinator.data
-            or not isinstance(coordinator.data, dict)
-            or "protect" not in coordinator.data
-            or not isinstance(coordinator.data["protect"], dict)
-        ):
-            return
-
-        protect = coordinator.data["protect"]
         entities: list[UnifiProtectCameraSpeaker] = []
-
-        cameras = protect.get("cameras", {})
-        if isinstance(cameras, dict):
-            for camera_id, camera in cameras.items():
-                if not isinstance(camera, dict):
-                    continue
-                if not camera_supports_speaker(camera):
-                    continue
-                key = (camera_id, "speaker")
-                if key in known_speaker_keys:
-                    continue
-                known_speaker_keys.add(key)
-                entities.append(UnifiProtectCameraSpeaker(coordinator, camera_id))
+        cameras = protect_collection(coordinator.data, "cameras") or {}
+        for camera_id, camera in cameras.items():
+            if not camera_supports_speaker(camera):
+                continue
+            key = (camera_id, "speaker")
+            if key in known_speaker_keys:
+                continue
+            known_speaker_keys.add(key)
+            entities.append(UnifiProtectCameraSpeaker(coordinator, camera_id))
 
         if entities:
             async_add_entities(entities)
@@ -103,7 +91,7 @@ class UnifiProtectCameraSpeaker(UnifiProtectEntity, MediaPlayerEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the camera speaker media player."""
@@ -197,7 +185,8 @@ class UnifiProtectCameraSpeaker(UnifiProtectEntity, MediaPlayerEntity):
                 self._current_stream = None
                 self.async_write_ha_state()
 
-            stream = await self.coordinator.async_start_camera_talkback(
+            protect = self.coordinator.require_protect_coordinator()
+            stream = await protect.async_start_camera_talkback(
                 self._device_id, media_url
             )
             self._current_stream = stream

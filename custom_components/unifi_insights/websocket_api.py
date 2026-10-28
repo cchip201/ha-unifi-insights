@@ -15,6 +15,7 @@ serves a single node resolved on the server.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -25,37 +26,41 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util.hass_dict import HassKey
 
-from .carrier_fabric_data import CarrierFabricData
-from .console_identity import resolve_console_namespace
-from .const import DOMAIN
-from .dashboard_contract_utils import as_dict, content_revision
+from .console_identity import async_get_device_entry, resolve_console_namespace
+from .const import DOMAIN, TIMELINE_MAX_HOURS
+from .dashboard_snapshots import (
+    as_dict,
+    build_internet_activity_snapshot,
+    build_no_protect_snapshot,
+    build_performance_snapshot,
+    build_protect_snapshot,
+    build_site_health_snapshot,
+    build_timeline_snapshot,
+    build_unavailable_internet_activity,
+    build_unavailable_performance,
+    build_unavailable_protect_snapshot,
+    build_unavailable_site_health,
+    build_unavailable_timeline,
+)
+from .data_transforms import NETWORK_FACTS_KEY, site_section
 from .device_tracker import _client_tracker_entries, _mac_from_unique_id
 from .entity import get_field
-from .helpers import async_get_device_entry
-from .internet_activity_snapshot import (
-    build_internet_activity_snapshot,
-    build_unavailable_internet_activity,
-)
-from .performance import build_performance_snapshot, build_unavailable_performance
-from .protect_snapshot import (
-    build_no_protect_snapshot,
-    build_protect_snapshot,
-    build_unavailable_protect_snapshot,
-)
-from .site_health import build_site_health_snapshot, build_unavailable_site_health
-from .timeline import build_timeline_snapshot, build_unavailable_timeline
-from .topology import build_site_topology, build_unavailable_topology
-from .topology_contract import (
+from .topology import (
     MAX_CLIENTS_PER_SITE,
+    async_get_node_key,
+    build_site_topology,
+    build_unavailable_topology,
     device_kind,
     opaque_node_id,
     site_display_name,
+    wan_node_id,
 )
-from .topology_keys import async_get_node_key
 
 # Schemas are typed against probatio, the library HA 2026.10 annotates its schema
 # arguments with. Runtime still imports voluptuous: HA 2026.10 aliases it to probatio,
-# and the 2026.6 minimum ships real voluptuous, so only the type checker sees probatio.
+# and the 2026.9 minimum ships real voluptuous, so only the type checker sees probatio.
+# CarrierFabricData is imported inside functions: __init__.py imports this
+# module while it loads, before the class exists.
 if TYPE_CHECKING:
     import probatio as vol
 else:
@@ -67,7 +72,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
     from . import UnifiInsightsConfigEntry
-    from .topology_contract import NodeKind, SiteTopology
+    from .topology import NodeKind, SiteTopology
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,7 +112,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_topology_get)
     websocket_api.async_register_command(hass, ws_topology_subscribe)
     # Extend HA's native schema so required fields work with both Voluptuous
-    # (HA 2026.6/9) and Probatio (HA 2026.10+).
+    # (HA 2026.9) and Probatio (HA 2026.10+).
     websocket_api.async_register_command(
         hass,
         "unifi_insights/topology/node_details",
@@ -137,6 +142,8 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
 
 def _resolve_entry(hass: HomeAssistant, entry_id: str) -> UnifiInsightsConfigEntry:
     """Return a loaded UniFi Insights entry or raise _RequestError."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     entry = hass.config_entries.async_get_entry(entry_id)
     if entry is None or entry.domain != DOMAIN:
         msg = f"No UniFi Insights config entry {entry_id}"
@@ -159,21 +166,12 @@ def _require_selected_site(entry: UnifiInsightsConfigEntry, site_id: str) -> Non
 
 
 def _device_in_entry(device: dr.DeviceEntry, entry_id: str) -> bool:
-    """
-    Return whether a registry device belongs to the config entry.
-
-    Home Assistant 2026.9+ gives a device a single owner (``config_entry_id``);
-    earlier versions list every owner in ``config_entries``, which 2026.9+
-    reports as deprecated, so it is only read when the single owner is absent.
-    """
-    owner = getattr(device, "config_entry_id", None)
-    if owner is not None:
-        return bool(owner == entry_id)
-    return entry_id in device.config_entries
+    """Return whether a registry device belongs to the config entry."""
+    return device.config_entry_id == entry_id
 
 
 def _ha_device_ids(
-    hass: HomeAssistant, data: dict[str, Any], site_id: str, entry_id: str
+    hass: HomeAssistant, data: Mapping[str, Any], site_id: str, entry_id: str
 ) -> dict[str, str]:
     """
     Map the site's device ids to their Home Assistant device registry ids.
@@ -185,9 +183,8 @@ def _ha_device_ids(
     deprecated DeviceRegistry.async_get_device path (removed in 2027.8).
     """
     registry = dr.async_get(hass)
-    devices = data.get("devices", {}).get(site_id, {})
     result: dict[str, str] = {}
-    for device_id in devices if isinstance(devices, dict) else ():
+    for device_id in site_section(data, "devices", site_id) or ():
         device = async_get_device_entry(
             registry, (DOMAIN, f"{site_id}_{device_id}"), entry_id
         )
@@ -217,26 +214,41 @@ def _build_snapshot(
 
 
 def _find_node(
-    data: dict[str, Any], site_id: str, node_key: bytes, node_id: str
+    data: Mapping[str, Any], site_id: str, node_key: bytes, node_id: str
 ) -> tuple[NodeKind, str, dict[str, Any]]:
     """
-    Return (kind, raw id, record) of the one device or client ``node_id`` names.
+    Return (kind, raw id, record) of the one device, client or WAN ``node_id`` names.
 
     The id is never decoded: each record of the validated site is given the id
     the snapshot would give it and compared. A node id that matches no record,
     or more than one (two ids that normalise to the same MAC share a hash),
-    names no node.
+    names no node. A WAN's raw id is its gateway's device id and its record is
+    the WAN record.
     """
+    by_section = {
+        section: site_section(data, section, site_id) or {}
+        for _, section in _NODE_SECTIONS
+    }
     matches: list[tuple[NodeKind, str, dict[str, Any]]] = []
     for prefix, section in _NODE_SECTIONS:
-        records = as_dict(as_dict(data.get(section)).get(site_id))
-        for raw_id, record in records.items():
-            if (
-                isinstance(record, dict)
-                and opaque_node_id(prefix, node_key, raw_id) == node_id
-            ):
+        for raw_id, record in by_section[section].items():
+            if opaque_node_id(prefix, node_key, raw_id) == node_id:
                 kind = device_kind(record) if section == "devices" else "client"
                 matches.append((kind, raw_id, record))
+    for raw_id, record in by_section["devices"].items():
+        if device_kind(record) != "gateway":
+            continue
+        wans = record.get("wans")
+        for wan in wans if isinstance(wans, list) else ():
+            wan_key = wan.get("key") if isinstance(wan, dict) else None
+            if (
+                isinstance(wan_key, str)
+                and wan_key
+                and wan_node_id(node_key, raw_id, wan_key) == node_id
+            ):
+                # The snapshot keeps the first record per WAN node id.
+                matches.append(("wan", raw_id, wan))
+                break
     if len(matches) != 1:
         msg = f"No node {node_id} in site {site_id}"
         raise _RequestError(ERR_NODE_NOT_FOUND, msg)
@@ -244,10 +256,17 @@ def _find_node(
 
 
 def _device_targets(
-    hass: HomeAssistant, entry: UnifiInsightsConfigEntry, site_id: str, device_id: str
+    hass: HomeAssistant,
+    entry: UnifiInsightsConfigEntry,
+    site_id: str,
+    device_id: str,
+    entity_key: str = "device_status",
 ) -> dict[str, str]:
     """
     Return the registry device and connectivity entity of an infrastructure node.
+
+    ``entity_key`` picks the connectivity sensor: the device status, or a WAN
+    node's ``wan_link_<key>`` connection sensor on its gateway.
 
     Each registry row must belong to this config entry: the device lookup's
     older-Home-Assistant fallbacks match on identifier alone, and an entity's
@@ -262,7 +281,7 @@ def _device_targets(
         targets["device_id"] = device.id
     registry = er.async_get(hass)
     entity_id = registry.async_get_entity_id(
-        "binary_sensor", DOMAIN, f"{site_id}_{device_id}_device_status"
+        "binary_sensor", DOMAIN, f"{site_id}_{device_id}_{entity_key}"
     )
     entity = registry.async_get(entity_id) if entity_id is not None else None
     if entity is not None and entity.config_entry_id == entry.entry_id:
@@ -334,6 +353,10 @@ def _build_node_details(
             details[key] = value.lower() if key == "mac_address" else value
     if kind == "client":
         details.update(_client_targets(hass, entry, details.get("mac_address")))
+    elif kind == "wan":
+        details.update(
+            _device_targets(hass, entry, site_id, raw_id, f"wan_link_{record['key']}")
+        )
     else:
         details.update(_device_targets(hass, entry, site_id, raw_id))
     return details
@@ -356,7 +379,7 @@ def _snapshot_inputs(
     runtime = entry.runtime_data
     data = runtime.coordinator.data
     per_site = []
-    for section in ("devices", "clients", "client_links"):
+    for section in ("devices", "clients", "client_links", NETWORK_FACTS_KEY):
         by_site = data.get(section)
         per_site.append(by_site.get(site_id) if isinstance(by_site, dict) else None)
     return (
@@ -394,17 +417,19 @@ def _runtime_snapshot_inputs(
     devices = data.get("devices")
     stats = data.get("stats")
     clients = data.get("clients")
-    protect_signal = (
-        _protect_change_signal(data.get("protect"), keys=("events",))
+    network_facts = data.get(NETWORK_FACTS_KEY)
+    protect_events = (
+        _protect_collections(data.get("protect"), keys=("events",))
         if payload_type == "timeline"
-        else 0
+        else (None,)
     )
     return (
         sites,
         devices.get(site_id) if isinstance(devices, dict) else None,
         stats.get(site_id) if isinstance(stats, dict) else None,
         clients.get(site_id) if isinstance(clients, dict) else None,
-        protect_signal,
+        network_facts.get(site_id) if isinstance(network_facts, dict) else None,
+        *protect_events,
         data.get("internet_activity"),
         data.get("internet_activity_unavailable"),
         runtime.coordinator.device_available,
@@ -415,16 +440,21 @@ def _runtime_snapshot_inputs(
     )
 
 
-def _protect_change_signal(
+def _protect_collections(
     value: object,
     *,
     keys: tuple[str, ...] = ("cameras", "chimes", "nvrs"),
-) -> int:
-    """Return a value-based signal for in-place Protect mutations."""
-    if not isinstance(value, dict):
-        return 0
-    signal = content_revision({key: value.get(key) for key in keys})
-    return int(signal, 16)
+) -> tuple[object, ...]:
+    """
+    Return the Protect collections a snapshot reads, for identity gating.
+
+    The Protect cache is copy-on-write (ADR-012): a frame replaces every
+    collection it changes and leaves the others as they were, so a collection
+    that is the same object as last time is unchanged.
+    """
+    if not isinstance(value, Mapping):
+        return (None,) * len(keys)
+    return tuple(value.get(key) for key in keys)
 
 
 def _runtime_protect_inputs(
@@ -434,7 +464,7 @@ def _runtime_protect_inputs(
     runtime = entry.runtime_data
     data = runtime.coordinator.data
     return (
-        _protect_change_signal(data.get("protect")),
+        *_protect_collections(data.get("protect")),
         runtime.coordinator.protect_available,
         len(dr.async_get(hass).devices),
         len(er.async_get(hass).entities),
@@ -569,6 +599,8 @@ def ws_topology_sources(
     msg: dict[str, Any],
 ) -> None:
     """List loaded entries and their selected sites for the card editor."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     sources = []
     for entry in hass.config_entries.async_loaded_entries(DOMAIN):
         runtime = getattr(entry, "runtime_data", None)
@@ -882,7 +914,7 @@ _TIMELINE_OPTIONS_SCHEMA: dict[str | vol.Marker, Any] = {
         vol.Coerce(int), vol.Range(min=1, max=50)
     ),
     vol.Optional("hours", default=6): vol.All(
-        vol.Coerce(int), vol.Range(min=1, max=24)
+        vol.Coerce(int), vol.Range(min=1, max=TIMELINE_MAX_HOURS)
     ),
     vol.Optional("categories", default=["security"]): [str],
 }
@@ -956,6 +988,8 @@ def ws_protect_sources(
     msg: dict[str, Any],
 ) -> None:
     """List loaded entries that can provide Protect snapshots."""
+    from . import CarrierFabricData  # noqa: PLC0415
+
     sources = []
     for entry in hass.config_entries.async_loaded_entries(DOMAIN):
         runtime = getattr(entry, "runtime_data", None)

@@ -10,22 +10,56 @@ import pytest
 from homeassistant.components.device_tracker import SourceType
 from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from unifi_official_api.exceptions import UniFiConnectionError
 
-from custom_components.unifi_insights.const import CONF_TRACK_WIFI_CLIENTS, DOMAIN
+from custom_components.unifi_insights.const import (
+    CONF_CLIENT_CONTROL,
+    CONF_TRACK_WIFI_CLIENTS,
+    CONF_TRACK_WIRED_CLIENTS,
+    DOMAIN,
+)
 from custom_components.unifi_insights.device_tracker import (
     PARALLEL_UPDATES,
     UnifiClientTracker,
     _client_should_be_tracked,
     _get_client_type,
     _partition_connected_clients,
-    _uplink_identifiers,
     async_setup_entry,
 )
+from tests.fixtures.facade_data import (
+    facade_data,
+    frozen,
+    set_availability,
+    with_client,
+    with_sections,
+)
+from tests.fixtures.library_responses import SAMPLE_WIRED_CLIENT
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers import entity_registry as er
+
+    from custom_components.unifi_insights.coordinators.facade import FacadeData
+
+
+def _with_site_clients(
+    data: Mapping[str, Any], site_id: str, clients: Any
+) -> FacadeData:
+    """Return ``data`` with one site's clients replaced."""
+    return with_sections(
+        data, clients=frozen({**data.get("clients", {}), site_id: clients})
+    )
+
+
+def _with_client_fields(
+    data: Mapping[str, Any], site_id: str, client_id: str, **fields: Any
+) -> FacadeData:
+    """Return ``data`` with fields of one client's record replaced."""
+    record = data["clients"][site_id][client_id]
+    return with_client(data, site_id, client_id, {**record, **fields})
 
 
 class TestParallelUpdates:
@@ -62,16 +96,22 @@ class TestAsyncSetupEntry:
         return coordinator
 
     @pytest.mark.asyncio
-    async def test_setup_entry_tracking_disabled(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_tracking_disabled(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup when client tracking is disabled (default)."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Test Client",
-                "connected": True,
-            }
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Test Client",
+                    "connected": True,
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -113,19 +153,25 @@ class TestAsyncSetupEntry:
         async_add_entities.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_setup_entry_with_clients(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_with_clients(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with clients present and tracking enabled (wired client)."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Test Client",
-                "connected": True,
-                "ipAddress": "192.168.1.100",
-                "hostname": "test-client",
-                "type": "WIRED",
-            }
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Test Client",
+                    "connected": True,
+                    "ipAddress": "192.168.1.100",
+                    "hostname": "test-client",
+                    "type": "WIRED",
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -149,25 +195,29 @@ class TestAsyncSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_wifi_only_skips_wired(
-        self, hass, mock_coordinator
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
         """Test setup with WiFi tracking only skips wired clients."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Wired Client",
-                "connected": True,
-                "type": "WIRED",
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Wired Client",
+                    "connected": True,
+                    "type": "WIRED",
+                },
+                "client2": {
+                    "id": "client2",
+                    "mac": "11:22:33:44:55:66",
+                    "name": "WiFi Client",
+                    "connected": True,
+                    "type": "WIRELESS",
+                },
             },
-            "client2": {
-                "id": "client2",
-                "mac": "11:22:33:44:55:66",
-                "name": "WiFi Client",
-                "connected": True,
-                "type": "WIRELESS",
-            },
-        }
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -192,25 +242,29 @@ class TestAsyncSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_wired_only_skips_wifi(
-        self, hass, mock_coordinator
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
         """Test setup with wired tracking only skips WiFi clients."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Wired Client",
-                "connected": True,
-                "type": "WIRED",
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Wired Client",
+                    "connected": True,
+                    "type": "WIRED",
+                },
+                "client2": {
+                    "id": "client2",
+                    "mac": "11:22:33:44:55:66",
+                    "name": "WiFi Client",
+                    "connected": True,
+                    "type": "WIRELESS",
+                },
             },
-            "client2": {
-                "id": "client2",
-                "mac": "11:22:33:44:55:66",
-                "name": "WiFi Client",
-                "connected": True,
-                "type": "WIRELESS",
-            },
-        }
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -234,24 +288,30 @@ class TestAsyncSetupEntry:
         assert entities[0]._mac == "aa:bb:cc:dd:ee:ff"
 
     @pytest.mark.asyncio
-    async def test_setup_entry_both_client_types(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_both_client_types(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with both client types tracking enabled."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Wired Client",
-                "connected": True,
-                "type": "WIRED",
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Wired Client",
+                    "connected": True,
+                    "type": "WIRED",
+                },
+                "client2": {
+                    "id": "client2",
+                    "mac": "11:22:33:44:55:66",
+                    "name": "WiFi Client",
+                    "connected": True,
+                    "type": "WIRELESS",
+                },
             },
-            "client2": {
-                "id": "client2",
-                "mac": "11:22:33:44:55:66",
-                "name": "WiFi Client",
-                "connected": True,
-                "type": "WIRELESS",
-            },
-        }
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -275,25 +335,29 @@ class TestAsyncSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_old_option_migration(
-        self, hass, mock_coordinator
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
         """Test setup migrates old track_clients option to new options."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Wired Client",
-                "connected": True,
-                "type": "WIRED",
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Wired Client",
+                    "connected": True,
+                    "type": "WIRED",
+                },
+                "client2": {
+                    "id": "client2",
+                    "mac": "11:22:33:44:55:66",
+                    "name": "WiFi Client",
+                    "connected": True,
+                    "type": "WIRELESS",
+                },
             },
-            "client2": {
-                "id": "client2",
-                "mac": "11:22:33:44:55:66",
-                "name": "WiFi Client",
-                "connected": True,
-                "type": "WIRELESS",
-            },
-        }
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -316,30 +380,43 @@ class TestAsyncSetupEntry:
         assert len(entities) == 2
 
     @pytest.mark.asyncio
-    async def test_setup_entry_multiple_sites(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_multiple_sites(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with clients from multiple sites and tracking enabled."""
-        mock_coordinator.data["sites"]["site2"] = {
-            "id": "site2",
-            "meta": {"name": "Site 2"},
-        }
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Client 1",
-                "connected": True,
-                "type": "WIRED",
-            }
-        }
-        mock_coordinator.data["clients"]["site2"] = {
-            "client2": {
-                "id": "client2",
-                "mac": "11:22:33:44:55:66",
-                "name": "Client 2",
-                "connected": False,
-                "type": "WIRELESS",
-            }
-        }
+        mock_coordinator.data = with_sections(
+            mock_coordinator.data,
+            sites={
+                **mock_coordinator.data["sites"],
+                "site2": {"id": "site2", "meta": {"name": "Site 2"}},
+            },
+        )
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Client 1",
+                    "connected": True,
+                    "type": "WIRED",
+                }
+            },
+        )
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site2",
+            {
+                "client2": {
+                    "id": "client2",
+                    "mac": "11:22:33:44:55:66",
+                    "name": "Client 2",
+                    "connected": False,
+                    "type": "WIRELESS",
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -362,25 +439,29 @@ class TestAsyncSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_skips_already_tracked_clients(
-        self, hass, mock_coordinator
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
         """Test the per-setup dedup set prevents duplicate tracker entities."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client1": {
-                "id": "client1",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "First Client",
-                "connected": True,
-                "type": "WIRED",
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client1": {
+                    "id": "client1",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "First Client",
+                    "connected": True,
+                    "type": "WIRED",
+                },
+                "client2": {
+                    "id": "client2",
+                    "mac": "11:22:33:44:55:66",
+                    "name": "Second Client",
+                    "connected": True,
+                    "type": "WIRED",
+                },
             },
-            "client2": {
-                "id": "client2",
-                "mac": "11:22:33:44:55:66",
-                "name": "Second Client",
-                "connected": True,
-                "type": "WIRED",
-            },
-        }
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -478,9 +559,11 @@ class TestUnifiClientTracker:
 
         assert tracker.source_type == SourceType.ROUTER
 
-    def test_source_type_wireless(self, mock_coordinator) -> None:
+    def test_source_type_wireless(self, mock_coordinator: MagicMock) -> None:
         """Test source type for wireless client."""
-        mock_coordinator.data["clients"]["site1"]["client1"]["type"] = "WIRELESS"
+        mock_coordinator.data = _with_client_fields(
+            mock_coordinator.data, "site1", "client1", type="WIRELESS"
+        )
 
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -490,10 +573,12 @@ class TestUnifiClientTracker:
 
         assert tracker.source_type == SourceType.ROUTER
 
-    def test_is_connected_online(self, mock_coordinator) -> None:
+    def test_is_connected_online(self, mock_coordinator: MagicMock) -> None:
         """Test is_connected for online client."""
         # Ensure connected field is True
-        mock_coordinator.data["clients"]["site1"]["client1"]["connected"] = True
+        mock_coordinator.data = _with_client_fields(
+            mock_coordinator.data, "site1", "client1", connected=True
+        )
 
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -503,9 +588,45 @@ class TestUnifiClientTracker:
 
         assert tracker.is_connected is True
 
-    def test_is_connected_offline(self, mock_coordinator) -> None:
+    def test_is_connected_missing_connected_key(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """Test is_connected for a present client record without a connected key."""
+        record = dict(mock_coordinator.data["clients"]["site1"]["client1"])
+        record.pop("connected", None)
+        mock_coordinator.data = with_client(
+            mock_coordinator.data, "site1", "client1", record
+        )
+
+        tracker = UnifiClientTracker(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            mac="AA:BB:CC:DD:EE:FF",
+        )
+
+        assert tracker.is_connected is True
+
+    def test_is_connected_none_connected_value(
+        self, mock_coordinator: MagicMock
+    ) -> None:
+        """Test is_connected for a present client record with connected=None."""
+        mock_coordinator.data = _with_client_fields(
+            mock_coordinator.data, "site1", "client1", connected=None
+        )
+
+        tracker = UnifiClientTracker(
+            coordinator=mock_coordinator,
+            site_id="site1",
+            mac="AA:BB:CC:DD:EE:FF",
+        )
+
+        assert tracker.is_connected is True
+
+    def test_is_connected_offline(self, mock_coordinator: MagicMock) -> None:
         """Test is_connected for offline client."""
-        mock_coordinator.data["clients"]["site1"]["client1"]["connected"] = False
+        mock_coordinator.data = _with_client_fields(
+            mock_coordinator.data, "site1", "client1", connected=False
+        )
 
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -515,7 +636,7 @@ class TestUnifiClientTracker:
 
         assert tracker.is_connected is False
 
-    def test_is_connected_missing_client(self, mock_coordinator) -> None:
+    def test_is_connected_missing_client(self, mock_coordinator: MagicMock) -> None:
         """Test is_connected when client data is missing."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -524,7 +645,7 @@ class TestUnifiClientTracker:
         )
 
         # Remove client data
-        mock_coordinator.data["clients"]["site1"] = {}
+        mock_coordinator.data = _with_site_clients(mock_coordinator.data, "site1", {})
 
         assert tracker.is_connected is False
 
@@ -555,7 +676,7 @@ class TestUnifiClientTracker:
             mac="AA:BB:CC:DD:EE:FF",
         )
         mock_coordinator.last_update_success = True
-        mock_coordinator.device_available = False
+        set_availability(mock_coordinator, device=False)
 
         assert tracker.available is True
 
@@ -589,16 +710,17 @@ class TestUnifiClientTracker:
 
         assert tracker.hostname == "test-client"
 
-    def test_extra_state_attributes(self, mock_coordinator) -> None:
+    def test_extra_state_attributes(self, mock_coordinator: MagicMock) -> None:
         """Test extra state attributes."""
-        mock_coordinator.data["clients"]["site1"]["client1"].update(
-            {
-                "type": "WIRELESS",
-                "uplinkDeviceId": "device123",
-                "essid": "TestWiFi",
-                "channel": 36,
-                "rssi": -45,
-            }
+        mock_coordinator.data = _with_client_fields(
+            mock_coordinator.data,
+            "site1",
+            "client1",
+            type="WIRELESS",
+            uplinkDeviceId="device123",
+            essid="TestWiFi",
+            channel=36,
+            rssi=-45,
         )
 
         tracker = UnifiClientTracker(
@@ -683,9 +805,7 @@ class TestGetClientType:
                 "site3": [1, 2, 3],
                 "site4": {
                     "client1": {
-                        # A global (burned-in) MAC: the cmcore fork skips a
-                        # randomized, unnamed client (backlog 529).
-                        "mac": "A8:BB:CC:DD:EE:FF",
+                        "mac": "AA:BB:CC:DD:EE:FF",
                         "type": "WIRELESS",
                     }
                 },
@@ -694,7 +814,7 @@ class TestGetClientType:
         wanted, untracked = _partition_connected_clients(
             coordinator, track_wifi=True, track_wired=True
         )
-        assert wanted == {"a8:bb:cc:dd:ee:ff": "site4"}
+        assert wanted == {"aa:bb:cc:dd:ee:ff": "site4"}
         assert untracked == set()
 
 
@@ -736,7 +856,7 @@ class TestUnifiClientTrackerEdgeCases:
         }
         return coordinator
 
-    def test_source_type_no_client_data(self, mock_coordinator) -> None:
+    def test_source_type_no_client_data(self, mock_coordinator: MagicMock) -> None:
         """Test source_type returns ROUTER when client data is missing."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -745,11 +865,11 @@ class TestUnifiClientTrackerEdgeCases:
         )
 
         # Remove client data
-        mock_coordinator.data["clients"]["site1"] = {}
+        mock_coordinator.data = _with_site_clients(mock_coordinator.data, "site1", {})
 
         assert tracker.source_type == SourceType.ROUTER
 
-    def test_ip_address_no_client_data(self, mock_coordinator) -> None:
+    def test_ip_address_no_client_data(self, mock_coordinator: MagicMock) -> None:
         """Test ip_address returns None when client data is missing."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -758,11 +878,11 @@ class TestUnifiClientTrackerEdgeCases:
         )
 
         # Remove client data
-        mock_coordinator.data["clients"]["site1"] = {}
+        mock_coordinator.data = _with_site_clients(mock_coordinator.data, "site1", {})
 
         assert tracker.ip_address is None
 
-    def test_mac_address_no_client_data(self, mock_coordinator) -> None:
+    def test_mac_address_no_client_data(self, mock_coordinator: MagicMock) -> None:
         """Test mac_address survives the client vanishing from the snapshot."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -771,14 +891,14 @@ class TestUnifiClientTrackerEdgeCases:
         )
 
         # Remove client data
-        mock_coordinator.data["clients"]["site1"] = {}
+        mock_coordinator.data = _with_site_clients(mock_coordinator.data, "site1", {})
 
         # The MAC identifies the client; it is not a live reading. An absent
         # client is exactly the case a restored tracker exists to report on,
         # so dropping its identity here would defeat the purpose.
         assert tracker.mac_address == "aa:bb:cc:dd:ee:ff"
 
-    def test_hostname_no_client_data(self, mock_coordinator) -> None:
+    def test_hostname_no_client_data(self, mock_coordinator: MagicMock) -> None:
         """Test hostname returns None when client data is missing."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -787,11 +907,13 @@ class TestUnifiClientTrackerEdgeCases:
         )
 
         # Remove client data
-        mock_coordinator.data["clients"]["site1"] = {}
+        mock_coordinator.data = _with_site_clients(mock_coordinator.data, "site1", {})
 
         assert tracker.hostname is None
 
-    def test_extra_state_attributes_no_client_data(self, mock_coordinator) -> None:
+    def test_extra_state_attributes_no_client_data(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test extra_state_attributes returns empty dict when missing."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -800,22 +922,26 @@ class TestUnifiClientTrackerEdgeCases:
         )
 
         # Remove client data
-        mock_coordinator.data["clients"]["site1"] = {}
+        mock_coordinator.data = _with_site_clients(mock_coordinator.data, "site1", {})
 
         assert tracker.extra_state_attributes == {}
 
     async def test_setup_skips_clients_without_mac(
-        self, hass, mock_coordinator
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
     ) -> None:
         """Clients without a MAC cannot be identified and are not tracked."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "client_no_mac": {
-                "id": "client_no_mac",
-                "name": "Client Without MAC",
-                "connected": True,
-                "type": "WIRED",
-            }
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "client_no_mac": {
+                    "id": "client_no_mac",
+                    "name": "Client Without MAC",
+                    "connected": True,
+                    "type": "WIRED",
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.runtime_data = MagicMock()
@@ -869,19 +995,23 @@ class TestUnifiClientTrackerEdgeCases:
         tracker.async_write_ha_state.assert_called_once()
 
     def test_get_client_data_with_invalid_non_dict_entry(
-        self, mock_coordinator
+        self, mock_coordinator: MagicMock
     ) -> None:
         """Test _get_client_data skips non-dictionary entries gracefully."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "invalid_client": None,
-            "invalid_client_str": "not-a-dict",
-            "valid_client": {
-                "id": "valid_client",
-                "mac": "AA:BB:CC:DD:EE:FF",
-                "name": "Valid Client",
-                "connected": True,
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {
+                "invalid_client": None,
+                "invalid_client_str": "not-a-dict",
+                "valid_client": {
+                    "id": "valid_client",
+                    "mac": "AA:BB:CC:DD:EE:FF",
+                    "name": "Valid Client",
+                    "connected": True,
+                },
             },
-        }
+        )
 
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
@@ -895,28 +1025,48 @@ class TestUnifiClientTrackerEdgeCases:
         assert client_data["id"] == "valid_client"
         assert tracker.is_connected is True
 
-    def test_find_in_site_non_dict_clients(self, mock_coordinator) -> None:
-        """Test _find_in_site returns None when clients argument is not a dict."""
+    @pytest.mark.parametrize(
+        "site_clients",
+        [None, "invalid", [1, 2, 3], {"bad": "not-a-record"}],
+        ids=["none", "string", "list", "malformed-record"],
+    )
+    def test_get_client_data_skips_a_malformed_site(
+        self, mock_coordinator, site_clients: Any
+    ) -> None:
+        """A malformed hinted site is skipped and the client found in another."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
             site_id="site1",
             mac="aa:bb:cc:dd:ee:ff",
         )
-        assert tracker._find_in_site(None) is None
-        assert tracker._find_in_site("invalid") is None
-        assert tracker._find_in_site([1, 2, 3]) is None
+        mock_coordinator.data = with_client(
+            facade_data(clients={"site1": site_clients}),
+            "site2",
+            "c1",
+            {"id": "c1", "macAddress": "AA:BB:CC:DD:EE:FF"},
+        )
 
-    def test_get_client_data_all_clients_not_dict(self, mock_coordinator) -> None:
+        client_data = tracker._get_client_data()
+
+        assert client_data is not None
+        assert client_data["id"] == "c1"
+        assert tracker._site_id == "site2"
+
+    def test_get_client_data_all_clients_not_dict(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test _get_client_data returns None when clients in data is not a dict."""
         tracker = UnifiClientTracker(
             coordinator=mock_coordinator,
             site_id="site1",
             mac="aa:bb:cc:dd:ee:ff",
         )
-        mock_coordinator.data["clients"] = None
+        mock_coordinator.data = with_sections(mock_coordinator.data, clients=None)
         assert tracker._get_client_data() is None
 
-        mock_coordinator.data["clients"] = "not_a_dict"
+        mock_coordinator.data = with_sections(
+            mock_coordinator.data, clients="not_a_dict"
+        )
         assert tracker._get_client_data() is None
 
 
@@ -929,9 +1079,7 @@ class TestRegistryReconciliation:
     """
 
     OFFLINE_MAC: str = "aa:bb:cc:dd:ee:01"
-    # A global MAC: the cmcore fork leaves a randomized, unnamed client alone
-    # (test below).
-    WIRED_MAC: str = "a8:bb:cc:dd:ee:02"
+    WIRED_MAC: str = "aa:bb:cc:dd:ee:02"
     WIFI_MAC: str = "aa:bb:cc:dd:ee:03"
 
     @pytest.fixture
@@ -1013,9 +1161,11 @@ class TestRegistryReconciliation:
         mock_coordinator: MagicMock,
     ) -> None:
         """A connected client whose type is no longer tracked is still removed."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "c1": self._client(self.WIRED_MAC, "WIRED")
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {"c1": self._client(self.WIRED_MAC, "WIRED")},
+        )
 
         entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
         entity_id = self._register(entity_registry, entry, self.WIRED_MAC)
@@ -1025,25 +1175,6 @@ class TestRegistryReconciliation:
         assert entity_registry.async_get(entity_id) is None
 
     @pytest.mark.asyncio
-    async def test_ephemeral_client_of_untracked_type_is_left_alone(
-        self,
-        hass: HomeAssistant,
-        entity_registry: er.EntityRegistry,
-        mock_coordinator: MagicMock,
-    ) -> None:
-        """cmcore fork (529): a randomized, unnamed client is not tracked or removed."""
-        # locally administered, and the payload carries no name
-        mac = "aa:bb:cc:dd:ee:04"
-        mock_coordinator.data["clients"]["site1"] = {"c1": self._client(mac, "WIRED")}
-
-        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
-        entity_id = self._register(entity_registry, entry, mac)
-
-        await async_setup_entry(hass, entry, MagicMock())
-
-        assert entity_registry.async_get(entity_id) is not None
-
-    @pytest.mark.asyncio
     async def test_connected_tracked_client_is_kept(
         self,
         hass: HomeAssistant,
@@ -1051,9 +1182,11 @@ class TestRegistryReconciliation:
         mock_coordinator: MagicMock,
     ) -> None:
         """A connected client of a tracked type keeps its registry entry."""
-        mock_coordinator.data["clients"]["site1"] = {
-            "c1": self._client(self.WIFI_MAC, "WIRELESS")
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {"c1": self._client(self.WIFI_MAC, "WIRELESS")},
+        )
 
         entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
         entity_id = self._register(entity_registry, entry, self.WIFI_MAC)
@@ -1200,9 +1333,11 @@ class TestRegistryReconciliation:
         assert tracker.is_connected is False
 
         # The client turns up on a site the tracker was never pointed at.
-        mock_coordinator.data["clients"]["site2"] = {
-            "c1": self._client(self.WIFI_MAC, "WIRELESS")
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site2",
+            {"c1": self._client(self.WIFI_MAC, "WIRELESS")},
+        )
 
         assert tracker.is_connected is True
         assert tracker._site_id == "site2"
@@ -1229,9 +1364,11 @@ class TestRegistryReconciliation:
         assert len(added) == 1
 
         # The retained client comes back; the coordinator listener re-runs.
-        mock_coordinator.data["clients"]["site1"] = {
-            "c1": self._client(self.WIFI_MAC, "WIRELESS")
-        }
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {"c1": self._client(self.WIFI_MAC, "WIRELESS")},
+        )
         listener = mock_coordinator.async_add_listener.call_args[0][0]
         listener()
 
@@ -1427,6 +1564,107 @@ class TestEntityPlatformRestoration:
         assert state.state == STATE_NOT_HOME
 
     @pytest.mark.asyncio
+    async def test_entity_platform_wired_client_lifecycle(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        *,
+        mock_local_auth: MagicMock,
+        enable_custom_integrations: None,
+    ) -> None:
+        """Wired client reports home from connected listing, not_home when absent."""
+        mac = SAMPLE_WIRED_CLIENT["macAddress"].lower()
+        mock_config_entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(
+            mock_config_entry,
+            options={
+                CONF_TRACK_WIRED_CLIENTS: True,
+                CONF_CLIENT_CONTROL: True,
+            },
+        )
+
+        reg_entry = entity_registry.async_get_or_create(
+            "device_tracker",
+            DOMAIN,
+            f"{DOMAIN}_{mac}",
+            config_entry=mock_config_entry,
+            suggested_object_id="test_wired",
+        )
+        entity_id = reg_entry.entity_id
+
+        mock_network_client.sites.get_all.return_value = [
+            {"id": "default", "name": "Default"}
+        ]
+        mock_network_client.clients.get_all.return_value = [SAMPLE_WIRED_CLIENT]
+
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        # STATE_HOME after setup
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_HOME
+
+        # STATE_NOT_HOME after refresh with [] (same unique ID stays registered)
+        mock_network_client.clients.get_all.return_value = []
+        data = mock_config_entry.runtime_data
+        await data.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_NOT_HOME
+        reg_after_empty = entity_registry.async_get(entity_id)
+        assert reg_after_empty is not None
+        assert reg_after_empty.unique_id == f"{DOMAIN}_{mac}"
+
+        # STATE_HOME after the client returns
+        mock_network_client.clients.get_all.return_value = [SAMPLE_WIRED_CLIENT]
+        await data.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_HOME
+
+        # Connection error: runtime_data retains previous client record
+        mock_network_client.clients.get_all.side_effect = UniFiConnectionError(
+            "Connection lost"
+        )
+        await data.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        # Check client record retention and architectural availability behavior:
+        # device_coordinator records failure, retains previous client record.
+        # Per #116 and UnifiClientTracker.available docstring, the tracker retains
+        # its last home/not_home state (STATE_HOME) and does not drop to unavailable.
+        assert data.device_coordinator.last_update_success is False
+        client_data = (
+            data.device_coordinator.data.get("clients", {})
+            .get("default", {})
+            .get(SAMPLE_WIRED_CLIENT["id"])
+        )
+        assert client_data is not None
+
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_HOME
+
+        # Recovery: refresh succeeds and client reports home
+        mock_network_client.clients.get_all.side_effect = None
+        mock_network_client.clients.get_all.return_value = [SAMPLE_WIRED_CLIENT]
+        await data.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        assert data.device_coordinator.last_update_success is True
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == STATE_HOME
+
+    @pytest.mark.asyncio
     async def test_entity_platform_legacy_collision_retained_lifecycle(
         self,
         hass: HomeAssistant,
@@ -1509,111 +1747,3 @@ class TestEntityPlatformRestoration:
         state = hass.states.get(entity_id)
         assert state is not None
         assert state.state == STATE_HOME
-
-
-class TestOfflineTrackerKeepsItsUplink:
-    """
-    cmcore 2026-10-01 (backlog 643.1 A): an offline client's tracker keeps its uplink.
-
-    A tracker whose client is offline at setup stays on the AP or switch device its
-    registry entry already points at, instead of a standalone client_<mac> device -
-    39 of those, all without an area, followed one day of planned outages.
-    """
-
-    MAC: str = "aa:bb:cc:dd:ee:01"
-
-    @pytest.fixture
-    def mock_coordinator(self) -> MagicMock:
-        """Return a site that answered, with this client not connected."""
-        coordinator = MagicMock()
-        coordinator.data = {"clients": {"site1": {}}}
-        return coordinator
-
-    @staticmethod
-    def _entry(hass: HomeAssistant, coordinator: MagicMock) -> MockConfigEntry:
-        entry = MockConfigEntry(
-            domain=DOMAIN,
-            data={"connection_type": "remote", "console_id": "c", "api_key": "k"},
-            options={"track_wifi_clients": True, "track_wired_clients": True},
-            entry_id="uplink_keep_entry",
-        )
-        entry.add_to_hass(hass)
-        entry.runtime_data = MagicMock()
-        entry.runtime_data.coordinator = coordinator
-        return entry
-
-    async def _tracker(
-        self, hass: HomeAssistant, entry: MockConfigEntry
-    ) -> UnifiClientTracker:
-        added: list[Any] = []
-        await async_setup_entry(hass, entry, added.extend)
-        return next(e for e in added if isinstance(e, UnifiClientTracker))
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("identifier", "expect"),
-        [
-            pytest.param("site1_ap1", "uplink", id="last_under_an_access_point"),
-            pytest.param(
-                "client_aa:bb:cc:dd:ee:01", "placeholder", id="already_on_a_placeholder"
-            ),
-        ],
-    )
-    async def test_offline_tracker_stays_under_its_last_device(
-        self,
-        hass: HomeAssistant,
-        entity_registry: er.EntityRegistry,
-        device_registry: dr.DeviceRegistry,
-        mock_coordinator: MagicMock,
-        *,
-        identifier: str,
-        expect: str,
-    ) -> None:
-        """The tracker keeps the AP device; a placeholder stays a placeholder."""
-        entry = self._entry(hass, mock_coordinator)
-        device = device_registry.async_get_or_create(
-            config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, identifier)},
-            name="U7ProXGHallway",
-        )
-        entity_registry.async_get_or_create(
-            "device_tracker",
-            DOMAIN,
-            f"{DOMAIN}_{self.MAC}",
-            config_entry=entry,
-            device_id=device.id,
-            suggested_object_id="client_aa_bb",
-        )
-        tracker = await self._tracker(hass, entry)
-        if expect == "uplink":
-            assert tracker.device_info["identifiers"] == {(DOMAIN, identifier)}
-            assert "name" not in tracker.device_info  # the AP's device, not renamed
-        else:
-            placeholder = {(DOMAIN, f"client_{self.MAC}")}
-            assert tracker.device_info["identifiers"] == placeholder
-
-    @pytest.mark.asyncio
-    async def test_no_device_on_record_falls_back_to_the_placeholder(
-        self,
-        hass: HomeAssistant,
-        entity_registry: er.EntityRegistry,
-        mock_coordinator: MagicMock,
-    ) -> None:
-        """A registry entry with no device keeps upstream's standalone device."""
-        entry = self._entry(hass, mock_coordinator)
-        entity_registry.async_get_or_create(
-            "device_tracker",
-            DOMAIN,
-            f"{DOMAIN}_{self.MAC}",
-            config_entry=entry,
-            suggested_object_id="client_aa_bb",
-        )
-        tracker = await self._tracker(hass, entry)
-        placeholder = {(DOMAIN, f"client_{self.MAC}")}
-        assert tracker.device_info["identifiers"] == placeholder
-
-    def test_a_device_that_is_gone_gives_no_uplink(self) -> None:
-        """A registry entry naming a deleted device keeps the placeholder."""
-        device_registry = MagicMock()
-        device_registry.async_get.return_value = None
-        assert _uplink_identifiers(device_registry, MagicMock(device_id="gone")) is None

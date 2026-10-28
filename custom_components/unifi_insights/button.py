@@ -19,20 +19,13 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .access_entity import (
-    UnifiAccessDoorEntity,
-    access_coordinator_for,
-    access_unique_id,
-    async_discover_access_entities,
-    door_device_info,
-)
 from .client_wake import (
     find_client_by_mac,
     first_non_blank_text,
     mac_from_wake_unique_id,
     wake_unique_id,
 )
-from .console_identity import resolve_console_namespace
+from .console_identity import async_migrate_site_entity, resolve_console_namespace
 from .const import (
     ATTR_CHIME_ID,
     ATTR_CHIME_NAME,
@@ -45,23 +38,44 @@ from .const import (
     DOMAIN,
     MANUFACTURER,
 )
-from .coordinators import UnifiFacadeCoordinator
-from .coordinators.voucher_state import voucher_request_kwargs, voucher_site_ids
-from .data_transforms import current_chime_ringtone_id
+from .coordinators import UnifiInsightsFacadeCoordinator
+from .coordinators.device import (
+    get_device_port,
+    port_can_be_power_cycled,
+    power_cyclable_ports,
+)
+from .data_transforms import (
+    current_chime_ringtone_id,
+    get_port_label,
+    network_client,
+    owner_available,
+    protect_collection,
+    protect_device,
+    section_by_site,
+    site_record,
+    site_section_available,
+    voucher_request_kwargs,
+    voucher_site_ids,
+)
 from .entity import (
+    UnifiAccessDoorEntity,
     UnifiInsightsEntity,
     UnifiProtectEntity,
-    async_call_coordinator_action,
+    UnifiSiteEntity,
+    access_coordinator_for,
+    access_unique_id,
+    async_discover_access_entities,
     build_site_device_info,
     camera_supports_ptz,
+    door_device_info,
     get_client_type,
     get_field,
-    is_ephemeral_client,
 )
-from .helpers import async_migrate_site_entity
-from .topology_contract import normalize_mac
+from .topology import normalize_mac
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -79,66 +93,6 @@ class UnifiInsightsButtonEntityDescription(ButtonEntityDescription):  # type: ig
     """Class describing UniFi Insights button entities."""
 
 
-def get_device_ports(device_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Return the port dictionaries the coordinator emitted for a device.
-
-    The coordinator publishes ports in two places, both with ``idx`` and a
-    ``poe`` dict carrying ``enabled``: ``ports`` (legacy ``port_table``
-    normalised by ``_normalize_legacy_port``) and ``interfaces["ports"]``
-    (v1 API). ``ports`` is read first, as the sensor pipeline does.
-    """
-    ports = device_data.get("ports")
-    if not isinstance(ports, list) or not ports:
-        interfaces = device_data.get("interfaces")
-        ports = interfaces.get("ports") if isinstance(interfaces, dict) else None
-    if not isinstance(ports, list):
-        return []
-    return [p for p in ports if isinstance(p, dict)]
-
-
-def get_device_port(
-    coordinator_data: Any,
-    site_id: str | None,
-    device_id: str | None,
-    port_idx: int,
-) -> dict[str, Any] | None:
-    """Return port dictionary for a device port or None if not found."""
-    if not site_id or not device_id:
-        return None
-    if not isinstance(coordinator_data, dict):
-        return None
-    devices = coordinator_data.get("devices")
-    if not isinstance(devices, dict):
-        return None
-    site_devices = devices.get(site_id)
-    if not isinstance(site_devices, dict):
-        return None
-    device_data = site_devices.get(device_id)
-    if not isinstance(device_data, dict):
-        return None
-    for port in get_device_ports(device_data):
-        if port.get("idx") == port_idx:
-            return port
-    return None
-
-
-def port_can_be_power_cycled(port: dict[str, Any]) -> bool:
-    """Return True if port can be power-cycled (PoE is enabled)."""
-    return isinstance(port.get("poe"), dict) and port["poe"].get("enabled") is True
-
-
-def _get_port_label(port: dict[str, Any], port_idx: int) -> str:
-    """Return user-friendly port label based on port type."""
-    name = port.get("name")
-    if name and name != f"Port {port_idx}":
-        return str(name)
-    media = port.get("media", "")
-    if isinstance(media, str) and media.startswith("SFP"):
-        return f"{media} {port_idx}"
-    return f"Port {port_idx}"
-
-
 def _wired_client_mac(client: dict[str, Any]) -> str | None:
     """Return a wired client's normalized MAC, or None for any other client."""
     if get_client_type(client) != "WIRED":
@@ -146,18 +100,12 @@ def _wired_client_mac(client: dict[str, Any]) -> str | None:
     return normalize_mac(get_field(client, "macAddress", "mac_address", "mac"))
 
 
-def _connected_client_macs(coordinator: UnifiFacadeCoordinator) -> set[str]:
+def _connected_client_macs(coordinator: UnifiInsightsFacadeCoordinator) -> set[str]:
     """Return the normalized MACs of all clients currently connected."""
     macs: set[str] = set()
-    clients_by_site = (coordinator.data or {}).get("clients")
-    if not isinstance(clients_by_site, dict):
-        return macs
+    clients_by_site = section_by_site(coordinator.data, "clients") or {}
     for clients in clients_by_site.values():
-        if not isinstance(clients, dict):
-            continue
         for client in clients.values():
-            if not isinstance(client, dict):
-                continue
             raw_mac = get_field(client, "macAddress", "mac_address", "mac")
             if (mac := normalize_mac(raw_mac)) is not None:
                 macs.add(mac)
@@ -179,8 +127,6 @@ BUTTON_TYPES: tuple[UnifiInsightsButtonEntityDescription, ...] = (
     UnifiInsightsButtonEntityDescription(
         key="device_restart",
         translation_key="device_restart",
-        name="Device Restart",
-        icon="mdi:restart",
     ),
 )
 
@@ -208,10 +154,9 @@ class UnifiAccessUnlockButton(UnifiAccessDoorEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Send the remote unlock; the relay state comes from the read-back."""
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_unlock_door",
+        await self._async_command(
             "Could not unlock the Access door",
+            self.coordinator.async_unlock_door,
             self._door_id,
         )
 
@@ -243,7 +188,7 @@ async def async_setup_entry(
     """Set up buttons for UniFi Insights integration."""
     # Access is set up before the Protect-dependent buttons below.
     async_setup_access_buttons(config_entry, async_add_entities)
-    coordinator: UnifiFacadeCoordinator = config_entry.runtime_data.coordinator
+    coordinator: UnifiInsightsFacadeCoordinator = config_entry.runtime_data.coordinator
     client_control = config_entry.options.get(
         CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
     )
@@ -279,7 +224,9 @@ async def async_setup_entry(
         connected_macs = _connected_client_macs(coordinator)
         restored: dict[str, UnifiClientWakeButton] = {}
         enabled_macs: set[str] = set()
-        coord_data = coordinator.data or {}
+        snapshot: Mapping[str, Any] = coordinator.data
+        coord_data = snapshot or {}
+        clients_by_site = section_by_site(coordinator.data, "clients")
         for row in er.async_entries_for_config_entry(registry, config_entry.entry_id):
             mac = mac_from_wake_unique_id(row.unique_id)
             if row.domain != "button" or row.platform != DOMAIN or mac is None:
@@ -288,7 +235,7 @@ async def async_setup_entry(
                 enabled_macs.add(mac)
             elif mac not in registered_macs & connected_macs:
                 continue
-            live = find_client_by_mac(coord_data.get("clients"), mac)
+            live = find_client_by_mac(clients_by_site, mac)
             site_id = live[0] if live else next(iter(coord_data.get("sites", {})), "")
             device = (
                 dr.async_get(hass).async_get(row.device_id) if row.device_id else None
@@ -351,9 +298,6 @@ async def async_setup_entry(
     @callback
     def async_discover_buttons() -> None:
         """Discover and add new button entities."""
-        if not coordinator.data or not isinstance(coordinator.data, dict):
-            return
-
         current_client_control = config_entry.options.get(
             CONF_CLIENT_CONTROL, DEFAULT_CLIENT_CONTROL
         )
@@ -381,159 +325,131 @@ async def async_setup_entry(
             entities.append(button)
 
         # Add buttons for each device in each site
-        devices_by_site = coordinator.data.get("devices", {})
-        if isinstance(devices_by_site, dict):
-            for site_id, devices in devices_by_site.items():
-                if not isinstance(devices, dict):
-                    continue
-                site_data = coordinator.get_site(site_id)
-                site_name = (
-                    (site_data.get("meta") or {}).get("name", site_id)
-                    if site_data
-                    else site_id
-                )
+        devices_by_site = section_by_site(coordinator.data, "devices") or {}
+        for site_id, devices in devices_by_site.items():
+            site_data = site_record(coordinator.data, site_id)
+            site_name = (
+                (site_data.get("meta") or {}).get("name", site_id)
+                if site_data
+                else site_id
+            )
 
-                _LOGGER.debug(
-                    "Processing site %s (%s) with %d devices",
-                    site_id,
-                    site_name,
-                    len(devices),
-                )
+            _LOGGER.debug(
+                "Processing site %s (%s) with %d devices",
+                site_id,
+                site_name,
+                len(devices),
+            )
 
-                for device_id, device_data in devices.items():
-                    if not isinstance(device_data, dict):
+            for device_id in devices:
+                for description in BUTTON_TYPES:
+                    btn_key = (site_id, device_id, description.key)
+                    if btn_key in known_button_keys:
                         continue
-                    for description in BUTTON_TYPES:
-                        btn_key = (site_id, device_id, description.key)
-                        if btn_key in known_button_keys:
-                            continue
-                        known_button_keys.add(btn_key)
-                        entities.append(
-                            UnifiInsightsButton(
-                                coordinator=coordinator,
-                                description=description,
-                                site_id=site_id,
-                                device_id=device_id,
-                            )
+                    known_button_keys.add(btn_key)
+                    entities.append(
+                        UnifiInsightsButton(
+                            coordinator=coordinator,
+                            description=description,
+                            site_id=site_id,
+                            device_id=device_id,
                         )
+                    )
 
-                    # Discover PoE power-cycle buttons for PoE-enabled ports
-                    for port in get_device_ports(device_data):
-                        port_idx = port.get("idx")
-                        if not isinstance(port_idx, int):
-                            continue
-                        if not port_can_be_power_cycled(port):
-                            continue
+                # Discover PoE power-cycle buttons for PoE-enabled ports
+                for port_facts in power_cyclable_ports(
+                    coordinator.data, site_id, device_id
+                ):
+                    port = port_facts.record
+                    port_idx = port_facts.raw_index
 
-                        poe_btn_key = (
-                            site_id,
-                            device_id,
-                            f"port{port_idx}_poe_power_cycle",
+                    poe_btn_key = (
+                        site_id,
+                        device_id,
+                        f"port{port_idx}_poe_power_cycle",
+                    )
+                    if poe_btn_key in known_button_keys:
+                        continue
+                    known_button_keys.add(poe_btn_key)
+
+                    port_label = get_port_label(port, port_idx)
+                    entities.append(
+                        UnifiInsightsPoePowerCycleButton(
+                            coordinator=coordinator,
+                            site_id=site_id,
+                            device_id=device_id,
+                            port_idx=port_idx,
+                            port_label=port_label,
                         )
-                        if poe_btn_key in known_button_keys:
-                            continue
-                        known_button_keys.add(poe_btn_key)
-
-                        port_label = _get_port_label(port, port_idx)
-                        entities.append(
-                            UnifiInsightsPoePowerCycleButton(
-                                coordinator=coordinator,
-                                site_id=site_id,
-                                device_id=device_id,
-                                port_idx=port_idx,
-                                port_label=port_label,
-                            )
-                        )
+                    )
 
         # Add reconnect buttons for connected clients (when client control is enabled)
         if current_client_control:
-            clients_by_site = coordinator.data.get("clients", {})
-            if isinstance(clients_by_site, dict):
-                for site_id, clients in clients_by_site.items():
-                    if not isinstance(clients, dict):
+            clients_by_site = section_by_site(coordinator.data, "clients") or {}
+            for site_id, clients in clients_by_site.items():
+                for client_id in clients:
+                    client_key = (site_id, client_id, "reconnect")
+                    if client_key in known_button_keys:
                         continue
-                    for client_id, client_data in clients.items():
-                        if not isinstance(client_data, dict):
-                            continue
-                        if is_ephemeral_client(client_data):
-                            # cmcore fork (backlog 529): randomized MAC, no name
-                            continue
-                        client_key = (site_id, client_id, "reconnect")
-                        if client_key in known_button_keys:
-                            continue
-                        known_button_keys.add(client_key)
-                        entities.append(
-                            UnifiClientReconnectButton(
-                                coordinator=coordinator,
-                                site_id=site_id,
-                                client_id=client_id,
-                            )
+                    known_button_keys.add(client_key)
+                    entities.append(
+                        UnifiClientReconnectButton(
+                            coordinator=coordinator,
+                            site_id=site_id,
+                            client_id=client_id,
                         )
-                for site_id, clients in clients_by_site.items():
-                    if not isinstance(clients, dict):
+                    )
+            for site_id, clients in clients_by_site.items():
+                for client_data in clients.values():
+                    wake_mac = _wired_client_mac(client_data)
+                    if wake_mac is None or wake_mac in known_wake_macs:
                         continue
-                    for client_data in clients.values():
-                        if not isinstance(client_data, dict):
-                            continue
-                        if is_ephemeral_client(client_data):
-                            # cmcore fork (backlog 529): randomized MAC, no name
-                            continue
-                        wake_mac = _wired_client_mac(client_data)
-                        if wake_mac is None or wake_mac in known_wake_macs:
-                            continue
-                        known_wake_macs.add(wake_mac)
-                        entities.append(
-                            UnifiClientWakeButton(
-                                coordinator, wake_mac, site_id=str(site_id)
-                            )
+                    known_wake_macs.add(wake_mac)
+                    entities.append(
+                        UnifiClientWakeButton(
+                            coordinator, wake_mac, site_id=str(site_id)
                         )
+                    )
 
         # Add UniFi Protect buttons
         if coordinator.protect_client:
-            protect = coordinator.data.get("protect", {})
-            if isinstance(protect, dict):
-                # Add play button for each chime
-                chimes = protect.get("chimes", {})
-                if isinstance(chimes, dict):
-                    for chime_id, chime_data in chimes.items():
-                        if not isinstance(chime_data, dict):
-                            continue
-                        chime_key = (chime_id, "play")
-                        if chime_key not in known_button_keys:
-                            known_button_keys.add(chime_key)
-                            entities.append(
-                                UnifiProtectChimePlayButton(
-                                    coordinator=coordinator,
-                                    chime_id=chime_id,
-                                )
-                            )
+            # Add play button for each chime
+            chimes = protect_collection(coordinator.data, "chimes") or {}
+            for chime_id in chimes:
+                chime_key = (chime_id, "play")
+                if chime_key not in known_button_keys:
+                    known_button_keys.add(chime_key)
+                    entities.append(
+                        UnifiProtectChimePlayButton(
+                            coordinator=coordinator,
+                            chime_id=chime_id,
+                        )
+                    )
 
-                # Add PTZ patrol start/stop buttons for cameras with PTZ support
-                cameras = protect.get("cameras", {})
-                if isinstance(cameras, dict):
-                    for camera_id, camera_data in cameras.items():
-                        if not isinstance(camera_data, dict):
-                            continue
-                        if camera_supports_ptz(camera_data):
-                            start_key = (camera_id, "ptz_start")
-                            if start_key not in known_button_keys:
-                                known_button_keys.add(start_key)
-                                entities.append(
-                                    UnifiProtectPTZPatrolStartButton(
-                                        coordinator=coordinator,
-                                        camera_id=camera_id,
-                                    )
-                                )
+            # Add PTZ patrol start/stop buttons for cameras with PTZ support
+            cameras = protect_collection(coordinator.data, "cameras") or {}
+            for camera_id, camera_data in cameras.items():
+                if not camera_supports_ptz(camera_data):
+                    continue
+                start_key = (camera_id, "ptz_start")
+                if start_key not in known_button_keys:
+                    known_button_keys.add(start_key)
+                    entities.append(
+                        UnifiProtectPTZPatrolStartButton(
+                            coordinator=coordinator,
+                            camera_id=camera_id,
+                        )
+                    )
 
-                            stop_key = (camera_id, "ptz_stop")
-                            if stop_key not in known_button_keys:
-                                known_button_keys.add(stop_key)
-                                entities.append(
-                                    UnifiProtectPTZPatrolStopButton(
-                                        coordinator=coordinator,
-                                        camera_id=camera_id,
-                                    )
-                                )
+                stop_key = (camera_id, "ptz_stop")
+                if stop_key not in known_button_keys:
+                    known_button_keys.add(stop_key)
+                    entities.append(
+                        UnifiProtectPTZPatrolStopButton(
+                            coordinator=coordinator,
+                            camera_id=camera_id,
+                        )
+                    )
 
         if entities:
             _LOGGER.info("Adding %d UniFi Insights buttons", len(entities))
@@ -550,7 +466,7 @@ class UnifiInsightsButton(UnifiInsightsEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         description: UnifiInsightsButtonEntityDescription,
         site_id: str,
         device_id: str,
@@ -576,41 +492,15 @@ class UnifiInsightsButton(UnifiInsightsEntity, ButtonEntity):
             self._site_id,
         )
 
-        success = await async_call_coordinator_action(
-            self.coordinator,
-            "async_restart_device",
-            f"Unable to restart device {self._device_id}",
-            self._site_id,
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.network_client.devices.restart(
-                self._site_id,
-                self._device_id,
-            ),
+        await self.coordinator.device_coordinator.async_restart_device(
+            self._site_id, self._device_id
         )
-        if not success:
-            msg = "Unable to restart device"
-            raise HomeAssistantError(msg)
 
         _LOGGER.info(
             "Successfully initiated restart for device %s in site %s",
             self._device_id,
             self._site_id,
         )
-
-    @property
-    def available(self) -> bool:
-        """Return if the device is available."""
-        devices = self.coordinator.data.get("devices", {})
-        if not isinstance(devices, dict):
-            return False
-        site_devices = devices.get(self._site_id, {})
-        if not isinstance(site_devices, dict):
-            return False
-        device_data = site_devices.get(self._device_id)
-        if not device_data or not isinstance(device_data, dict):
-            return False
-        state = device_data.get("state")
-        return isinstance(state, str) and state == "ONLINE"
 
 
 class UnifiInsightsPoePowerCycleButton(UnifiInsightsEntity, ButtonEntity):
@@ -622,7 +512,7 @@ class UnifiInsightsPoePowerCycleButton(UnifiInsightsEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         device_id: str,
         port_idx: int,
@@ -666,24 +556,8 @@ class UnifiInsightsPoePowerCycleButton(UnifiInsightsEntity, ButtonEntity):
             self._port_idx,
             self._device_id,
         )
-        err_msg = (
-            f"Unable to power cycle PoE port {self._port_idx} on device"
-            f" {self._device_id}"
-        )
-        devices_api = self.coordinator.network_client.devices
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_power_cycle_port",
-            err_msg,
-            self._site_id,
-            self._device_id,
-            self._port_idx,
-            fallback_factory=lambda: devices_api.execute_port_action(
-                self._site_id,
-                self._device_id,
-                self._port_idx,
-                "POWER_CYCLE",
-            ),
+        await self.coordinator.device_coordinator.async_power_cycle_port(
+            self._site_id, self._device_id, self._port_idx
         )
 
 
@@ -692,11 +566,10 @@ class UnifiProtectChimePlayButton(UnifiProtectEntity, ButtonEntity):
 
     _attr_has_entity_name = True
     _attr_translation_key = "play"
-    _attr_icon = "mdi:bell-ring-outline"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         chime_id: str,
     ) -> None:
         """Initialize the button."""
@@ -707,12 +580,9 @@ class UnifiProtectChimePlayButton(UnifiProtectEntity, ButtonEntity):
 
     def _update_attributes(self) -> None:
         """Update button attributes."""
-        data = self.coordinator.data
-        protect = data.get("protect") if isinstance(data, dict) else None
-        chimes = protect.get("chimes") if isinstance(protect, dict) else None
-        chime_data = chimes.get(self._device_id) if isinstance(chimes, dict) else None
-        if not isinstance(chime_data, dict):
-            chime_data = {}
+        chime_data = (
+            protect_device(self.coordinator.data, "chimes", self._device_id) or {}
+        )
 
         self._attr_extra_state_attributes = {
             ATTR_CHIME_ID: self._device_id,
@@ -722,36 +592,26 @@ class UnifiProtectChimePlayButton(UnifiProtectEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         """Report that the official API cannot play a chime."""
-
-        async def unsupported() -> None:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="chime_playback_unsupported",
-            )
-
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_play_chime",
-            f"Unable to play ringtone on chime {self._device_id}",
-            self._device_id,
-            fallback_factory=unsupported,
-        )
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_play_chime(self._device_id)
 
 
-class UnifiClientReconnectButton(ButtonEntity):
+class UnifiClientReconnectButton(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ButtonEntity
+):
     """Button to force a client to reconnect."""
 
     _attr_has_entity_name = True
-    _attr_icon = "mdi:refresh"
+    _attr_translation_key = "client_reconnect"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         client_id: str,
     ) -> None:
         """Initialize the button."""
-        self.coordinator = coordinator
+        super().__init__(coordinator)
         self._site_id = site_id
         self._client_id = client_id
 
@@ -760,11 +620,12 @@ class UnifiClientReconnectButton(ButtonEntity):
         client_name = (
             client_data.get("name")
             or client_data.get("hostname")
-            or client_data.get("mac", client_id)
+            or client_data.get("mac")
+            or client_id
         )
 
         self._attr_unique_id = f"{site_id}_{client_id}_reconnect"
-        self._attr_name = f"{client_name} Reconnect"
+        self._attr_translation_placeholders = {"client_name": client_name}
 
         # Device info - associate with the connected network device (switch/AP)
         uplink_device_id = client_data.get("uplinkDeviceId") or client_data.get(
@@ -786,17 +647,13 @@ class UnifiClientReconnectButton(ButtonEntity):
 
     def _get_client_data(self) -> dict[str, Any]:
         """Get client data from coordinator."""
-        result: dict[str, Any] = (
-            self.coordinator.data.get("clients", {})
-            .get(self._site_id, {})
-            .get(self._client_id, {})
-        )
-        return result
+        result = network_client(self.coordinator.data, self._site_id, self._client_id)
+        return result if isinstance(result, dict) else {}
 
     @property
     def available(self) -> bool:
         """Return if button is available."""
-        if not self.coordinator.device_available:
+        if not owner_available(self.coordinator.data, "device"):
             return False
         client_data = self._get_client_data()
         return bool(client_data)
@@ -807,12 +664,8 @@ class UnifiClientReconnectButton(ButtonEntity):
             "Reconnecting client %s in site %s", self._client_id, self._site_id
         )
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_reconnect_client",
-            f"Unable to reconnect client {self._client_id}",
-            self._site_id,
-            self._client_id,
+        await self.coordinator.device_coordinator.async_reconnect_client(
+            self._site_id, self._client_id
         )
         _LOGGER.info(
             "Successfully reconnected client %s in site %s",
@@ -821,7 +674,9 @@ class UnifiClientReconnectButton(ButtonEntity):
         )
 
 
-class UnifiClientWakeButton(ButtonEntity):
+class UnifiClientWakeButton(
+    CoordinatorEntity[UnifiInsightsFacadeCoordinator], ButtonEntity
+):
     """Button that wakes a wired client with a Wake-on-LAN magic packet."""
 
     _attr_has_entity_name = True
@@ -830,7 +685,7 @@ class UnifiClientWakeButton(ButtonEntity):
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         mac: str,
         *,
         site_id: str,
@@ -844,24 +699,22 @@ class UnifiClientWakeButton(ButtonEntity):
         console's client history holds, used only while the client is not connected.
         site_id is the client's site. Registry restoration preserves its device.
         """
-        self.coordinator = coordinator
+        super().__init__(coordinator)
         self._mac = mac
         self._attr_unique_id = wake_unique_id(mac)
 
-        coord_data = coordinator.data if isinstance(coordinator.data, dict) else {}
         if device_info is not None:
             self._attr_device_info = device_info
         elif site_id:
-            site_info = build_site_device_info(coord_data, site_id)
+            site_info = build_site_device_info(coordinator.data, site_id)
             self._attr_device_info = DeviceInfo(**site_info)  # type: ignore[typeddict-item]
         self.async_update_history_name(fallback_name)
 
     @callback
     def async_update_history_name(self, fallback_name: str | None) -> None:
         """Apply a history name while preferring the current live client name."""
-        live = find_client_by_mac(
-            (self.coordinator.data or {}).get("clients"), self._mac
-        )
+        snapshot: Mapping[str, Any] = self.coordinator.data
+        live = find_client_by_mac((snapshot or {}).get("clients"), self._mac)
         live_name = first_non_blank_text(live[1], "name", "hostname") if live else None
         client_name = live_name or (
             fallback_name.strip()
@@ -874,15 +727,16 @@ class UnifiClientWakeButton(ButtonEntity):
         if self.hass is not None:
             self.async_write_ha_state()
 
+    @property
+    def available(self) -> bool:
+        """Return True while the console can send a Wake-on-LAN packet."""
+        return owner_available(self.coordinator.data, "device")
+
     async def async_press(self) -> None:
         """Send the Wake-on-LAN magic packet."""
         _LOGGER.debug("Sending Wake-on-LAN packet from a Wake button")
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_wake_client",
-            f"Unable to wake client {self._client_name}",
-            self._mac,
-            client_name=self._client_name,
+        await self.coordinator.device_coordinator.async_wake_client(
+            self._mac, client_name=self._client_name
         )
 
 
@@ -891,11 +745,10 @@ class UnifiProtectPTZPatrolStartButton(UnifiProtectEntity, ButtonEntity):
 
     _attr_has_entity_name = True
     _attr_translation_key = "ptz_patrol_start"
-    _attr_icon = "mdi:cctv"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the button."""
@@ -905,17 +758,8 @@ class UnifiProtectPTZPatrolStartButton(UnifiProtectEntity, ButtonEntity):
         """Start PTZ patrol."""
         _LOGGER.debug("Starting PTZ patrol for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_start_ptz_patrol",
-            f"Unable to start PTZ patrol for camera {self._device_id}",
-            self._device_id,
-            0,
-            fallback_factory=lambda: self.coordinator.protect_client.ptz_start_patrol(  # type: ignore[union-attr]
-                camera_id=self._device_id,
-                slot=0,
-            ),
-        )
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_start_ptz_patrol(self._device_id, 0)
         _LOGGER.info("Successfully started PTZ patrol for camera %s", self._device_id)
 
 
@@ -924,11 +768,10 @@ class UnifiProtectPTZPatrolStopButton(UnifiProtectEntity, ButtonEntity):
 
     _attr_has_entity_name = True
     _attr_translation_key = "ptz_patrol_stop"
-    _attr_icon = "mdi:stop-circle-outline"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         camera_id: str,
     ) -> None:
         """Initialize the button."""
@@ -938,59 +781,42 @@ class UnifiProtectPTZPatrolStopButton(UnifiProtectEntity, ButtonEntity):
         """Stop PTZ patrol."""
         _LOGGER.debug("Stopping PTZ patrol for camera %s", self._device_id)
 
-        await async_call_coordinator_action(
-            self.coordinator,
-            "async_stop_ptz_patrol",
-            f"Unable to stop PTZ patrol for camera {self._device_id}",
-            self._device_id,
-            fallback_factory=lambda: self.coordinator.protect_client.ptz_stop_patrol(  # type: ignore[union-attr]
-                camera_id=self._device_id,
-            ),
-        )
+        protect = self.coordinator.require_protect_coordinator()
+        await protect.async_stop_ptz_patrol(self._device_id)
         _LOGGER.info("Successfully stopped PTZ patrol for camera %s", self._device_id)
 
 
-class UnifiGenerateVoucherButton(
-    CoordinatorEntity[UnifiFacadeCoordinator], ButtonEntity
-):
+class UnifiGenerateVoucherButton(UnifiSiteEntity, ButtonEntity):
     """Button entity that creates a new hotspot voucher using HA-stored settings."""
 
-    _attr_has_entity_name = True
     _attr_translation_key = "generate_voucher"
 
     def __init__(
         self,
-        coordinator: UnifiFacadeCoordinator,
+        coordinator: UnifiInsightsFacadeCoordinator,
         site_id: str,
         *,
         unique_id: str,
     ) -> None:
         """Initialize the voucher generation button."""
-        super().__init__(coordinator)
-        self._site_id = site_id
-        self._attr_unique_id = unique_id
-        self._attr_device_info = DeviceInfo(
-            **build_site_device_info(coordinator.data, site_id)  # type: ignore[typeddict-item]
-        )
+        super().__init__(coordinator, site_id, unique_id=unique_id)
 
     @property
     def available(self) -> bool:
         """Return True if vouchers are available for this site."""
-        return bool(self.coordinator.vouchers_available(self._site_id))
+        return site_section_available(self.coordinator.data, self._site_id, "vouchers")
 
     async def async_press(self) -> None:
         """Generate a guest voucher with current HA settings."""
-        settings = self.coordinator.get_voucher_settings(self._site_id)
+        owner = self.coordinator.config_coordinator
+        settings = owner.get_voucher_settings(self._site_id)
         kwargs: dict[str, Any] = voucher_request_kwargs(settings)
-        created = await async_call_coordinator_action(
-            self.coordinator,
-            "async_generate_voucher",
-            f"Unable to generate a guest voucher in site {self._site_id}",
-            self._site_id,
-            name=DEFAULT_VOUCHER_NAME,
-            count=1,
-            **kwargs,
+        created = await owner.async_generate_voucher(
+            self._site_id, name=DEFAULT_VOUCHER_NAME, count=1, **kwargs
         )
         if not created:
-            err_msg = f"UniFi returned no voucher for site {self._site_id}"
-            raise HomeAssistantError(err_msg)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="voucher_not_created",
+                translation_placeholders={"site_id": self._site_id},
+            )

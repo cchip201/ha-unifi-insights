@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,8 +18,6 @@ from homeassistant.const import UnitOfDataRate, UnitOfInformation, UnitOfTime
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 
-from custom_components.unifi_insights.api import ApiKeyAuth, ConnectionType
-from custom_components.unifi_insights.api.protect import UniFiProtectClient
 from custom_components.unifi_insights.const import (
     ATTR_CAMERA_ID,
     ATTR_CAMERA_NAME,
@@ -33,8 +33,7 @@ from custom_components.unifi_insights.const import (
     DEVICE_TYPE_CHIME,
     DEVICE_TYPE_LIGHT,
 )
-from custom_components.unifi_insights.coordinators import UnifiFacadeCoordinator
-from custom_components.unifi_insights.coordinators.voucher_state import VoucherSettings
+from custom_components.unifi_insights.data_transforms import VoucherSettings
 from custom_components.unifi_insights.number import (
     PARALLEL_UPDATES,
     VOUCHER_NUMBER_DESCRIPTIONS,
@@ -45,6 +44,35 @@ from custom_components.unifi_insights.number import (
     UnifiVoucherInputNumber,
     async_setup_entry,
 )
+from tests.fixtures.command_owners import autospec_command_owners, protect_owner
+from tests.fixtures.facade_data import (
+    set_availability,
+    with_protect_collection,
+    with_protect_device,
+    with_protect_fields,
+    with_sections,
+    without_sections,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from homeassistant.core import HomeAssistant
+
+    from custom_components.unifi_insights.coordinators.facade import FacadeData
+
+
+def _without_protect_fields(
+    data: Mapping[str, Any], collection: str, device_id: str, *keys: str
+) -> FacadeData:
+    """Return ``data`` with fields of one Protect device's record removed."""
+    record = data["protect"][collection][device_id]
+    return with_protect_device(
+        data,
+        collection,
+        device_id,
+        {key: value for key, value in record.items() if key not in keys},
+    )
 
 
 class TestParallelUpdates:
@@ -61,7 +89,7 @@ class TestAsyncSetupEntry:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
         coordinator.network_client = MagicMock()
         coordinator.network_client.base_url = "https://192.168.1.1"
@@ -81,7 +109,9 @@ class TestAsyncSetupEntry:
         return coordinator
 
     @pytest.mark.asyncio
-    async def test_setup_entry_no_protect_client(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_no_protect_client(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup when Protect API is not available."""
         mock_coordinator.protect_client = None
 
@@ -98,16 +128,22 @@ class TestAsyncSetupEntry:
         async_add_entities.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_setup_entry_with_cameras(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_with_cameras(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with cameras present."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "camera1": {
-                "id": "camera1",
-                "name": "Test Camera",
-                "state": "CONNECTED",
-                "micVolume": 50,
-            }
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {
+                "camera1": {
+                    "id": "camera1",
+                    "name": "Test Camera",
+                    "state": "CONNECTED",
+                    "micVolume": 50,
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
@@ -124,15 +160,21 @@ class TestAsyncSetupEntry:
         assert isinstance(entities[0], UnifiProtectMicrophoneVolumeNumber)
 
     @pytest.mark.asyncio
-    async def test_setup_entry_with_lights(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_with_lights(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with lights present."""
-        mock_coordinator.data["protect"]["lights"] = {
-            "light1": {
-                "id": "light1",
-                "name": "Test Light",
-                "state": "CONNECTED",
-            }
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "lights",
+            {
+                "light1": {
+                    "id": "light1",
+                    "name": "Test Light",
+                    "state": "CONNECTED",
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
@@ -149,15 +191,21 @@ class TestAsyncSetupEntry:
         assert isinstance(entities[0], UnifiProtectLightLevelNumber)
 
     @pytest.mark.asyncio
-    async def test_setup_entry_with_chimes(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_with_chimes(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with chimes present."""
-        mock_coordinator.data["protect"]["chimes"] = {
-            "chime1": {
-                "id": "chime1",
-                "name": "Test Chime",
-                "state": "CONNECTED",
-            }
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "chimes",
+            {
+                "chime1": {
+                    "id": "chime1",
+                    "name": "Test Chime",
+                    "state": "CONNECTED",
+                }
+            },
+        )
 
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
@@ -177,17 +225,25 @@ class TestAsyncSetupEntry:
         assert "UnifiProtectChimeRepeatTimesNumber" in entity_types
 
     @pytest.mark.asyncio
-    async def test_setup_entry_with_all_devices(self, hass, mock_coordinator) -> None:
+    async def test_setup_entry_with_all_devices(
+        self, hass: HomeAssistant, mock_coordinator: MagicMock
+    ) -> None:
         """Test setup with all device types."""
-        mock_coordinator.data["protect"]["cameras"] = {
-            "camera1": {"id": "camera1", "name": "Cam1", "state": "CONNECTED"}
-        }
-        mock_coordinator.data["protect"]["lights"] = {
-            "light1": {"id": "light1", "name": "Light1", "state": "CONNECTED"}
-        }
-        mock_coordinator.data["protect"]["chimes"] = {
-            "chime1": {"id": "chime1", "name": "Chime1", "state": "CONNECTED"}
-        }
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "cameras",
+            {"camera1": {"id": "camera1", "name": "Cam1", "state": "CONNECTED"}},
+        )
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "lights",
+            {"light1": {"id": "light1", "name": "Light1", "state": "CONNECTED"}},
+        )
+        mock_coordinator.data = with_protect_collection(
+            mock_coordinator.data,
+            "chimes",
+            {"chime1": {"id": "chime1", "name": "Chime1", "state": "CONNECTED"}},
+        )
 
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
@@ -209,7 +265,7 @@ class TestUnifiProtectMicrophoneVolumeNumber:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
         coordinator.protect_client.set_microphone_volume = AsyncMock()
@@ -241,7 +297,7 @@ class TestUnifiProtectMicrophoneVolumeNumber:
         }
         return coordinator
 
-    def test_initialization(self, mock_coordinator) -> None:
+    def test_initialization(self, mock_coordinator: MagicMock) -> None:
         """Test number entity initialization."""
         number = UnifiProtectMicrophoneVolumeNumber(
             coordinator=mock_coordinator,
@@ -258,7 +314,7 @@ class TestUnifiProtectMicrophoneVolumeNumber:
         assert number._attr_native_step == 1
         assert number._attr_mode == NumberMode.SLIDER
 
-    def test_update_from_data(self, mock_coordinator) -> None:
+    def test_update_from_data(self, mock_coordinator: MagicMock) -> None:
         """Test _update_from_data."""
         number = UnifiProtectMicrophoneVolumeNumber(
             coordinator=mock_coordinator,
@@ -267,7 +323,7 @@ class TestUnifiProtectMicrophoneVolumeNumber:
 
         assert number._attr_native_value == 75
 
-    def test_extra_state_attributes(self, mock_coordinator) -> None:
+    def test_extra_state_attributes(self, mock_coordinator: MagicMock) -> None:
         """Test extra state attributes."""
         number = UnifiProtectMicrophoneVolumeNumber(
             coordinator=mock_coordinator,
@@ -280,11 +336,16 @@ class TestUnifiProtectMicrophoneVolumeNumber:
         assert attrs[ATTR_MIC_ENABLED] is True
 
     def test_extra_state_attributes_mic_enabled_precedence(
-        self, mock_coordinator
+        self, mock_coordinator: MagicMock
     ) -> None:
         """Test mic_enabled reads isMicEnabled first, then micEnabled."""
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["isMicEnabled"] = True
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["micEnabled"] = False
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "cameras",
+            "camera1",
+            isMicEnabled=True,
+            micEnabled=False,
+        )
         number = UnifiProtectMicrophoneVolumeNumber(
             coordinator=mock_coordinator,
             camera_id="camera1",
@@ -292,25 +353,38 @@ class TestUnifiProtectMicrophoneVolumeNumber:
         assert number.extra_state_attributes[ATTR_MIC_ENABLED] is True
 
         # isMicEnabled False takes precedence over micEnabled True
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["isMicEnabled"] = False
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["micEnabled"] = True
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "cameras",
+            "camera1",
+            isMicEnabled=False,
+            micEnabled=True,
+        )
         number._update_from_data()
         assert number.extra_state_attributes[ATTR_MIC_ENABLED] is False
 
         # Fallback to micEnabled when isMicEnabled is None
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["isMicEnabled"] = None
-        mock_coordinator.data["protect"]["cameras"]["camera1"]["micEnabled"] = True
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "cameras",
+            "camera1",
+            isMicEnabled=None,
+            micEnabled=True,
+        )
         number._update_from_data()
         assert number.extra_state_attributes[ATTR_MIC_ENABLED] is True
 
         # Default to False when both missing
-        del mock_coordinator.data["protect"]["cameras"]["camera1"]["isMicEnabled"]
-        del mock_coordinator.data["protect"]["cameras"]["camera1"]["micEnabled"]
+        mock_coordinator.data = _without_protect_fields(
+            mock_coordinator.data, "cameras", "camera1", "isMicEnabled", "micEnabled"
+        )
         number._update_from_data()
         assert number.extra_state_attributes[ATTR_MIC_ENABLED] is False
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_success(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting volume successfully."""
         number = UnifiProtectMicrophoneVolumeNumber(
             coordinator=mock_coordinator,
@@ -320,18 +394,24 @@ class TestUnifiProtectMicrophoneVolumeNumber:
 
         await number.async_set_native_value(50.0)
 
-        mock_coordinator.protect_client.set_microphone_volume.assert_called_once_with(
-            camera_id="camera1",
-            volume=50,
+        protect = protect_owner(mock_coordinator)
+        protect.async_set_microphone_volume.assert_awaited_once_with("camera1", 50)
+        # The owner publishes micVolume; the value follows from the data.
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "cameras", "camera1", micVolume=50
         )
-        assert number._attr_native_value == 50.0
-        number.async_write_ha_state.assert_called_once()
+        number._update_from_data()
+        assert number._attr_native_value == 50
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_error(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_error(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting volume with error."""
-        mock_coordinator.protect_client.set_microphone_volume.side_effect = Exception(
-            "API error"
+        protect_owner(
+            mock_coordinator
+        ).async_set_microphone_volume.side_effect = HomeAssistantError(
+            "Unable to set microphone volume for camera camera1"
         )
 
         number = UnifiProtectMicrophoneVolumeNumber(
@@ -345,9 +425,11 @@ class TestUnifiProtectMicrophoneVolumeNumber:
 
         number.async_write_ha_state.assert_not_called()
 
-    def test_missing_mic_volume(self, mock_coordinator) -> None:
+    def test_missing_mic_volume(self, mock_coordinator: MagicMock) -> None:
         """A missing micVolume shows as unknown, not 0 (below the minimum of 1)."""
-        del mock_coordinator.data["protect"]["cameras"]["camera1"]["micVolume"]
+        mock_coordinator.data = _without_protect_fields(
+            mock_coordinator.data, "cameras", "camera1", "micVolume"
+        )
 
         number = UnifiProtectMicrophoneVolumeNumber(
             coordinator=mock_coordinator,
@@ -363,7 +445,7 @@ class TestUnifiProtectLightLevelNumber:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
         coordinator.protect_client.lights = MagicMock()
@@ -395,7 +477,7 @@ class TestUnifiProtectLightLevelNumber:
         }
         return coordinator
 
-    def test_initialization(self, mock_coordinator) -> None:
+    def test_initialization(self, mock_coordinator: MagicMock) -> None:
         """Test number entity initialization."""
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -409,7 +491,7 @@ class TestUnifiProtectLightLevelNumber:
         assert number._attr_entity_category == EntityCategory.CONFIG
         assert number._attr_mode == NumberMode.SLIDER
 
-    def test_update_from_data(self, mock_coordinator) -> None:
+    def test_update_from_data(self, mock_coordinator: MagicMock) -> None:
         """Test _update_from_data."""
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -419,7 +501,7 @@ class TestUnifiProtectLightLevelNumber:
         # ledLevel 3 of 6 is shown on the 0-100 slider as 50
         assert number._attr_native_value == 50
 
-    def test_slider_range_is_unchanged(self, mock_coordinator) -> None:
+    def test_slider_range_is_unchanged(self, mock_coordinator: MagicMock) -> None:
         """Test the user-facing slider stays 0-100 in whole percent steps."""
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -429,7 +511,7 @@ class TestUnifiProtectLightLevelNumber:
         assert number.native_max_value == 100
         assert number.native_step == 1
 
-    def test_extra_state_attributes(self, mock_coordinator) -> None:
+    def test_extra_state_attributes(self, mock_coordinator: MagicMock) -> None:
         """Test extra state attributes."""
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -442,7 +524,9 @@ class TestUnifiProtectLightLevelNumber:
         assert attrs[ATTR_LIGHT_LEVEL] == 3
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_success(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting light level successfully."""
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -453,18 +537,26 @@ class TestUnifiProtectLightLevelNumber:
         await number.async_set_native_value(60.0)
 
         # 60% maps to LED level 4, which reads back as 67%
-        mock_coordinator.protect_client.lights.set_brightness.assert_called_once_with(
+        protect = protect_owner(mock_coordinator)
+        protect.async_set_light_brightness.assert_awaited_once_with("light1", 4)
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "lights",
             "light1",
-            4,
+            lightDeviceSettings={"ledLevel": 4},
         )
+        number._update_from_data()
         assert number._attr_native_value == 67
-        number.async_write_ha_state.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_error(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_error(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting light level with error."""
-        mock_coordinator.protect_client.lights.set_brightness.side_effect = Exception(
-            "API error"
+        protect_owner(
+            mock_coordinator
+        ).async_set_light_brightness.side_effect = HomeAssistantError(
+            "Unable to set brightness for light light1"
         )
 
         number = UnifiProtectLightLevelNumber(
@@ -478,9 +570,11 @@ class TestUnifiProtectLightLevelNumber:
 
         number.async_write_ha_state.assert_not_called()
 
-    def test_missing_light_device_settings(self, mock_coordinator) -> None:
+    def test_missing_light_device_settings(self, mock_coordinator: MagicMock) -> None:
         """Test handling missing lightDeviceSettings."""
-        del mock_coordinator.data["protect"]["lights"]["light1"]["lightDeviceSettings"]
+        mock_coordinator.data = _without_protect_fields(
+            mock_coordinator.data, "lights", "light1", "lightDeviceSettings"
+        )
 
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -490,10 +584,10 @@ class TestUnifiProtectLightLevelNumber:
         assert number._attr_native_value is None
         assert number._attr_extra_state_attributes[ATTR_LIGHT_LEVEL] is None
 
-    def test_null_light_device_settings(self, mock_coordinator) -> None:
+    def test_null_light_device_settings(self, mock_coordinator: MagicMock) -> None:
         """Test lightDeviceSettings present but None reads as no value."""
-        mock_coordinator.data["protect"]["lights"]["light1"]["lightDeviceSettings"] = (
-            None
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "lights", "light1", lightDeviceSettings=None
         )
 
         number = UnifiProtectLightLevelNumber(
@@ -505,11 +599,16 @@ class TestUnifiProtectLightLevelNumber:
         assert number._attr_extra_state_attributes[ATTR_LIGHT_LEVEL] is None
 
     @pytest.mark.parametrize("led_level", [0, 7, "3", True, 3.5])
-    def test_invalid_led_level_reads_as_none(self, mock_coordinator, led_level) -> None:
+    def test_invalid_led_level_reads_as_none(
+        self, mock_coordinator: MagicMock, led_level: object
+    ) -> None:
         """Test an invalid ledLevel gives no value instead of a bogus percentage."""
-        mock_coordinator.data["protect"]["lights"]["light1"]["lightDeviceSettings"][
-            "ledLevel"
-        ] = led_level
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "lights",
+            "light1",
+            lightDeviceSettings={"ledLevel": led_level},
+        )
 
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -519,12 +618,15 @@ class TestUnifiProtectLightLevelNumber:
         assert number._attr_native_value is None
 
     def test_whole_number_float_led_level_reads_as_percent(
-        self, mock_coordinator
+        self, mock_coordinator: MagicMock
     ) -> None:
         """Test a whole-number float ledLevel (spec: number) is accepted."""
-        mock_coordinator.data["protect"]["lights"]["light1"]["lightDeviceSettings"][
-            "ledLevel"
-        ] = 6.0
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "lights",
+            "light1",
+            lightDeviceSettings={"ledLevel": 6.0},
+        )
 
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
@@ -538,25 +640,10 @@ class TestUnifiProtectLightLevelNumber:
         ("percent", "led_level", "shown"),
         [(0, 1, 17), (50, 3, 50), (100, 6, 100)],
     )
-    async def test_light_level_number_sends_spec_patch_body(
-        self, mock_coordinator, percent: float, led_level: int, shown: int
+    async def test_light_level_number_writes_the_led_level(
+        self, mock_coordinator: MagicMock, percent: float, led_level: int, shown: int
     ) -> None:
-        """Test the slider reaches PATCH /lights/{id} as a 1-6 ledLevel."""
-        client = UniFiProtectClient(
-            auth=ApiKeyAuth(api_key="test-key"),
-            base_url="https://192.168.1.1",
-            connection_type=ConnectionType.LOCAL,
-        )
-        client._patch = AsyncMock(return_value={"id": "light1", "mac": "00:11:22"})
-        mock_coordinator.protect_client = client
-        # Real coordinator methods, so the whole path down to the client runs
-        mock_coordinator._require_protect_client = lambda: client
-        mock_coordinator._async_execute_api_action = (
-            UnifiFacadeCoordinator._async_execute_api_action.__get__(mock_coordinator)
-        )
-        mock_coordinator.async_set_light_brightness = (
-            UnifiFacadeCoordinator.async_set_light_brightness.__get__(mock_coordinator)
-        )
+        """The slider percentage reaches the owner as a 1-6 ledLevel."""
         number = UnifiProtectLightLevelNumber(
             coordinator=mock_coordinator,
             light_id="light1",
@@ -565,30 +652,16 @@ class TestUnifiProtectLightLevelNumber:
 
         await number.async_set_native_value(percent)
 
-        client._patch.assert_awaited_once_with(
-            client.build_api_path("/lights/light1"),
-            json_data={"lightDeviceSettings": {"ledLevel": led_level}},
-        )
-        assert number._attr_native_value == shown
-
-    @pytest.mark.asyncio
-    async def test_light_level_number_brightness_fallback(
-        self, mock_coordinator
-    ) -> None:
-        """Test the fallback calls lights.set_brightness with the converted level."""
-        mock_coordinator.async_set_light_brightness = MagicMock()
-        number = UnifiProtectLightLevelNumber(
-            coordinator=mock_coordinator,
-            light_id="light1",
-        )
-        number.async_write_ha_state = MagicMock()
-
-        await number.async_set_native_value(100.0)
-
-        mock_coordinator.protect_client.lights.set_brightness.assert_awaited_once_with(
+        protect = protect_owner(mock_coordinator)
+        protect.async_set_light_brightness.assert_awaited_once_with("light1", led_level)
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "lights",
             "light1",
-            6,
+            lightDeviceSettings={"ledLevel": led_level},
         )
+        number._update_from_data()
+        assert number._attr_native_value == shown
 
 
 class TestUnifiProtectChimeVolumeNumber:
@@ -597,7 +670,7 @@ class TestUnifiProtectChimeVolumeNumber:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
         coordinator.protect_client.set_chime_volume = AsyncMock()
@@ -630,7 +703,7 @@ class TestUnifiProtectChimeVolumeNumber:
         }
         return coordinator
 
-    def test_initialization(self, mock_coordinator) -> None:
+    def test_initialization(self, mock_coordinator: MagicMock) -> None:
         """Test number entity initialization."""
         number = UnifiProtectChimeVolumeNumber(
             coordinator=mock_coordinator,
@@ -643,9 +716,9 @@ class TestUnifiProtectChimeVolumeNumber:
         assert number._attr_translation_key == "chime_volume"
         assert number._attr_entity_category == EntityCategory.CONFIG
         assert number._attr_mode == NumberMode.SLIDER
-        assert number._attr_icon == "mdi:volume-high"
+        assert getattr(number, "_attr_icon", None) is None
 
-    def test_update_from_data(self, mock_coordinator) -> None:
+    def test_update_from_data(self, mock_coordinator: MagicMock) -> None:
         """Test _update_from_data."""
         number = UnifiProtectChimeVolumeNumber(
             coordinator=mock_coordinator,
@@ -654,9 +727,13 @@ class TestUnifiProtectChimeVolumeNumber:
 
         assert number._attr_native_value == 65
 
-    def test_update_from_data_no_ring_settings(self, mock_coordinator) -> None:
+    def test_update_from_data_no_ring_settings(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test _update_from_data with no ring settings."""
-        mock_coordinator.data["protect"]["chimes"]["chime1"]["ringSettings"] = []
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "chimes", "chime1", ringSettings=[]
+        )
 
         number = UnifiProtectChimeVolumeNumber(
             coordinator=mock_coordinator,
@@ -666,7 +743,7 @@ class TestUnifiProtectChimeVolumeNumber:
         # Default is 80
         assert number._attr_native_value == 80
 
-    def test_extra_state_attributes(self, mock_coordinator) -> None:
+    def test_extra_state_attributes(self, mock_coordinator: MagicMock) -> None:
         """Test extra state attributes."""
         number = UnifiProtectChimeVolumeNumber(
             coordinator=mock_coordinator,
@@ -679,7 +756,9 @@ class TestUnifiProtectChimeVolumeNumber:
         assert attrs[ATTR_CHIME_VOLUME] == 65
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_success(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting chime volume successfully."""
         number = UnifiProtectChimeVolumeNumber(
             coordinator=mock_coordinator,
@@ -689,18 +768,27 @@ class TestUnifiProtectChimeVolumeNumber:
 
         await number.async_set_native_value(70.0)
 
-        mock_coordinator.protect_client.set_chime_volume.assert_called_once_with(
-            chime_id="chime1",
-            volume=70,
+        protect = protect_owner(mock_coordinator)
+        protect.async_set_chime_volume.assert_awaited_once_with("chime1", 70)
+        chime = mock_coordinator.data["protect"]["chimes"]["chime1"]
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "chimes",
+            "chime1",
+            ringSettings=[{**chime["ringSettings"][0], "volume": 70}],
         )
+        number._update_from_data()
         assert number._attr_native_value == 70
-        number.async_write_ha_state.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_error(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_error(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting chime volume with error."""
-        mock_coordinator.protect_client.set_chime_volume.side_effect = Exception(
-            "API error"
+        protect_owner(
+            mock_coordinator
+        ).async_set_chime_volume.side_effect = HomeAssistantError(
+            "Unable to set volume for chime chime1"
         )
 
         number = UnifiProtectChimeVolumeNumber(
@@ -721,7 +809,7 @@ class TestUnifiProtectChimeRepeatTimesNumber:
     @pytest.fixture
     def mock_coordinator(self) -> MagicMock:
         """Create mock coordinator."""
-        coordinator = MagicMock()
+        coordinator = autospec_command_owners(MagicMock())
         coordinator.protect_client = MagicMock()
         coordinator.protect_client.base_url = "https://192.168.1.1"
         coordinator.protect_client.set_chime_repeat = AsyncMock()
@@ -754,7 +842,7 @@ class TestUnifiProtectChimeRepeatTimesNumber:
         }
         return coordinator
 
-    def test_initialization(self, mock_coordinator) -> None:
+    def test_initialization(self, mock_coordinator: MagicMock) -> None:
         """Test number entity initialization."""
         number = UnifiProtectChimeRepeatTimesNumber(
             coordinator=mock_coordinator,
@@ -770,9 +858,9 @@ class TestUnifiProtectChimeRepeatTimesNumber:
         assert number._attr_native_max_value == 10
         assert number._attr_native_step == 1
         assert number._attr_mode == NumberMode.BOX
-        assert number._attr_icon == "mdi:repeat"
+        assert getattr(number, "_attr_icon", None) is None
 
-    def test_update_from_data(self, mock_coordinator) -> None:
+    def test_update_from_data(self, mock_coordinator: MagicMock) -> None:
         """Test _update_from_data."""
         number = UnifiProtectChimeRepeatTimesNumber(
             coordinator=mock_coordinator,
@@ -781,9 +869,13 @@ class TestUnifiProtectChimeRepeatTimesNumber:
 
         assert number._attr_native_value == 5
 
-    def test_update_from_data_no_ring_settings(self, mock_coordinator) -> None:
+    def test_update_from_data_no_ring_settings(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test _update_from_data with no ring settings."""
-        mock_coordinator.data["protect"]["chimes"]["chime1"]["ringSettings"] = []
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data, "chimes", "chime1", ringSettings=[]
+        )
 
         number = UnifiProtectChimeRepeatTimesNumber(
             coordinator=mock_coordinator,
@@ -793,7 +885,7 @@ class TestUnifiProtectChimeRepeatTimesNumber:
         # Default is 3
         assert number._attr_native_value == 3
 
-    def test_extra_state_attributes(self, mock_coordinator) -> None:
+    def test_extra_state_attributes(self, mock_coordinator: MagicMock) -> None:
         """Test extra state attributes."""
         number = UnifiProtectChimeRepeatTimesNumber(
             coordinator=mock_coordinator,
@@ -806,7 +898,9 @@ class TestUnifiProtectChimeRepeatTimesNumber:
         assert attrs[ATTR_CHIME_REPEAT_TIMES] == 5
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_success(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_success(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting repeat times successfully."""
         number = UnifiProtectChimeRepeatTimesNumber(
             coordinator=mock_coordinator,
@@ -816,18 +910,27 @@ class TestUnifiProtectChimeRepeatTimesNumber:
 
         await number.async_set_native_value(3.0)
 
-        mock_coordinator.protect_client.set_chime_repeat.assert_called_once_with(
-            chime_id="chime1",
-            repeat_times=3,
+        protect = protect_owner(mock_coordinator)
+        protect.async_set_chime_repeat.assert_awaited_once_with("chime1", 3)
+        chime = mock_coordinator.data["protect"]["chimes"]["chime1"]
+        mock_coordinator.data = with_protect_fields(
+            mock_coordinator.data,
+            "chimes",
+            "chime1",
+            ringSettings=[{**chime["ringSettings"][0], "repeatTimes": 3}],
         )
+        number._update_from_data()
         assert number._attr_native_value == 3
-        number.async_write_ha_state.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_async_set_native_value_error(self, mock_coordinator) -> None:
+    async def test_async_set_native_value_error(
+        self, mock_coordinator: MagicMock
+    ) -> None:
         """Test setting repeat times with error."""
-        mock_coordinator.protect_client.set_chime_repeat.side_effect = Exception(
-            "API error"
+        protect_owner(
+            mock_coordinator
+        ).async_set_chime_repeat.side_effect = HomeAssistantError(
+            "Unable to set repeat count for chime chime1"
         )
 
         number = UnifiProtectChimeRepeatTimesNumber(
@@ -854,18 +957,23 @@ class TestVoucherNumbers:
             "sites": {"site1": {"id": "site1", "name": "Main Site"}},
             "vouchers": {"site1": {}},
         }
-        coord.vouchers_available.return_value = True
+        autospec_command_owners(coord)
         settings_map: dict[str, VoucherSettings] = {}
 
         def get_settings(site_id: str) -> VoucherSettings:
             return settings_map.setdefault(site_id, VoucherSettings())
 
-        coord.get_voucher_settings.side_effect = get_settings
+        def set_setting(site_id: str, field: str, value: float) -> None:
+            settings_map[site_id] = replace(get_settings(site_id), **{field: value})
+
+        owner = coord.config_coordinator
+        owner.get_voucher_settings.side_effect = get_settings
+        owner.set_voucher_setting.side_effect = set_setting
         return coord
 
     @pytest.mark.asyncio
     async def test_voucher_numbers_created_without_protect_client(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """Voucher numbers are created even when protect_client is None."""
         mock_entry = MagicMock()
@@ -882,11 +990,17 @@ class TestVoucherNumbers:
 
     @pytest.mark.asyncio
     async def test_voucher_numbers_one_set_per_selected_site_with_empty_inventory(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """One set of 5 numbers per selected site with empty voucher inventory."""
-        voucher_coordinator.data["sites"]["site2"] = {"id": "site2", "name": "Branch"}
-        voucher_coordinator.data["vouchers"]["site2"] = {}
+        voucher_coordinator.data = with_sections(
+            voucher_coordinator.data,
+            sites={
+                **voucher_coordinator.data["sites"],
+                "site2": {"id": "site2", "name": "Branch"},
+            },
+            vouchers={**voucher_coordinator.data["vouchers"], "site2": {}},
+        )
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
         mock_entry.runtime_data.coordinator = voucher_coordinator
@@ -897,10 +1011,12 @@ class TestVoucherNumbers:
 
     @pytest.mark.asyncio
     async def test_voucher_numbers_skipped_without_vouchers_section(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """Voucher numbers are skipped if data has sites but lacks vouchers section."""
-        del voucher_coordinator.data["vouchers"]
+        voucher_coordinator.data = without_sections(
+            voucher_coordinator.data, "vouchers"
+        )
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
         mock_entry.runtime_data.coordinator = voucher_coordinator
@@ -911,7 +1027,7 @@ class TestVoucherNumbers:
 
     @pytest.mark.asyncio
     async def test_voucher_numbers_late_site_added_once(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """Adding a site dynamically triggers discovery exactly once."""
         mock_entry = MagicMock()
@@ -928,8 +1044,11 @@ class TestVoucherNumbers:
         ]
 
         # Add new site
-        voucher_coordinator.data["sites"]["site2"] = {"id": "site2"}
-        voucher_coordinator.data["vouchers"]["site2"] = {}
+        voucher_coordinator.data = with_sections(
+            voucher_coordinator.data,
+            sites={**voucher_coordinator.data["sites"], "site2": {"id": "site2"}},
+            vouchers={**voucher_coordinator.data["vouchers"], "site2": {}},
+        )
 
         discover_callback()
         assert len(added_entities) == 10
@@ -940,7 +1059,7 @@ class TestVoucherNumbers:
 
     @pytest.mark.asyncio
     async def test_voucher_number_construction_failure_is_retried(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """A failed entity construction is not recorded in known and is retried."""
         mock_entry = MagicMock()
@@ -1062,8 +1181,12 @@ class TestVoucherNumbers:
         )
         entity_int.async_write_ha_state = MagicMock()
 
+        owner = voucher_coordinator.config_coordinator
         await entity_int.async_set_native_value(60)
-        settings = voucher_coordinator.get_voucher_settings("site1")
+        owner.set_voucher_setting.assert_called_once_with(
+            "site1", "duration_minutes", 60
+        )
+        settings = owner.get_voucher_settings("site1")
         assert settings.duration_minutes == 60
         assert isinstance(settings.duration_minutes, int)
         entity_int.async_write_ha_state.assert_called_once()
@@ -1080,15 +1203,19 @@ class TestVoucherNumbers:
         entity_float.async_write_ha_state = MagicMock()
 
         await entity_float.async_set_native_value(12.5)
-        assert settings.download_limit_mbps == 12.5
-        assert isinstance(settings.download_limit_mbps, float)
+        replaced = owner.get_voucher_settings("site1")
+        assert replaced.download_limit_mbps == 12.5
+        assert isinstance(replaced.download_limit_mbps, float)
+        assert replaced.duration_minutes == 60
+        # The earlier settings object is replaced, not changed in place.
+        assert settings.download_limit_mbps == 0.0
 
         # No network client call
         assert voucher_coordinator.network_client.mock_calls == []
 
     @pytest.mark.asyncio
     async def test_voucher_number_restores_valid_value(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """Valid restored value updates settings."""
         desc = next(
@@ -1109,7 +1236,7 @@ class TestVoucherNumbers:
         ):
             await entity.async_added_to_hass()
 
-        settings = voucher_coordinator.get_voucher_settings("site1")
+        settings = voucher_coordinator.config_coordinator.get_voucher_settings("site1")
         assert settings.duration_minutes == 30
 
     @pytest.mark.asyncio
@@ -1144,13 +1271,13 @@ class TestVoucherNumbers:
         ):
             await entity.async_added_to_hass()
 
-        settings = voucher_coordinator.get_voucher_settings("site1")
+        settings = voucher_coordinator.config_coordinator.get_voucher_settings("site1")
         assert settings.duration_minutes == 480
 
-    def test_voucher_number_availability_follows_vouchers_available(
-        self, voucher_coordinator
+    def test_voucher_number_availability_follows_captured_vouchers(
+        self, voucher_coordinator: MagicMock
     ) -> None:
-        """Availability follows coordinator.vouchers_available."""
+        """Availability follows the site's captured voucher availability."""
         desc = VOUCHER_NUMBER_DESCRIPTIONS[0]
         entity = UnifiVoucherInputNumber(
             voucher_coordinator,
@@ -1158,9 +1285,9 @@ class TestVoucherNumbers:
             "site1",
             unique_id="console_site1_" + desc.key,
         )
-        voucher_coordinator.vouchers_available.return_value = True
+        set_availability(voucher_coordinator)
         assert entity.available is True
-        voucher_coordinator.vouchers_available.return_value = False
+        set_availability(voucher_coordinator, failed_sections={("vouchers", "site1")})
         assert entity.available is False
 
     def test_voucher_number_device_info_uses_site_device(
@@ -1178,15 +1305,18 @@ class TestVoucherNumbers:
 
     @pytest.mark.asyncio
     async def test_protect_numbers_still_created_next_to_voucher_numbers(
-        self, hass, voucher_coordinator
+        self, hass: HomeAssistant, voucher_coordinator: MagicMock
     ) -> None:
         """Verify voucher and Protect numbers when protect_client is present."""
         voucher_coordinator.protect_client = MagicMock()
-        voucher_coordinator.data["protect"] = {
-            "lights": {"l1": {"id": "l1", "name": "Light 1"}},
-            "cameras": {},
-            "chimes": {},
-        }
+        voucher_coordinator.data = with_sections(
+            voucher_coordinator.data,
+            protect={
+                "lights": {"l1": {"id": "l1", "name": "Light 1"}},
+                "cameras": {},
+                "chimes": {},
+            },
+        )
         mock_entry = MagicMock()
         mock_entry.data = {"console_id": "console"}
         mock_entry.runtime_data.coordinator = voucher_coordinator
