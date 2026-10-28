@@ -157,7 +157,7 @@ Carrier Fabric entries have their own options. See [Carrier Fabric setup](#carri
 | _Tunnel name_ Site-to-Site VPN                      | Binary sensor  | Connection state of each site-to-site VPN tunnel                                       |
 | WAN IP Address, WAN Uptime                          | Sensor         | Gateway, disabled by default                                                           |
 | WiFi _network name_                                 | Switch         | Turn a Wi-Fi network on or off                                                         |
-| _Policy name_                                       | Switch         | Turn a user-defined firewall policy on or off                                          |
+| _Policy name_                                       | Switch         | Turn a user-defined firewall policy on or off. A console-generated "(Return)" policy gets no switch: it follows its parent, and its id changes whenever a policy is deleted |
 | _Route name_                                        | Switch         | Turn a policy-based route on or off                                                    |
 | _VPN client name_                                   | Switch         | Turn a VPN client (WireGuard, OpenVPN, Privado VPN) on or off                          |
 | Port forward _rule name_                            | Switch         | Turn a port forwarding rule on or off                                                  |

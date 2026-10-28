@@ -552,6 +552,48 @@ class TestPruneOrphanedSwitchEntities:
 
         registry.async_remove.assert_called_once_with(stale_entry.entity_id)
 
+    def test_derived_return_policy_switch_pruned_user_rule_kept(
+        self, hass, mock_coordinator
+    ) -> None:
+        """A switch left over for a DERIVED "(Return)" policy is pruned even
+        though the policy is still listed: it no longer gets a switch, and its
+        id is not stable. The user rule's switch and the others stay (cmcore,
+        backlog 976)."""
+        mock_coordinator.data = with_rule(
+            mock_coordinator.data,
+            "firewall_rules",
+            "site1",
+            "derived1",
+            {"metadata": {"origin": "DERIVED"}},
+        )
+        user_entry = self._reg_entry("site1_rule1_firewall_rule")
+        derived_entry = self._reg_entry("site1_derived1_firewall_rule")
+        route_entry = self._reg_entry("site1_route1_policy_based_route")
+
+        registry = self._prune(
+            hass, mock_coordinator, [user_entry, derived_entry, route_entry]
+        )
+
+        registry.async_remove.assert_called_once_with(derived_entry.entity_id)
+
+    def test_only_derived_policies_left_still_prunes_their_switches(
+        self, hass, mock_coordinator
+    ) -> None:
+        """A site whose listed policies are all DERIVED is a real, non-empty
+        fetch: their leftover switches are pruned, not kept by the empty-site
+        guard (cmcore, backlog 976)."""
+        mock_coordinator.data = _with_site_records(
+            mock_coordinator.data,
+            "firewall_rules",
+            "site1",
+            {"derived1": {"metadata": {"origin": "DERIVED"}}},
+        )
+        derived_entry = self._reg_entry("site1_derived1_firewall_rule")
+
+        registry = self._prune(hass, mock_coordinator, [derived_entry])
+
+        registry.async_remove.assert_called_once_with(derived_entry.entity_id)
+
     @pytest.mark.parametrize(
         ("data_key", "suffix", "availability_attr"), _ORPHAN_TYPE_PARAMS
     )
@@ -1531,6 +1573,71 @@ class TestAsyncSetupEntryFirewallRules:
         ]
         assert len(firewall_switches) == 2
         assert {entity._rule_id for entity in firewall_switches} == {"rule1", "rule2"}
+
+    @pytest.mark.asyncio
+    async def test_setup_entry_skips_derived_return_policies(
+        self, hass, mock_coordinator
+    ) -> None:
+        """A console-generated "(Return)" policy (origin DERIVED) gets no switch.
+
+        Its id is name-based and moves when any policy is deleted, so a switch
+        keyed on it would end up naming and toggling another rule (cmcore,
+        backlog 976).
+        """
+        mock_coordinator.data = with_rule(
+            mock_coordinator.data,
+            "firewall_rules",
+            "site1",
+            "derived",
+            {
+                "id": "derived",
+                "name": "Block Instagram (Return)",
+                "enabled": True,
+                "metadata": {"origin": "DERIVED"},
+            },
+        )
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = mock_coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+
+        entities = async_add_entities.call_args[0][0]
+        firewall_switches = [
+            entity
+            for entity in entities
+            if (
+                isinstance(entity, UnifiInsightsNetworkRuleSwitch)
+                and entity.entity_description is FIREWALL_RULE_SWITCH
+            )
+        ]
+        assert {entity._rule_id for entity in firewall_switches} == {"rule1", "rule2"}
+
+    def test_a_switch_whose_policy_became_derived_is_unavailable(
+        self, mock_coordinator
+    ) -> None:
+        """A live switch whose id now names a DERIVED policy reads unavailable
+        rather than toggling it (cmcore, backlog 976)."""
+        switch = UnifiInsightsNetworkRuleSwitch(
+            mock_coordinator, FIREWALL_RULE_SWITCH, "site1", "rule1"
+        )
+        assert switch.available is True
+
+        mock_coordinator.data = with_rule(
+            mock_coordinator.data,
+            "firewall_rules",
+            "site1",
+            "rule1",
+            {
+                "id": "rule1",
+                "name": "Block Instagram (Return)",
+                "enabled": True,
+                "metadata": {"origin": "DERIVED"},
+            },
+        )
+        assert switch.available is False
 
     @pytest.mark.asyncio
     async def test_setup_entry_firewall_rules_malformed_record_and_dedupe(

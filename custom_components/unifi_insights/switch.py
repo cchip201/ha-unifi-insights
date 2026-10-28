@@ -88,6 +88,31 @@ def _get_firewall_rule_action(rule_data: dict[str, Any]) -> str | None:
     return str(action) if action is not None else None
 
 
+def _is_derived_firewall_rule(rule_data: Any) -> bool:
+    """
+    Return True for a policy the console generates from another policy.
+
+    cmcore (backlog 976): a user policy with "allow return traffic" gets a
+    generated "<name> (Return)" policy, ``metadata.origin == "DERIVED"``. It has
+    no settings of its own - it follows its parent - and the integration API
+    gives it a name-based id that moves when any policy is deleted, so a switch
+    keyed on that id ends up naming, and toggling, a different rule (about 30
+    of 109 on 2026-10-15). Derived policies therefore get no switch, and an
+    existing one is pruned as orphaned.
+    """
+    if not isinstance(rule_data, dict):
+        return False
+    metadata = rule_data.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("origin") == "DERIVED"
+
+
+def _is_hidden_firewall_rule(rule_data: dict[str, Any]) -> bool:
+    """Return True for a policy that gets no switch: system-defined, or derived."""
+    return _is_predefined_firewall_rule(rule_data) or _is_derived_firewall_rule(
+        rule_data
+    )
+
+
 def _resolve_site_name(
     coordinator: UnifiInsightsFacadeCoordinator, site_id: str
 ) -> str:
@@ -112,6 +137,12 @@ def _stale_switch_unique_ids(
 ) -> set[str]:
     """
     Return unique_ids of switches whose backing object no longer exists.
+
+    ``is_hidden_fn`` narrows "exists" to the objects that still get a switch:
+    an object it accepts counts as gone, so a switch the integration no longer
+    creates for it - a console-managed NAT rule, or (cmcore, backlog 976) a
+    derived "(Return)" firewall policy - is pruned like a deleted one. The
+    empty-collection guard below still looks at the raw collection.
 
     Policy-based-route, firewall-rule, and VPN-client switches have no
     cleanup: deleting the underlying object on the console leaves ``available``
@@ -245,7 +276,7 @@ def _prune_orphaned_switch_entities(
             "_firewall_rule",
             "firewall_rules",
             lambda site_id: site_section_available(data, site_id, "firewall_rules"),
-            None,
+            _is_derived_firewall_rule,
         ),
         (
             "_vpn_client",
@@ -1306,7 +1337,8 @@ FIREWALL_RULE_SWITCH = UnifiInsightsNetworkRuleSwitchEntityDescription(
     ),
     command=lambda owner: owner.async_set_firewall_rule_enabled,
     attributes_fn=_firewall_rule_attributes,
-    is_hidden_fn=_is_predefined_firewall_rule,
+    # cmcore (backlog 976): a derived "(Return)" policy gets no switch either.
+    is_hidden_fn=_is_hidden_firewall_rule,
     strict_enabled=False,
     fallback_device=(
         "firewall_policies",
