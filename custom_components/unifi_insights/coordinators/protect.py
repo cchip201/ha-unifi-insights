@@ -32,10 +32,15 @@ from unifi_official_api.protect.talkback import (
     TalkbackStream,
 )
 
-from custom_components.unifi_insights.const import DOMAIN, SCAN_INTERVAL_PROTECT
+from custom_components.unifi_insights.const import DOMAIN
 from custom_components.unifi_insights.probe import is_malformed_response
 
-from .base import CommandFailure, UnifiInsightsBaseCoordinator, async_execute_command
+from .base import (
+    CommandFailure,
+    UnifiInsightsBaseCoordinator,
+    async_execute_command,
+    entry_poll_interval,
+)
 from .protect_events import (
     MAX_CONSECUTIVE_EMPTY_FETCHES,
     MAX_CONSECUTIVE_MISSING_POLLS,
@@ -195,7 +200,7 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
             protect_client=protect_client,
             entry=entry,
             name="protect",
-            update_interval=SCAN_INTERVAL_PROTECT,
+            update_interval=entry_poll_interval(entry),
         )
         # Latches, sensor recency, tamper records, siren stop guards,
         # WebSocket generations and per-family counters, owned by the pure
@@ -275,7 +280,9 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
         # update interval via async_set_updated_data, postponing the 30s full
         # poll indefinitely. An independent timer guarantees sensor state
         # reconciliation every 30 seconds regardless of camera activity.
-        self._sensor_reconcile_interval: timedelta = SCAN_INTERVAL_PROTECT
+        # cmcore (backlog 663): the same interval as the main poll, so a slower
+        # cloud poll is not undone by this timer's own /sensors calls.
+        self._sensor_reconcile_interval: timedelta = entry_poll_interval(entry)
         self._unsub_sensor_reconcile: Callable[[], None] | None = None
         self._sensor_refresh_task: asyncio.Task[None] | None = None
         self._sensor_reconcile_task: asyncio.Task[None] | None = None
@@ -328,9 +335,9 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
         """
         Start the real-time Protect WebSocket subscription.
 
-        This is additive to the 30 second poll (SCAN_INTERVAL_PROTECT), which
-        remains the fallback if the WebSocket is unavailable or drops - it is
-        never removed by this method. Any failure here is logged and
+        This is additive to the entry's poll (`entry_poll_interval`: 30 s local,
+        120 s cloud), which remains the fallback if the WebSocket is unavailable
+        or drops - it is never removed by this method. Any failure here is logged and
         swallowed so a WebSocket problem never blocks integration setup or
         leaves the coordinator without its polling fallback.
         """
@@ -346,7 +353,7 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
             _LOGGER.warning(
                 "Protect coordinator: Unable to resolve host_id for WebSocket "
                 "subscription, falling back to %s polling only: %s",
-                SCAN_INTERVAL_PROTECT,
+                self.update_interval,
                 err,
             )
             return
@@ -677,8 +684,8 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
         after the first completes. The waiter's own `await` returns as
         soon as the *original* in-flight fetch finishes - it does not wait
         for that follow-up fetch. This is a deliberate, bounded trade-off
-        (see `MAX_SENSOR_REFRESH_LOOP_ITERATIONS`): the 30s reconcile timer
-        and the 30s main poll share `SCAN_INTERVAL_PROTECT`, so this
+        (see `MAX_SENSOR_REFRESH_LOOP_ITERATIONS`): the reconcile timer
+        and the main poll share `entry_poll_interval`, so this
         collision is routine, not a rare edge case.
 
         `raise_on_error`: when True, an error from the underlying fetch

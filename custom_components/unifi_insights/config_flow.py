@@ -19,6 +19,9 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -67,6 +70,7 @@ from .const import (
     CONF_CONNECTION_TYPE,
     CONF_CONSOLE_ID,
     CONF_CONSOLE_NAME,
+    CONF_POLL_INTERVAL,
     CONF_SITE_IDS,
     CONF_TRACK_CLIENTS,
     CONF_TRACK_SUBSCRIBERS,
@@ -83,6 +87,9 @@ from .const import (
     DEFAULT_TRACK_CLIENTS,
     DEFAULT_TRACK_SUBSCRIBERS,
     DOMAIN,
+    MAX_POLL_INTERVAL,
+    MIN_POLL_INTERVAL,
+    poll_interval_seconds,
 )
 from .probe import (
     ProbeResult,
@@ -1400,6 +1407,10 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
         current_site_ids: list[str] = list(
             self.config_entry.options.get(CONF_SITE_IDS) or []
         )
+        connection_type = self.config_entry.data.get(CONF_CONNECTION_TYPE)
+        current_poll_interval = poll_interval_seconds(
+            connection_type, self.config_entry.options
+        )
         # Sites are only known while the entry is loaded. Offer the picker for
         # multi-site consoles, or whenever a filter is already saved so it can
         # be cleared.
@@ -1409,6 +1420,14 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
 
         if user_input is not None:
             options = dict(user_input)
+            # cmcore (backlog 663): store whole seconds within the bounds; a cleared
+            # field stores nothing, so the connection type's default applies again.
+            if options.get(CONF_POLL_INTERVAL) in (None, ""):
+                options.pop(CONF_POLL_INTERVAL, None)
+            else:
+                options[CONF_POLL_INTERVAL] = poll_interval_seconds(
+                    connection_type, {CONF_POLL_INTERVAL: options[CONF_POLL_INTERVAL]}
+                )
             if not show_site_picker:
                 # The picker was not shown (entry not loaded, or a single-site
                 # console), so keep whatever filter was saved before.
@@ -1447,6 +1466,17 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
                 CONF_CLIENT_CONTROL,
                 default=default_client_control,
             ): bool,
+            # Suggested, not a default (like the site picker): an entry stores no
+            # interval until one is chosen, so its connection type's default holds.
+            vol.Optional(CONF_POLL_INTERVAL): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_POLL_INTERVAL,
+                    max=MAX_POLL_INTERVAL,
+                    step=15,
+                    unit_of_measurement="s",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
         }
         if self._access_webhook_available():
             schema[
@@ -1483,7 +1513,11 @@ class UnifiInsightsOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(schema), {CONF_SITE_IDS: current_site_ids}
+                vol.Schema(schema),
+                {
+                    CONF_SITE_IDS: current_site_ids,
+                    CONF_POLL_INTERVAL: current_poll_interval,
+                },
             ),
         )
 

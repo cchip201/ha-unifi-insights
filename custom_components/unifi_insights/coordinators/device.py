@@ -39,7 +39,6 @@ from custom_components.unifi_insights.client_wake import (
 from custom_components.unifi_insights.const import (
     DOMAIN,
     MAX_CONSECUTIVE_MISSING_POLLS,
-    SCAN_INTERVAL_DEVICE,
 )
 from custom_components.unifi_insights.data_transforms import (
     CPU_STAT_KEYS,
@@ -56,7 +55,12 @@ from custom_components.unifi_insights.topology import (
     normalize_mac,
 )
 
-from .base import CommandFailure, UnifiInsightsBaseCoordinator, async_execute_command
+from .base import (
+    CommandFailure,
+    UnifiInsightsBaseCoordinator,
+    async_execute_command,
+    entry_poll_interval,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -813,7 +817,7 @@ class UnifiInsightsDeviceCoordinator(UnifiInsightsBaseCoordinator):
             protect_client=protect_client,
             entry=entry,
             name="device",
-            update_interval=SCAN_INTERVAL_DEVICE,
+            update_interval=entry_poll_interval(entry),
         )
         self.config_coordinator = config_coordinator
         # Track sites operating on legacy fallback to avoid spamming the log

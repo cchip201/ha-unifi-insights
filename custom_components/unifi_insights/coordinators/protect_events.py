@@ -97,9 +97,10 @@ FAMILIES: Final[tuple[Family, ...]] = (
 # and detection binary sensors are on from "start seen, end not yet seen", so
 # a lost "end" would otherwise keep them on forever; a stuck motion sensor in
 # a security system is worse than one that never fires. Five minutes is well
-# above the 30 second poll (no false expiry from poll jitter) and above any
-# real single motion or ring event, yet short enough that a stuck sensor heals
-# within minutes. It is the same for every event type.
+# above the poll (30 s local, 120 s cloud by default - cmcore, backlog 663), so
+# there is no false expiry from poll jitter, and above any real single motion
+# or ring event, yet short enough that a stuck sensor heals within minutes. It
+# is the same for every event type.
 STALE_EVENT_TIMEOUT: Final = timedelta(minutes=5)
 
 # How long the event store keeps an event, counted from the first sweep that

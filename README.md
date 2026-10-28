@@ -115,6 +115,7 @@ To change these settings after setup, go to **Settings** → **Devices & service
 | Track Wired Clients   | Off     | Creates a device tracker for each wired client.                                                                                                                                    |
 | Enable Client Control | On      | Creates client allow/block switches, reconnect buttons and disabled-by-default Wake-on-LAN buttons for wired clients. Turn off for read-only monitoring.                           |
 | Sites                 | All     | Only shown when the console has more than one site. Choose the sites to poll. Sites you don't choose are not queried at all, which reduces API traffic. Leave empty for all sites. |
+| Poll interval (s)     | 30/120  | How often devices, clients and Protect are polled, 30-900 s. Cloud entries default to 120 s because UniFi's remote connector times out (HTTP 408) under faster polling; local entries default to 30 s. Clear the field to return to the default. |
 
 Carrier Fabric entries have their own options. See [Carrier Fabric setup](#carrier-fabric-setup).
 
