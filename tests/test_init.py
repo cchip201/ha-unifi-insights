@@ -779,6 +779,32 @@ async def test_remove_config_entry_device_for_empty_client_device(
     assert await async_remove_config_entry_device(hass, entry, network) is False
 
 
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "innerspace_dcba8527-f206-450a-87da-5691f873f9d9",
+        "innerspace_floor_plan_1cf17015-9d46-41f0-af10-e20646881ffc",
+    ],
+)
+async def test_remove_config_entry_device_for_innerspace_without_innerspace(
+    hass: HomeAssistant, identifier: str
+) -> None:
+    """An InnerSpace device of an entry without InnerSpace can go (cmcore, 1374)."""
+    entry = _entry_with_sites({"default": "Default"}, ["default"])
+    device = _hold_an_entity(hass, _device_entry(identifier))
+
+    # the entry reads InnerSpace: the device and its placement stay
+    assert await async_remove_config_entry_device(hass, entry, device) is False
+
+    # the entry set up without InnerSpace: nothing can update the device again
+    entry.runtime_data.innerspace_coordinator = None
+    assert await async_remove_config_entry_device(hass, entry, device) is True
+
+    # a device that is not InnerSpace's is not covered by this rule
+    network = _hold_an_entity(hass, _device_entry("default_device-1"))
+    assert await async_remove_config_entry_device(hass, entry, network) is False
+
+
 async def test_remove_config_entry_device_ephemeral_without_runtime_data(
     hass: HomeAssistant,
 ) -> None:

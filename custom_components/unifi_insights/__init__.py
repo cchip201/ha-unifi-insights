@@ -939,6 +939,12 @@ async def async_remove_config_entry_device(
     integration set up, and it is left empty once the client is back. Nothing
     re-uses an empty one, so deleting it loses nothing - a tracker that needs a
     client device again creates a new one.
+
+    cmcore fork (backlog 1374): so can an InnerSpace device or floor plan of an
+    entry that set up without InnerSpace - the app is gone from the console, or
+    the console does not answer for it. Only the InnerSpace coordinator
+    creates or updates those devices, so none of them can come back before the
+    entry sets up with InnerSpace again; the same rule as Mobility's above.
     """
     if _is_ephemeral_client_device(device_entry):
         return True
@@ -975,6 +981,9 @@ async def async_remove_config_entry_device(
             or _is_stale_wifi_identifier(identifier, config_coordinator, polled)
             or _is_stale_mobility_identifier(
                 identifier, runtime_data.mobility_coordinator
+            )
+            or _is_stale_innerspace_identifier(
+                identifier, runtime_data.innerspace_coordinator
             )
         )
         for domain, identifier in device_entry.identifiers
@@ -1134,6 +1143,21 @@ def _is_stale_mobility_identifier(
         workspace_id = identifier.removeprefix(MOBILITY_WORKSPACE_PREFIX)
         return workspace_id not in data["workspaces"]
     return identifier.removeprefix(MOBILITY_DEVICE_PREFIX) not in data["devices"]
+
+
+def _is_stale_innerspace_identifier(
+    identifier: str, coordinator: UnifiInsightsInnerSpaceCoordinator | None
+) -> bool:
+    """
+    Return True for an InnerSpace device of an entry without InnerSpace (cmcore, 1374).
+
+    InnerSpace devices (``innerspace_<record id>``) and floor plans
+    (``innerspace_floor_plan_<plan id>``) are made only from the entry's
+    InnerSpace coordinator. An entry that set up without one can never update
+    them again. With a coordinator they stay: a record the project no longer
+    places is not proof enough.
+    """
+    return identifier.startswith("innerspace_") and coordinator is None
 
 
 def _is_stale_wifi_identifier(
