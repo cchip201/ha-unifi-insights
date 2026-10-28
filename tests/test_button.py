@@ -1137,6 +1137,49 @@ class TestAsyncSetupEntryWithClients:
         ]
         assert len(reconnect_buttons) == 3
 
+    async def test_setup_entry_skips_ephemeral_client_buttons(
+        self, hass: HomeAssistant, mock_coordinator, mock_config_entry
+    ):
+        """
+        cmcore fork (backlog 529): a randomized, unnamed client gets no buttons.
+
+        No reconnect button and no Wake button: each would be a registry row per
+        rotating MAC. A named client on a randomized MAC keeps both.
+        """
+        mock_coordinator.data = {
+            **mock_coordinator.data,
+            "clients": {
+                "site1": {
+                    "ephemeral": {
+                        "id": "ephemeral",
+                        "mac": "aa:bb:cc:00:00:01",  # locally administered, no name
+                        "type": "WIRED",
+                    },
+                    "named": {
+                        "id": "named",
+                        "mac": "aa:bb:cc:00:00:02",  # locally administered, but named
+                        "name": "Workshop PC",
+                        "type": "WIRED",
+                    },
+                },
+            },
+        }
+        added_entities: list = []
+
+        def add_entities(new_entities, **kwargs):
+            added_entities.extend(new_entities)
+
+        await async_setup_entry(hass, mock_config_entry, add_entities)
+
+        reconnect = [
+            e._client_id
+            for e in added_entities
+            if isinstance(e, UnifiClientReconnectButton)
+        ]
+        wake = [e for e in added_entities if isinstance(e, UnifiClientWakeButton)]
+        assert reconnect == ["named"]
+        assert [e.unique_id for e in wake] == [f"{DOMAIN}_aa:bb:cc:00:00:02_wake"]
+
     async def test_setup_entry_client_button_uses_name(
         self, hass: HomeAssistant, mock_coordinator, mock_config_entry
     ):

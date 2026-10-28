@@ -34,6 +34,7 @@ from .entity import (
     UnifiMobilityRouterEntity,
     async_add_mobility_router_entities,
     get_field,
+    is_ephemeral_client,
 )
 from .entity import get_client_type as _get_client_type
 
@@ -81,6 +82,11 @@ def _partition_connected_clients(
         for client_data in clients.values():
             mac = get_field(client_data, "macAddress", "mac_address", "mac", default="")
             if not mac:
+                continue
+            if is_ephemeral_client(client_data):
+                # cmcore fork (backlog 529): no new tracker for a randomized,
+                # unnamed client, and not "untracked" either - that set removes
+                # registry entries.
                 continue
             if _client_should_be_tracked(
                 client_data, track_wifi=track_wifi, track_wired=track_wired

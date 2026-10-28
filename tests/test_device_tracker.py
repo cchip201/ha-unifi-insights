@@ -805,7 +805,9 @@ class TestGetClientType:
                 "site3": [1, 2, 3],
                 "site4": {
                     "client1": {
-                        "mac": "AA:BB:CC:DD:EE:FF",
+                        # A global (burned-in) MAC: the cmcore fork skips a
+                        # randomized, unnamed client (backlog 529).
+                        "mac": "A8:BB:CC:DD:EE:FF",
                         "type": "WIRELESS",
                     }
                 },
@@ -814,7 +816,7 @@ class TestGetClientType:
         wanted, untracked = _partition_connected_clients(
             coordinator, track_wifi=True, track_wired=True
         )
-        assert wanted == {"aa:bb:cc:dd:ee:ff": "site4"}
+        assert wanted == {"a8:bb:cc:dd:ee:ff": "site4"}
         assert untracked == set()
 
 
@@ -1079,7 +1081,9 @@ class TestRegistryReconciliation:
     """
 
     OFFLINE_MAC: str = "aa:bb:cc:dd:ee:01"
-    WIRED_MAC: str = "aa:bb:cc:dd:ee:02"
+    # A global MAC: the cmcore fork leaves a randomized, unnamed client alone
+    # (test below).
+    WIRED_MAC: str = "a8:bb:cc:dd:ee:02"
     WIFI_MAC: str = "aa:bb:cc:dd:ee:03"
 
     @pytest.fixture
@@ -1173,6 +1177,58 @@ class TestRegistryReconciliation:
         await async_setup_entry(hass, entry, MagicMock())
 
         assert entity_registry.async_get(entity_id) is None
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_client_of_untracked_type_is_left_alone(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """cmcore fork (529): a randomized, unnamed client is not tracked or removed."""
+        # locally administered, and the payload carries no name
+        mac = "aa:bb:cc:dd:ee:04"
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data, "site1", {"c1": self._client(mac, "WIRED")}
+        )
+
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        entity_id = self._register(entity_registry, entry, mac)
+
+        await async_setup_entry(hass, entry, MagicMock())
+
+        assert entity_registry.async_get(entity_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_client_gets_no_new_tracker(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator: MagicMock,
+    ) -> None:
+        """cmcore fork (529): a randomized, unnamed client mints no tracker."""
+        ephemeral = "aa:bb:cc:dd:ee:04"  # locally administered, no name
+        named = {**self._client("aa:bb:cc:dd:ee:05", "WIRELESS"), "name": "Pixel"}
+        mock_coordinator.data = _with_site_clients(
+            mock_coordinator.data,
+            "site1",
+            {"c1": self._client(ephemeral, "WIRELESS"), "c2": named},
+        )
+
+        entry = self._entry(hass, mock_coordinator, {"track_wifi_clients": True})
+        added = MagicMock()
+
+        await async_setup_entry(hass, entry, added)
+
+        trackers = [
+            entity
+            for call in added.call_args_list
+            for entity in call.args[0]
+            if isinstance(entity, UnifiClientTracker)
+        ]
+        # a named client on a randomized MAC keeps its tracker
+        assert [tracker.unique_id for tracker in trackers] == [
+            f"{DOMAIN}_aa:bb:cc:dd:ee:05"
+        ]
 
     @pytest.mark.asyncio
     async def test_connected_tracked_client_is_kept(

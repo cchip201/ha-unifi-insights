@@ -59,6 +59,7 @@ from .entity import (
     console_device_info,
     get_field,
     is_device_serviceable,
+    is_ephemeral_client,
 )
 
 if TYPE_CHECKING:
@@ -467,7 +468,10 @@ async def async_setup_entry(
         if current_client_control:
             clients_by_site = section_by_site(coordinator.data, "clients") or {}
             for site_id, clients in clients_by_site.items():
-                for client_id in clients:
+                for client_id, client_data in clients.items():
+                    if is_ephemeral_client(client_data):
+                        # cmcore fork (backlog 529): randomized MAC, no name
+                        continue
                     key = (site_id, client_id, "block_switch")
                     if key in known_switch_keys:
                         continue

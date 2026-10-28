@@ -70,6 +70,7 @@ from .entity import (
     door_device_info,
     get_client_type,
     get_field,
+    is_ephemeral_client,
 )
 from .topology import normalize_mac
 
@@ -387,7 +388,10 @@ async def async_setup_entry(
         if current_client_control:
             clients_by_site = section_by_site(coordinator.data, "clients") or {}
             for site_id, clients in clients_by_site.items():
-                for client_id in clients:
+                for client_id, client_data in clients.items():
+                    if is_ephemeral_client(client_data):
+                        # cmcore fork (backlog 529): randomized MAC, no name
+                        continue
                     client_key = (site_id, client_id, "reconnect")
                     if client_key in known_button_keys:
                         continue
@@ -401,6 +405,9 @@ async def async_setup_entry(
                     )
             for site_id, clients in clients_by_site.items():
                 for client_data in clients.values():
+                    if is_ephemeral_client(client_data):
+                        # cmcore fork (backlog 529): randomized MAC, no name
+                        continue
                     wake_mac = _wired_client_mac(client_data)
                     if wake_mac is None or wake_mac in known_wake_macs:
                         continue

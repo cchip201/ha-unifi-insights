@@ -3339,8 +3339,9 @@ class TestAsyncSetupEntryEdgeCases:
                 "site1": {
                     "client1": {
                         "id": "client1",
-                        # No name, no hostname, fallback to mac
-                        "mac": "AA:BB:CC:DD:EE:FF",
+                        # No name, no hostname, fallback to mac. A global (burned-in)
+                        # MAC: the cmcore fork skips a randomized one (test below).
+                        "mac": "A8:BB:CC:DD:EE:FF",
                         "blocked": False,
                     }
                 }
@@ -3369,6 +3370,59 @@ class TestAsyncSetupEntryEdgeCases:
         client_switches = [e for e in entities if isinstance(e, UnifiClientBlockSwitch)]
 
         assert len(client_switches) == 1
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_client_gets_no_block_switch(self, hass) -> None:
+        """cmcore fork (529): a randomized, unnamed client gets no block switch."""
+        coordinator = autospec_command_owners(MagicMock())
+        coordinator.protect_client = None
+        coordinator.network_client = MagicMock()
+        coordinator.network_client.base_url = "https://192.168.1.1"
+        coordinator.data = {
+            "sites": {"site1": {"id": "site1"}},
+            "devices": {"site1": {}},
+            "stats": {},
+            "clients": {
+                "site1": {
+                    "client1": {
+                        "id": "client1",
+                        # Locally administered MAC, no name, no hostname
+                        "mac": "AA:BB:CC:DD:EE:FF",
+                        "blocked": False,
+                    },
+                    "client2": {
+                        "id": "client2",
+                        # Locally administered too, but named: it keeps its switch
+                        "mac": "AA:BB:CC:DD:EE:01",
+                        "name": "Workshop PC",
+                        "blocked": False,
+                    },
+                }
+            },
+            "wifi": {},
+            "protect": {
+                "cameras": {},
+                "lights": {},
+                "sensors": {},
+                "nvrs": {},
+                "viewers": {},
+                "chimes": {},
+                "liveviews": {},
+            },
+        }
+
+        mock_entry = MagicMock()
+        mock_entry.runtime_data = MagicMock()
+        mock_entry.runtime_data.coordinator = coordinator
+
+        async_add_entities = MagicMock()
+
+        await async_setup_entry(hass, mock_entry, async_add_entities)
+
+        entities = async_add_entities.call_args[0][0]
+        client_switches = [e for e in entities if isinstance(e, UnifiClientBlockSwitch)]
+
+        assert [e.unique_id for e in client_switches] == ["site1_client2_block_switch"]
 
     @pytest.mark.asyncio
     async def test_wifi_name_fallback_to_ssid(self, hass) -> None:

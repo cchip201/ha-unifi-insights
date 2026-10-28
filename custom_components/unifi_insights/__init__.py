@@ -927,7 +927,14 @@ async def async_remove_config_entry_device(
     reports them. Everything else is refused:
     devices of polled sites are live, and Protect and client devices are not
     site-scoped.
+
+    cmcore fork (backlog 529): the device of a randomized, unnamed client can
+    be deleted too. This fork creates no entity for such a client, so nothing
+    re-creates its device; before the fork each one minted a permanent device.
     """
+    if _is_ephemeral_client_device(device_entry):
+        return True
+
     runtime_data = getattr(entry, "runtime_data", None)
     if runtime_data is None:
         return False
@@ -1053,6 +1060,30 @@ def _has_live_protect_counterpart(
             for record in records.values()
         ):
             return True
+    return False
+
+
+def _is_ephemeral_client_device(device_entry: DeviceEntry) -> bool:
+    """
+    Return True for the device of a randomized, unnamed client (cmcore, 529).
+
+    The same test as is_ephemeral_client, read from the registry: a
+    ``client_<mac>`` identifier with a locally administered MAC, and a device
+    name that is empty or the MAC itself. A name given in Home Assistant
+    (name_by_user) makes it a named client.
+    """
+    from .entity import is_ephemeral_client  # noqa: PLC0415 - keep the import lazy
+
+    for domain, identifier in device_entry.identifiers:
+        if domain != DOMAIN or not identifier.startswith("client_"):
+            continue
+        # Typed as object: anything but a string is never taken for a MAC.
+        name: object = device_entry.name_by_user or device_entry.name or ""
+        if not isinstance(name, str):
+            return False
+        return is_ephemeral_client(
+            {"mac": identifier.removeprefix("client_"), "name": name}
+        )
     return False
 
 

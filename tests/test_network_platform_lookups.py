@@ -357,17 +357,20 @@ async def _sweep_known_device_ids(data: FacadeData) -> None:
 @pytest.mark.parametrize("variant", NO_RECORD)
 def test_connected_clients_need_a_client_record(variant: Variant) -> None:
     """Tracking and Wake discovery only see client records."""
-    record = {"macAddress": MAC, "type": "WIRED"}
+    # A global (burned-in) MAC: the cmcore fork does not track a randomized,
+    # unnamed client (backlog 529), and MAC is locally administered.
+    mac = "a8:00:00:00:00:0a"
+    record = {"macAddress": mac, "type": "WIRED"}
     found = _coordinator(_snapshot("clients", record))
     missing = _coordinator(variant(facade_data(), "clients"))
 
     assert device_tracker._partition_connected_clients(
         found, track_wifi=True, track_wired=True
-    ) == ({MAC: SITE}, set())
+    ) == ({mac: SITE}, set())
     assert device_tracker._partition_connected_clients(
         missing, track_wifi=True, track_wired=True
     ) == ({}, set())
-    assert button._connected_client_macs(found) == {MAC}
+    assert button._connected_client_macs(found) == {mac}
     assert button._connected_client_macs(missing) == set()
 
 
