@@ -34,7 +34,12 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import CarrierFabricData
-from .console_identity import async_migrate_site_entity, resolve_console_namespace
+from .console_identity import (
+    async_migrate_site_entity,
+    build_legacy_site_unique_id,
+    build_site_unique_id,
+    resolve_console_namespace,
+)
 from .const import (
     ATTR_ARM_PROFILE_ID,
     ATTR_NIGHT_PROFILE_ID,
@@ -1401,6 +1406,15 @@ async def async_setup_entry(
                 known_sensor_keys,
                 hass=hass,
                 entry=config_entry,
+                namespace=namespace,
+            )
+        )
+
+        # Add Site Manager ISP metric sensors (latency, packet loss, ISP, ASN)
+        entities.extend(
+            _discover_site_isp_sensors(
+                coordinator,
+                known_sensor_keys,
                 namespace=namespace,
             )
         )
@@ -3201,6 +3215,245 @@ def _discover_site_internet_activity_sensors(
                 known_sensor_keys.add(activity_key)
                 entities.append(entity)
 
+    return entities
+
+
+# --- Site Manager ISP metrics ------------------------------------------------
+
+# cmcore (backlog 1715.1): the WAN facts a console cannot tell about itself, from the
+# Site Manager `isp-metrics` feed that the shared Site Manager coordinator already
+# polls (five-minute periods; the newest one is kept per host and site). Only an entry
+# that has a Site Manager coordinator (a cloud entry) has them.
+
+
+@dataclass
+class UnifiSiteIspMetricSensorEntityDescription(  # type: ignore[misc]
+    SensorEntityDescription
+):
+    """Class describing one field of the newest ISP metrics period."""
+
+    field: str = ""
+    text: bool = False
+
+
+SITE_ISP_METRIC_SENSOR_TYPES: tuple[UnifiSiteIspMetricSensorEntityDescription, ...] = (
+    UnifiSiteIspMetricSensorEntityDescription(
+        key="isp_avg_latency",
+        translation_key="isp_avg_latency",
+        field="avgLatency",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        suggested_display_precision=0,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    UnifiSiteIspMetricSensorEntityDescription(
+        key="isp_max_latency",
+        translation_key="isp_max_latency",
+        field="maxLatency",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        suggested_display_precision=0,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+    ),
+    UnifiSiteIspMetricSensorEntityDescription(
+        key="isp_packet_loss",
+        translation_key="isp_packet_loss",
+        field="packetLoss",
+        native_unit_of_measurement=PERCENTAGE,
+        suggested_display_precision=1,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    UnifiSiteIspMetricSensorEntityDescription(
+        key="isp_name",
+        translation_key="isp_name",
+        field="ispName",
+        text=True,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    UnifiSiteIspMetricSensorEntityDescription(
+        key="isp_asn",
+        translation_key="isp_asn",
+        field="ispAsn",
+        text=True,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+
+def _name_keys(record: object) -> set[str]:
+    """Return the casefolded names a Network site record goes by."""
+    if not isinstance(record, Mapping):
+        return set()
+    meta = record.get("meta")
+    names = (
+        record.get("internalReference"),
+        record.get("name"),
+        meta.get("name") if isinstance(meta, Mapping) else None,
+    )
+    return {name.casefold() for name in names if isinstance(name, str) and name}
+
+
+def _isp_metric_sites(data: Mapping[str, Any]) -> dict[str, str]:
+    """
+    Pair the entry's host's Site Manager sites with its Network sites.
+
+    Returns ``{Site Manager site id: Network site id}``. Site Manager and the
+    Network application number the same site differently, so a host with one
+    metered site and one Network site pairs them; otherwise a site is paired
+    only when its Site Manager name (``default``) is a name of one Network site.
+    An unpaired site gets no sensors.
+    """
+    site_manager = data.get("site_manager")
+    if not isinstance(site_manager, Mapping):
+        return {}
+    host_id = site_manager.get("selected_host_id")
+    by_host = site_manager.get("isp_metrics")
+    host_metrics = by_host.get(host_id) if isinstance(by_host, Mapping) else None
+    network_sites = data.get("sites")
+    if (
+        not isinstance(host_id, str)
+        or not isinstance(host_metrics, Mapping)
+        or not isinstance(network_sites, Mapping)
+    ):
+        return {}
+    if len(host_metrics) == 1 and len(network_sites) == 1:
+        return {next(iter(host_metrics)): next(iter(network_sites))}
+    network_by_name: dict[str, str] = {}
+    for network_site_id, record in network_sites.items():
+        for name in _name_keys(record):
+            network_by_name.setdefault(name, network_site_id)
+    manager_sites = site_manager.get("sites")
+    pairs: dict[str, str] = {}
+    for isp_site_id in host_metrics:
+        record = (
+            manager_sites.get(isp_site_id)
+            if isinstance(manager_sites, Mapping)
+            else None
+        )
+        for name in _name_keys(record):
+            if name in network_by_name:
+                pairs[isp_site_id] = network_by_name[name]
+                break
+    return pairs
+
+
+def _isp_sample(data: object, isp_site_id: str) -> Mapping[str, Any] | None:
+    """Return the newest ISP metrics period of one metered site, or None."""
+    site_manager = data.get("site_manager") if isinstance(data, Mapping) else None
+    if not isinstance(site_manager, Mapping):
+        return None
+    by_host = site_manager.get("isp_metrics")
+    host_metrics = (
+        by_host.get(site_manager.get("selected_host_id"))
+        if isinstance(by_host, Mapping)
+        else None
+    )
+    sample = (
+        host_metrics.get(isp_site_id) if isinstance(host_metrics, Mapping) else None
+    )
+    return sample if isinstance(sample, Mapping) else None
+
+
+def _isp_field(sample: Mapping[str, Any] | None, field: str, *, text: bool) -> Any:
+    """Return one field of a sample's ``wan`` mapping when it has the right type."""
+    wan = sample.get("wan") if sample is not None else None
+    value = wan.get(field) if isinstance(wan, Mapping) else None
+    if text:
+        return value if isinstance(value, str) and value else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+class UnifiSiteIspMetricSensor(UnifiSiteEntity, SensorEntity):
+    """One field of a site's ISP metrics, grouped under the site's gateway."""
+
+    entity_description: UnifiSiteIspMetricSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: UnifiInsightsFacadeCoordinator,
+        description: UnifiSiteIspMetricSensorEntityDescription,
+        site_id: str,
+        isp_site_id: str,
+        *,
+        unique_id: str,
+    ) -> None:
+        """Initialize the sensor for a Network site and its Site Manager site."""
+        super().__init__(
+            coordinator, site_id, unique_id=unique_id, description=description
+        )
+        self._isp_site_id = isp_site_id
+
+    @property
+    def available(self) -> bool:
+        """Return True while Site Manager answers and the site has this field."""
+        data: Any = self.coordinator.data
+        site_manager = data.get("site_manager") if isinstance(data, Mapping) else None
+        collections = (
+            site_manager.get("collections")
+            if isinstance(site_manager, Mapping)
+            else None
+        )
+        state = (
+            collections.get("isp_metrics") if isinstance(collections, Mapping) else None
+        )
+        return (
+            self.coordinator.last_update_success
+            and isinstance(state, Mapping)
+            and state.get("available") is True
+            and self.native_value is not None
+        )
+
+    @property
+    def native_value(self) -> StateType:
+        """Return the field of the newest period."""
+        sample = _isp_sample(self.coordinator.data, self._isp_site_id)
+        description = self.entity_description
+        return cast(
+            "StateType", _isp_field(sample, description.field, text=description.text)
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return when the period the value comes from began."""
+        sample = _isp_sample(self.coordinator.data, self._isp_site_id)
+        metric_time = sample.get("metric_time") if sample is not None else None
+        return {"metric_time": metric_time} if isinstance(metric_time, str) else None
+
+
+def _discover_site_isp_sensors(
+    coordinator: UnifiInsightsFacadeCoordinator,
+    known_sensor_keys: set[tuple[str, ...]],
+    *,
+    namespace: str | None,
+) -> list[SensorEntity]:
+    """Discover the ISP metric sensors of the entry's host."""
+    entities: list[SensorEntity] = []
+    for isp_site_id, site_id in _isp_metric_sites(coordinator.data).items():
+        sample = _isp_sample(coordinator.data, isp_site_id)
+        for description in SITE_ISP_METRIC_SENSOR_TYPES:
+            isp_key = (isp_site_id, description.key)
+            if isp_key in known_sensor_keys:
+                continue
+            if _isp_field(sample, description.field, text=description.text) is None:
+                continue
+            unique_id = (
+                build_site_unique_id(namespace, isp_site_id, description.key)
+                if namespace
+                else build_legacy_site_unique_id(isp_site_id, description.key)
+            )
+            known_sensor_keys.add(isp_key)
+            entities.append(
+                UnifiSiteIspMetricSensor(
+                    coordinator=coordinator,
+                    description=description,
+                    site_id=site_id,
+                    isp_site_id=isp_site_id,
+                    unique_id=unique_id,
+                )
+            )
     return entities
 
 

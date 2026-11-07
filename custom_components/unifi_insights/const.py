@@ -185,6 +185,13 @@ ISP_WAN_NUMBERS: Final = (
     "upload_kbps",
     "uptime",
 )
+# cmcore (backlog 1715.1): the two text fields of an ISP period (the ISP's name and
+# its AS number as text, e.g. "Ziply Fiber" / "20055"); kept beside the numbers so a
+# sensor can show who the WAN is with. Diagnostics still export ISP_WAN_NUMBERS only.
+ISP_WAN_TEXT: Final = (
+    "ispAsn",
+    "ispName",
+)
 # cmcore (backlog 663): the device and Protect coordinators' poll, per config entry,
 # in seconds (options flow). A cloud entry is polled through UniFi's remote connector,
 # which answered HTTP 408 (connector timeout) about 35 times an hour on the offsite

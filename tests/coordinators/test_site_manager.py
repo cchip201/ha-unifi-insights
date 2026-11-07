@@ -110,10 +110,47 @@ def test_latest_isp_metrics_ignores_invalid_and_older_periods() -> None:
         "host": {
             "site": {
                 "metric_time": "2026-01-02T03:10:00+00:00",
-                "wan": {"avgLatency": 2},
+                "wan": {"avgLatency": 2, "ispName": "private ISP"},
             }
         }
     }
+
+
+def test_latest_isp_metrics_keeps_isp_name_and_asn_as_text() -> None:
+    """The ISP's name and AS number survive as text; unusable values do not."""
+    live_shape = {
+        "avgLatency": 3,
+        "download_kbps": 900000,
+        "downtime": 0,
+        "ispAsn": "20055",
+        "ispName": "Ziply Fiber",
+        "maxLatency": 4,
+        "packetLoss": 0,
+        "upload_kbps": 900000,
+        "uptime": 100,
+    }
+
+    def metrics(wan: dict[str, object]) -> dict[str, object]:
+        rows = [
+            {
+                "hostId": "host",
+                "siteId": "site",
+                "periods": [
+                    {"metricTime": "2026-01-02T03:10:00Z", "data": {"wan": wan}}
+                ],
+            }
+        ]
+        return _latest_isp_metrics(rows)["host"]["site"]["wan"]
+
+    assert metrics(live_shape) == live_shape
+    # An AS number sent as a number is kept as text.
+    assert metrics({"ispAsn": 14593})["ispAsn"] == "14593"
+    # Whitespace is trimmed and a state never exceeds 255 characters.
+    assert metrics({"ispName": "  Starlink  "}) == {"ispName": "Starlink"}
+    assert len(metrics({"ispName": "x" * 400})["ispName"]) == 255
+    # A boolean, a list, an empty or blank string and a missing value are dropped.
+    assert metrics({"ispName": True, "ispAsn": ["20055"]}) == {}
+    assert metrics({"ispName": "", "ispAsn": "   "}) == {}
 
 
 async def test_partial_failure_keeps_last_good_collection(
@@ -127,7 +164,8 @@ async def test_partial_failure_keeps_last_good_collection(
 
     assert first["sites"]["site-secret"]["hostId"] == "host-secret"
     assert first["isp_metrics"]["host-secret"]["site-secret"]["wan"] == {
-        "avgLatency": 2
+        "avgLatency": 2,
+        "ispName": "private ISP",
     }
     assert first["collections"]["sites"]["available"]
     metric_query = client.get_isp_metrics.call_args.kwargs
