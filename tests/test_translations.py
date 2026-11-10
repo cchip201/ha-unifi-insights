@@ -15,21 +15,28 @@ import json
 import re
 from pathlib import Path
 from string import Formatter
-from typing import Any, Final, cast
+from typing import Any, Final
 
 import pytest
 import yaml
+from homeassistant.components.sensor import SensorDeviceClass
 
 from custom_components.unifi_insights.binary_sensor import (
     BINARY_SENSOR_TYPES,
     SECURITY_BINARY_SENSOR_TYPES,
     STORAGE_NEARLY_FULL_DESCRIPTION,
 )
+from custom_components.unifi_insights.const import (
+    CAMERA_DIGITAL_INPUT_EVENT_TYPES,
+    DIGITAL_INPUT_EVENT_TYPES_BY_STATE,
+)
 from custom_components.unifi_insights.coordinators.rule_audit import (
     RULE_CHANGE_TYPES,
 )
 from custom_components.unifi_insights.device_tracker import LOCATION_DESCRIPTION
 from custom_components.unifi_insights.sensor import (
+    RADIO_DETAILS_SENSOR_TYPES,
+    RADIO_STATS_SENSOR_TYPES,
     ROUTER_SENSORS,
     SECURITY_SENSOR_TYPES,
     SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
@@ -388,6 +395,42 @@ def test_switch_translation_placeholders_are_supplied() -> None:
         )
 
 
+def test_radio_sensor_translations_and_enum_states() -> None:
+    """Every radio sensor has a name, and both enums a translated state each."""
+    en_sensor = json.loads(_EN_JSON.read_text())["entity"]["sensor"]
+    strings_sensor = json.loads(_STRINGS_JSON.read_text())["entity"]["sensor"]
+    radio_descriptions = (*RADIO_STATS_SENSOR_TYPES, *RADIO_DETAILS_SENSOR_TYPES)
+
+    enum_descriptions = 0
+    for description in radio_descriptions:
+        key = description.translation_key
+        assert key is not None
+        assert key in strings_sensor, f"{key} missing from strings.json"
+        assert en_sensor[key] == strings_sensor[key], (
+            f"{key} differs between strings.json and translations/en.json"
+        )
+        assert "{band}" in strings_sensor[key]["name"]
+        if description.device_class != SensorDeviceClass.ENUM:
+            continue
+        enum_descriptions += 1
+        assert description.options
+        for states in (strings_sensor[key]["state"], en_sensor[key]["state"]):
+            assert set(states) == set(description.options), (
+                f"{key} states do not match its options"
+            )
+    assert enum_descriptions == 2
+    assert set(en_sensor["radio_wlan_standard"]["state"].values()) == {
+        "802.11a",
+        "802.11b",
+        "802.11g",
+        "802.11n",
+        "802.11ac",
+        "802.11ax",
+        "802.11be",
+        "802.11ah",
+    }
+
+
 def test_site_internet_activity_sensor_translations_resolve_in_both_files() -> None:
     """Every site internet activity sensor must have matching translations."""
     en_sensor = json.loads(_EN_JSON.read_text())["entity"]["sensor"]
@@ -635,6 +678,29 @@ def test_storage_translations_and_icons_resolve_in_every_file() -> None:
         icon = icons.get(platform, {}).get(key, {}).get("default")
         assert icon is not None, f"{key} has no icon"
         assert icon.startswith("mdi:"), f"{key} icon invalid: {icon}"
+
+
+def test_camera_digital_input_event_translations_and_icon() -> None:
+    """Digital-input events have matching translations for both states and an icon."""
+    strings_event = json.loads(_STRINGS_JSON.read_text())["entity"]["event"][
+        "camera_digital_input"
+    ]
+    en_event = json.loads(_EN_JSON.read_text())["entity"]["event"][
+        "camera_digital_input"
+    ]
+    icons_event = json.loads(_ICONS_JSON.read_text())["entity"]["event"][
+        "camera_digital_input"
+    ]
+
+    assert strings_event == en_event
+    assert strings_event["name"] == "Digital input {channel}"
+    assert set(strings_event["state_attributes"]["event_type"]["state"]) == set(
+        CAMERA_DIGITAL_INPUT_EVENT_TYPES
+    )
+    assert tuple(DIGITAL_INPUT_EVENT_TYPES_BY_STATE.values()) == (
+        CAMERA_DIGITAL_INPUT_EVENT_TYPES
+    )
+    assert icons_event["default"].startswith("mdi:")
 
 
 def test_network_rule_change_event_translations_and_icon() -> None:
@@ -962,7 +1028,12 @@ def _dict_placeholders(node: ast.expr | None) -> _Placeholders | None:
     if isinstance(node, ast.Dict) and all(
         isinstance(k, ast.Constant) and isinstance(k.value, str) for k in node.keys
     ):
-        return (frozenset(cast("ast.Constant", k).value for k in node.keys),)
+        keys: set[str] = set()
+        for key in node.keys:
+            assert isinstance(key, ast.Constant)
+            assert isinstance(key.value, str)
+            keys.add(key.value)
+        return (frozenset(keys),)
     if isinstance(node, ast.IfExp):
         body, orelse = _dict_placeholders(node.body), _dict_placeholders(node.orelse)
         return None if body is None or orelse is None else body + orelse

@@ -15,6 +15,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from unifi_official_api import (
     UniFiAuthenticationError,
@@ -49,6 +50,7 @@ from .protect_events import (
     SIREN_STOP_GUARD_TTL,
     STALE_EVENT_TIMEOUT,
     CommandOverlay,
+    DispatchDigitalInput,
     Escalate,
     Fetched,
     Instant,
@@ -88,6 +90,9 @@ if TYPE_CHECKING:
     from .protect_ws import Stream
 
 type _DeviceFamily = Literal["fobs", "link_stations", "alarm_hubs", "sirens"]
+
+# The RTSPS channels Protect renders for a camera, heaviest first.
+type StreamQuality = Literal["high", "medium", "low"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -150,6 +155,11 @@ GLOBAL_ALARM_MANAGER_PROBE_WARN_AFTER: Final = 3
 def _escalated(step: Step) -> bool:
     """Return whether the reconciler asked the caller to re-raise."""
     return any(isinstance(effect, Escalate) for effect in step.effects)
+
+
+def protect_digital_input_signal(entry_id: str) -> str:
+    """Return the entry-scoped dispatcher signal for camera digital inputs."""
+    return f"{DOMAIN}_{entry_id}_protect_digital_input"
 
 
 class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
@@ -312,7 +322,7 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
         # tests without ever going through config-entry setup/unload; this
         # listener is the same safety net `cancel_on_shutdown` gives the
         # reconcile timer, so a scheduled cooldown can never outlive `hass`
-        # itself and trip pytest-homeassistant-custom-component's
+        # itself and trip pytest-homeassistant's
         # lingering-timer check.
         #
         # Registered via `entry.async_on_unload` (not called bare): the
@@ -845,6 +855,26 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
                     _LOGGER.log(level, msg, *args)
                 case RemoveDevice(identifiers=identifiers):
                     self._remove_stale_device(*identifiers)
+                case DispatchDigitalInput(
+                    camera_id=camera_id,
+                    input_key=input_key,
+                    event_type=event_type,
+                    input_channel=input_channel,
+                    input_token=input_token,
+                    start=start,
+                ):
+                    async_dispatcher_send(
+                        self.hass,
+                        protect_digital_input_signal(self.config_entry.entry_id),
+                        {
+                            "camera_id": camera_id,
+                            "input_key": input_key,
+                            "event_type": event_type,
+                            "input_channel": input_channel,
+                            "input_token": input_token,
+                            "start": start,
+                        },
+                    )
                 case PublishUpdate(mark_success=True):
                     # Also marks the update successful and re-arms the poll
                     # timer, so entities stay available while frames flow.
@@ -1761,11 +1791,19 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
             return None
         return snapshot if isinstance(snapshot, bytes) else None
 
-    async def async_create_camera_stream_url(self, camera_id: str) -> str | None:
-        """Return a new high-quality RTSPS stream URL, or None on failure."""
+    async def async_create_camera_stream_url(
+        self, camera_id: str, quality: StreamQuality = "high"
+    ) -> str | None:
+        """
+        Return a new RTSPS stream URL for one quality, or None on failure.
+
+        Protect renders a URL per quality. Only the requested quality is asked
+        for and only its URL is read, so a caller never gets a channel it did
+        not ask for: a response without that quality is no URL.
+        """
         try:
             stream = await self._client.cameras.create_rtsps_stream(
-                camera_id, qualities=["high"]
+                camera_id, qualities=[quality]
             )
         except Exception:
             _LOGGER.debug(
@@ -1773,4 +1811,10 @@ class UnifiInsightsProtectCoordinator(UnifiInsightsBaseCoordinator):
                 exc_info=True,
             )
             return None
-        return stream.high if stream and stream.high else None
+        if not stream:
+            return None
+        if quality == "high":
+            return stream.high or None
+        if quality == "medium":
+            return stream.medium or None
+        return stream.low or None

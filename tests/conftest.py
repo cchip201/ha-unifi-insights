@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.helpers import device_registry as dr
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 from unifi_official_api.exceptions import UniFiUnsupportedError
 from unifi_official_api.innerspace import InnerSpaceProject
 
@@ -25,6 +25,7 @@ from .fixtures.command_owners import (
     async_shutdown_owners,
     build_seeded_owners,
 )
+from .fixtures.deprecations import HANDLER as DEPRECATION_REPORTS
 from .fixtures.facade_data import facade_data
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
 
-pytest_plugins = "pytest_homeassistant_custom_component"
+pytest_plugins = "pytest_homeassistant"
 
 
 def _create_mock_network_client() -> MagicMock:
@@ -217,6 +218,32 @@ def _create_mock_innerspace_client() -> MagicMock:
     client.validate_connection = AsyncMock(return_value=True)
     client.close = AsyncMock()
     return client
+
+
+@pytest.fixture(autouse=True)
+def fail_on_ha_deprecation_reports() -> Generator[None]:
+    """Fail when Home Assistant logs deprecated use by this integration.
+
+    Reports logged while modules were imported surface on the first test.
+    """
+    yield
+    if reports := DEPRECATION_REPORTS.pop_reports():
+        pytest.fail(
+            "Home Assistant reported deprecated use by unifi_insights:\n"
+            + "\n".join(reports),
+            pytrace=False,
+        )
+
+
+@pytest.fixture
+def hass_config_dir(hass_tmp_config_dir: str) -> str:
+    """Give every test its own temporary Home Assistant config directory.
+
+    pytest-homeassistant points the config directory at `tests/testing_config`
+    in this repository by default, so tests that load blueprints would write
+    files into the working tree.
+    """
+    return hass_tmp_config_dir
 
 
 @pytest.fixture(autouse=True)

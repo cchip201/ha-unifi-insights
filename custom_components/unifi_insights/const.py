@@ -136,6 +136,11 @@ SCAN_INTERVAL_ACCESS = timedelta(seconds=30)
 # Scan intervals for multi-coordinator architecture (Platinum compliance)
 # Device coordinator - fast updates for status, stats (30 seconds)
 SCAN_INTERVAL_DEVICE = timedelta(seconds=30)
+# Access point radio settings (a per-device details call) change rarely, so
+# they are fetched far less often than the statistics they accompany. A failed
+# attempt waits the same interval before it retries, so rate limiting or an
+# offline console is not hammered once per statistics poll (#454).
+SCAN_INTERVAL_DEVICE_DETAILS = timedelta(minutes=5)
 # Config coordinator - slow updates for sites, WiFi config (5 minutes)
 SCAN_INTERVAL_CONFIG = timedelta(minutes=5)
 SCAN_INTERVAL_INNERSPACE = timedelta(minutes=5)
@@ -263,6 +268,25 @@ MODEL_KEY_FOB: Final = "fob"
 
 # Protect event types
 EVENT_TYPE_ALARM_HUB_DEVICE_TAMPER: Final = "alarmHubDeviceTamper"
+# Protect 7.2.105: "An ONVIF camera digital input has changed state (circuit
+# opened or closed)". The camera schema has no field that says which cameras
+# have inputs or how many, so the event entities are created from these frames.
+EVENT_TYPE_CAMERA_DIGITAL_INPUT_CHANGED: Final = "cameraDigitalInputChanged"
+
+# `cameraDigitalInputChanged` metadata.inputState -> the Home Assistant event
+# type it fires. The names stay neutral (circuit open/closed) rather than
+# opened/closed: with normally-closed wiring an open circuit can mean "idle",
+# so the integration must not guess what the input is wired to.
+DIGITAL_INPUT_EVENT_TYPES_BY_STATE: Final[dict[str, str]] = {
+    "circuitOpen": "circuit_open",
+    "circuitClosed": "circuit_closed",
+}
+
+# The event types a digital-input entity declares, in the order it lists them.
+CAMERA_DIGITAL_INPUT_EVENT_TYPES: Final[tuple[str, ...]] = (
+    "circuit_open",
+    "circuit_closed",
+)
 
 # Camera attributes
 ATTR_CAMERA_ID: Final = "camera_id"

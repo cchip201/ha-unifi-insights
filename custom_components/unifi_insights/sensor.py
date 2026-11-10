@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeIs, cast
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -22,6 +22,7 @@ from homeassistant.const import (
     UnitOfDataRate,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
+    UnitOfFrequency,
     UnitOfInformation,
     UnitOfPower,
     UnitOfTemperature,
@@ -70,6 +71,9 @@ from .const import (
 from .coordinators import UnifiInsightsFacadeCoordinator
 from .coordinators.mobility import UnifiInsightsMobilityCoordinator
 from .data_transforms import (
+    RADIO_BAND_LABELS,
+    RADIO_TX_POWER_MODE_OPTIONS,
+    RADIO_WLAN_STANDARD_OPTIONS,
     THREAD_DEVICE_TYPES,
     NetworkDeviceFacts,
     _field,
@@ -86,11 +90,19 @@ from .data_transforms import (
     nested_dict,
     network_device,
     network_device_stats,
+    network_radio_details,
+    network_radio_stats,
     normalize_nvr_storage,
     owner_available,
     parse_timestamp,
     present_attributes,
     protect_collection,
+    radio_band_map,
+    radio_channel,
+    radio_channel_width,
+    radio_tx_power_mode,
+    radio_tx_retries,
+    radio_wlan_standard,
     rule_record,
     section_by_site,
     site_section,
@@ -110,7 +122,7 @@ from .entity import (
     UnifiProtectEntity,
     UnifiSiteEntity,
     async_add_mobility_router_entities,
-    carrier_organisation_device_info,
+    carrier_organisation_device_fields,
     device_has_feature,
     first_not_none,
     get_field,
@@ -145,8 +157,8 @@ PARALLEL_UPDATES = 0
 _NO_STATS: Final = object()
 
 
-@dataclass
-class UnifiInsightsSensorEntityDescription(SensorEntityDescription):  # type: ignore[misc]
+@dataclass(frozen=True, kw_only=True)
+class UnifiInsightsSensorEntityDescription(SensorEntityDescription):
     """Class describing UniFi Insights sensor entities."""
 
     value_fn: Callable[[dict[str, Any]], StateType] | None = None
@@ -157,8 +169,8 @@ class UnifiInsightsSensorEntityDescription(SensorEntityDescription):  # type: ig
     required_feature: str | None = None
 
 
-@dataclass
-class UnifiProtectSensorEntityDescription(SensorEntityDescription):  # type: ignore[misc]
+@dataclass(frozen=True, kw_only=True)
+class UnifiProtectSensorEntityDescription(SensorEntityDescription):
     """Class describing UniFi Protect sensor entities."""
 
     value_fn: Callable[[dict[str, Any]], StateType] | None = None
@@ -984,6 +996,7 @@ def _discover_port_sensors(
     known_sensor_keys: set[tuple[Any, ...]],
     *,
     entities: list[SensorEntity],
+    restorable_unique_ids: frozenset[str] = frozenset(),
 ) -> None:
     """Discover port sensors for a network device."""
     # Ports need legacy data (see data_transforms): without port records no
@@ -1007,6 +1020,26 @@ def _discover_port_sensors(
 
         port_state = get_field(port, "state", "status", default="DOWN")
         if str(port_state).upper() != "UP":
+            if not restorable_unique_ids:
+                continue
+            port_label = _get_port_label(port, port_idx)
+            for desc in (
+                *PORT_SENSOR_TYPES,
+                *PORT_RATE_SENSOR_TYPES,
+                *SFP_SENSOR_TYPES,
+            ):
+                candidate = UnifiPortSensor(
+                    coordinator=coordinator,
+                    description=desc,
+                    site_id=site_id,
+                    device_id=device_id,
+                    port_idx=port_idx,
+                    port_label=port_label,
+                )
+                if candidate.unique_id in restorable_unique_ids:
+                    p_key = (site_id, device_id, port_idx, desc.key)
+                    known_sensor_keys.add(p_key)
+                    entities.append(candidate)
             continue
         active_port_indices.add(port_idx)
 
@@ -1255,6 +1288,40 @@ def _discover_protect_sensors(
                 )
 
 
+def _parse_port_sensor_identity(
+    entity: er.RegistryEntry,
+    config_entry_id: str,
+) -> tuple[str, UnifiInsightsSensorEntityDescription, int] | None:
+    """Parse device ID, description, and port index from an entity row."""
+    if (
+        entity.domain != "sensor"
+        or entity.platform != DOMAIN
+        or entity.config_entry_id != config_entry_id
+        or is_storage_unique_id(entity.unique_id)
+    ):
+        return None
+    prefix, separator, port_idx_str = entity.unique_id.rpartition("_")
+    try:
+        if not separator or str(int(port_idx_str)) != port_idx_str:
+            return None
+        port_idx = int(port_idx_str)
+    except ValueError:
+        return None
+    for description in (
+        *PORT_SENSOR_TYPES,
+        *PORT_RATE_SENSOR_TYPES,
+        *SFP_SENSOR_TYPES,
+    ):
+        ending = f"_{description.key}"
+        if not prefix.endswith(ending):
+            continue
+        device_id = prefix[: -len(ending)]
+        if not device_id:
+            return None
+        return (device_id, description, port_idx)
+    return None
+
+
 def _is_owned_port_sensor(
     entity: er.RegistryEntry,
     config_entry_id: str,
@@ -1268,34 +1335,42 @@ def _is_owned_port_sensor(
     incompatible or otherwise ambiguous rows are retained. Namespace, site,
     and storage-path text containing ``_port_`` never establishes port identity.
     """
-    if (
-        entity.domain != "sensor"
-        or entity.platform != DOMAIN
-        or entity.config_entry_id != config_entry_id
-        or is_storage_unique_id(entity.unique_id)
-    ):
+    parsed = _parse_port_sensor_identity(entity, config_entry_id)
+    if parsed is None:
         return False
-    prefix, separator, port_idx = entity.unique_id.rpartition("_")
-    try:
-        if not separator or str(int(port_idx)) != port_idx:
-            return False
-    except ValueError:
-        return False
-    for description in (
-        *PORT_SENSOR_TYPES,
-        *PORT_RATE_SENSOR_TYPES,
-        *SFP_SENSOR_TYPES,
-    ):
-        ending = f"_{description.key}"
-        if not prefix.endswith(ending):
-            continue
-        device_id = prefix[: -len(ending)]
-        if not device_id:
-            return False
-        return entity.translation_key == description.translation_key or (
-            entity.translation_key in (None, "") and device_id in known_device_ids
-        )
-    return False
+    device_id, description, _ = parsed
+    return entity.translation_key == description.translation_key or (
+        entity.translation_key in (None, "") and device_id in known_device_ids
+    )
+
+
+def _collect_device_port_indices(
+    coordinator: UnifiInsightsFacadeCoordinator,
+) -> dict[str, set[int]]:
+    """
+    Collect the union of valid port indices across sites for each device.
+
+    Devices with no valid port indices (missing ports, empty ports, all-invalid indices,
+    or facts is None) are omitted so their port evidence is treated as unknown.
+    """
+    device_ports: dict[str, set[int]] = {}
+    devices_by_site = section_by_site(coordinator.data, "devices") or {}
+    for site_id, devices in devices_by_site.items():
+        for device_id in devices:
+            facts = device_facts(coordinator.data, site_id, device_id)
+            if facts is None or not facts.ports:
+                continue
+            for port in facts.ports:
+                if port.index is not None:
+                    device_ports.setdefault(device_id, set()).add(port.index)
+    return device_ports
+
+
+def _is_carrier_fabric_sensor_entry(
+    entry: UnifiInsightsConfigEntry | CarrierFabricConfigEntry,
+) -> TypeIs[CarrierFabricConfigEntry]:
+    """Narrow the sensor entry through its existing runtime-data discriminator."""
+    return isinstance(entry.runtime_data, CarrierFabricData)
 
 
 async def async_setup_entry(
@@ -1304,7 +1379,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up sensors for UniFi Insights integration."""
-    if isinstance(config_entry.runtime_data, CarrierFabricData):
+    if _is_carrier_fabric_sensor_entry(config_entry):
         await async_setup_carrier_fabric_sensors(hass, config_entry, async_add_entities)
         return
 
@@ -1316,6 +1391,14 @@ async def async_setup_entry(
     coordinator: UnifiInsightsFacadeCoordinator = config_entry.runtime_data.coordinator
     known_sensor_keys: set[tuple[Any, ...]] = set()
     initial_entities: list[SensorEntity] = []
+
+    ent_reg = er.async_get(hass)
+    restorable_unique_ids: frozenset[str] = frozenset(
+        entry.unique_id
+        for entry in er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
+        if entry.domain == "sensor" and entry.platform == DOMAIN
+    )
+
     # Only the first pass feeds the stale-entity sweep below. Without this the
     # list would keep every entity discovered for the lifetime of the entry,
     # long after the one sweep that reads it has run.
@@ -1343,6 +1426,17 @@ async def async_setup_entry(
                     entities=entities,
                 )
                 _discover_port_sensors(
+                    coordinator,
+                    site_id,
+                    device_id,
+                    device_data,
+                    known_sensor_keys,
+                    entities=entities,
+                    restorable_unique_ids=restorable_unique_ids
+                    if not setup_complete
+                    else frozenset(),
+                )
+                _discover_radio_sensors(
                     coordinator,
                     site_id,
                     device_id,
@@ -1465,13 +1559,25 @@ async def async_setup_entry(
         for device_id in devices
         if isinstance(device_id, str) and device_id
     }
-    ent_reg = er.async_get(hass)
-    stale = [
-        entry
-        for entry in er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
-        if entry.unique_id not in created_uids
-        and _is_owned_port_sensor(entry, config_entry.entry_id, known_device_ids)
-    ]
+    device_port_indices = _collect_device_port_indices(coordinator)
+    stale: list[er.RegistryEntry] = []
+    for entry in er.async_entries_for_config_entry(ent_reg, config_entry.entry_id):
+        if entry.unique_id in created_uids:
+            continue
+        if not _is_owned_port_sensor(entry, config_entry.entry_id, known_device_ids):
+            continue
+        parsed = _parse_port_sensor_identity(entry, config_entry.entry_id)
+        if parsed is None:
+            continue
+        device_id, _, port_idx = parsed
+        if device_id not in known_device_ids:
+            stale.append(entry)
+            continue
+        valid_indices = device_port_indices.get(device_id)
+        if not valid_indices:
+            continue
+        if port_idx not in valid_indices:
+            stale.append(entry)
     for entry in stale:
         _LOGGER.debug("Removing stale port sensor entity: %s", entry.unique_id)
         ent_reg.async_remove(entry.entity_id)
@@ -2585,6 +2691,176 @@ def discover_storage_sensors(
     return entities
 
 
+# --- Access point radios ----------------------------------------------------
+#
+# One sensor family per radio of an access point (#454), following the port
+# and storage sub-item pattern. Step-1 sensors read the latest statistics the
+# coordinator already fetches; step-2 sensors read the throttled per-device
+# details record and go unavailable while its last request failed.
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnifiRadioSensorEntityDescription(SensorEntityDescription):
+    """Describes one reading of one access point radio."""
+
+    # Which published section the radio is read from.
+    source: Literal["stats", "details"]
+    value_fn: Callable[[Mapping[str, Any]], StateType]
+
+
+RADIO_STATS_SENSOR_TYPES: tuple[UnifiRadioSensorEntityDescription, ...] = (
+    UnifiRadioSensorEntityDescription(
+        key="radio_tx_retries",
+        translation_key="radio_tx_retries",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        source="stats",
+        value_fn=radio_tx_retries,
+    ),
+)
+
+# Radio settings rarely change, so these are diagnostic and start disabled.
+RADIO_DETAILS_SENSOR_TYPES: tuple[UnifiRadioSensorEntityDescription, ...] = (
+    UnifiRadioSensorEntityDescription(
+        key="radio_tx_power_mode",
+        translation_key="radio_tx_power_mode",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(RADIO_TX_POWER_MODE_OPTIONS),
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        source="details",
+        value_fn=radio_tx_power_mode,
+    ),
+    UnifiRadioSensorEntityDescription(
+        key="radio_wlan_standard",
+        translation_key="radio_wlan_standard",
+        device_class=SensorDeviceClass.ENUM,
+        options=list(RADIO_WLAN_STANDARD_OPTIONS),
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        source="details",
+        value_fn=radio_wlan_standard,
+    ),
+    UnifiRadioSensorEntityDescription(
+        key="radio_channel",
+        translation_key="radio_channel",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        source="details",
+        value_fn=radio_channel,
+    ),
+    UnifiRadioSensorEntityDescription(
+        key="radio_channel_width",
+        translation_key="radio_channel_width",
+        native_unit_of_measurement=UnitOfFrequency.MEGAHERTZ,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        source="details",
+        value_fn=radio_channel_width,
+    ),
+)
+
+
+class UnifiRadioSensor(UnifiInsightsEntity, SensorEntity):
+    """One reading of one radio of a UniFi access point."""
+
+    entity_description: UnifiRadioSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: UnifiInsightsFacadeCoordinator,
+        description: UnifiRadioSensorEntityDescription,
+        site_id: str,
+        device_id: str,
+        *,
+        band: str,
+    ) -> None:
+        """Initialize the radio sensor."""
+        super().__init__(coordinator, description, site_id, device_id)
+        self._band = band
+        # The {band} placeholder of the per-radio translation strings, such as
+        # "Wi-Fi 5 GHz TX retries".
+        self._attr_translation_placeholders = {"band": RADIO_BAND_LABELS[band]}
+        # The band slug is the stable key: it does not move when the channel,
+        # the power mode or a label changes.
+        self._attr_unique_id = f"{site_id}_{device_id}_radio_{band}_{description.key}"
+
+    def _radio_record(self) -> Mapping[str, Any] | None:
+        """
+        Return this radio's record from the current snapshot, or None.
+
+        A step-2 radio is only readable while the last details request
+        succeeded: the coordinator keeps its previous radios through a failure
+        but marks the record unavailable, so the sensors drop to unavailable
+        instead of freezing on an old value.
+        """
+        if self.entity_description.source == "stats":
+            radios = network_radio_stats(
+                self.coordinator.data, self._site_id, self._device_id
+            )
+            return None if radios is None else radios.get(self._band)
+        details = network_radio_details(
+            self.coordinator.data, self._site_id, self._device_id
+        )
+        if details is None or details.get("available") is not True:
+            return None
+        return radio_band_map(details.get("radios")).get(self._band)
+
+    @property
+    def available(self) -> bool:
+        """Return False once the radio is gone or its details are stale."""
+        return bool(super().available and self._radio_record() is not None)
+
+    @property
+    def native_value(self) -> StateType:
+        """Return this radio's reading, or None (unknown) when it has none."""
+        radio = self._radio_record()
+        return None if radio is None else self.entity_description.value_fn(radio)
+
+
+def _discover_radio_sensors(
+    coordinator: UnifiInsightsFacadeCoordinator,
+    site_id: str,
+    device_id: str,
+    device_data: dict[str, Any],
+    known_sensor_keys: set[tuple[Any, ...]],
+    *,
+    entities: list[SensorEntity],
+) -> None:
+    """Discover per-radio sensors for an access point."""
+    if not device_has_feature(device_data, "accessPoint"):
+        return
+
+    # Step 1 comes from the statistics the coordinator already polls, step 2
+    # from the throttled details record. Each band is discovered once; a band
+    # that first appears later is added on the next coordinator update.
+    stats_radios = network_radio_stats(coordinator.data, site_id, device_id) or {}
+    details = network_radio_details(coordinator.data, site_id, device_id)
+    details_radios = (
+        radio_band_map(details.get("radios")) if details is not None else {}
+    )
+    for radios, descriptions in (
+        (stats_radios, RADIO_STATS_SENSOR_TYPES),
+        (details_radios, RADIO_DETAILS_SENSOR_TYPES),
+    ):
+        for band in radios:
+            for description in descriptions:
+                key = (site_id, device_id, "radio", band, description.key)
+                if key in known_sensor_keys:
+                    continue
+                known_sensor_keys.add(key)
+                entities.append(
+                    UnifiRadioSensor(
+                        coordinator,
+                        description,
+                        site_id,
+                        device_id,
+                        band=band,
+                    )
+                )
+
+
 # --- Protect security devices ------------------------------------------------
 
 # Entities for UniFi Protect security devices: alarm hubs, link stations, fobs.
@@ -2680,10 +2956,8 @@ def _arm_control_attributes(data: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-@dataclass(kw_only=True)
-class UnifiProtectSecuritySensorEntityDescription(  # type: ignore[misc]
-    UnifiProtectSensorEntityDescription
-):
+@dataclass(frozen=True, kw_only=True)
+class UnifiProtectSecuritySensorEntityDescription(UnifiProtectSensorEntityDescription):
     """Describes a sensor of a Protect security device."""
 
     device_types: tuple[str, ...]
@@ -2773,13 +3047,17 @@ class UnifiVoucherSensorEntityDescription(SensorEntityDescription):
     attrs_fn: Callable[[Any, str], dict[str, Any]] | None = None
 
 
-def _get_latest_record(data: Mapping[str, Any], site_id: str) -> dict[str, Any] | None:
+def _get_latest_record(
+    data: Mapping[str, Any] | None, site_id: str
+) -> dict[str, Any] | None:
     """Safely return latest voucher record for a site."""
+    if data is None:
+        return None
     record = latest_voucher(data, site_id)
     return dict(record) if record is not None else None
 
 
-def _latest_code_value(data: Mapping[str, Any], site_id: str) -> StateType:
+def _latest_code_value(data: Mapping[str, Any] | None, site_id: str) -> StateType:
     """Return latest voucher code as string, or None."""
     record = _get_latest_record(data, site_id)
     if record is None:
@@ -2788,7 +3066,9 @@ def _latest_code_value(data: Mapping[str, Any], site_id: str) -> StateType:
     return str(code) if code is not None else None
 
 
-def _latest_expiration_value(data: Mapping[str, Any], site_id: str) -> datetime | None:
+def _latest_expiration_value(
+    data: Mapping[str, Any] | None, site_id: str
+) -> datetime | None:
     """Return latest voucher expiration datetime, or None."""
     record = _get_latest_record(data, site_id)
     if record is None:
@@ -2808,7 +3088,7 @@ def _active_vouchers_value(data: object, site_id: str) -> int:
     return count_active_vouchers(site_vouchers)
 
 
-def _latest_attributes(data: Mapping[str, Any], site_id: str) -> dict[str, Any]:
+def _latest_attributes(data: Mapping[str, Any] | None, site_id: str) -> dict[str, Any]:
     """Return attributes of the latest generated voucher."""
     record = _get_latest_record(data, site_id)
     if record is None:
@@ -2954,10 +3234,8 @@ def discover_voucher_sensors(
 # Site-level historical internet activity sensors for UniFi Insights.
 
 
-@dataclass
-class UnifiSiteInternetActivitySensorEntityDescription(  # type: ignore[misc]
-    SensorEntityDescription
-):
+@dataclass(frozen=True, kw_only=True)
+class UnifiSiteInternetActivitySensorEntityDescription(SensorEntityDescription):
     """Class describing UniFi site-level internet activity sensor entities."""
 
     window: str = "1h"
@@ -3628,7 +3906,7 @@ async def async_setup_carrier_fabric_sensors(
         dr.async_get(hass)
         .async_get_or_create(
             config_entry_id=config_entry.entry_id,
-            **carrier_organisation_device_info(config_entry),
+            **carrier_organisation_device_fields(config_entry),
         )
         .id
     )

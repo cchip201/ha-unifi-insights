@@ -12,7 +12,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 from unifi_official_api import (
     UniFiAuthenticationError,
     UniFiConnectionError,
@@ -52,6 +52,7 @@ from custom_components.unifi_insights.data_transforms import (
     site_section_available,
 )
 from custom_components.unifi_insights.probe import ProbeResult, ProbeStatus
+from tests.fixtures.assertions import require_not_none
 from tests.fixtures.mobility_responses import (
     OFFICE_ROUTER_ID,
     WORKSPACE_ID,
@@ -61,7 +62,7 @@ from tests.fixtures.mobility_responses import (
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.entity_registry import EntityRegistry
-    from pytest_homeassistant_custom_component.typing import WebSocketGenerator
+    from pytest_homeassistant.typing import WebSocketGenerator
 
 
 async def test_setup_entry_success(
@@ -1928,7 +1929,7 @@ async def test_carrier_fabric_device_removal(
     dev_reg = dr.async_get(hass)
     org_device = dev_reg.async_get_or_create(
         config_entry_id=carrier_entry.entry_id,
-        identifiers={(DOMAIN, carrier_entry.unique_id)},
+        identifiers={(DOMAIN, require_not_none(carrier_entry.unique_id))},
     )
     assert not await async_remove_config_entry_device(hass, carrier_entry, org_device)
 
@@ -2323,8 +2324,8 @@ async def test_mobility_moves_to_the_next_entry_when_the_owner_leaves(
         "sensor", DOMAIN, f"mobility_{OFFICE_ROUTER_ID}_clients"
     )
     assert router_clients is not None
-    assert registry.async_get(router_clients).disabled_by is None
-    assert hass.states.get(router_clients).state == "5"
+    assert require_not_none(registry.async_get(router_clients)).disabled_by is None
+    assert require_not_none(hass.states.get(router_clients)).state == "5"
     assert "does not generate unique IDs" not in caplog.text
 
 

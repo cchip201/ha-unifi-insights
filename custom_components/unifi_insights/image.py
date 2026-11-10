@@ -30,7 +30,7 @@ from .data_transforms import (
     site_section_available,
     voucher_site_ids,
 )
-from .entity import UnifiSiteEntity
+from .entity import UnifiSiteEntity, async_delegate_entity_id_changed
 from .innerspace_transforms import parse_floor_plan_asset_path, strip_url_query
 
 if TYPE_CHECKING:
@@ -166,7 +166,7 @@ class UnifiWifiQrCodeImage(
         wifi_id: str,
     ) -> None:
         """Initialize the WiFi QR code image."""
-        CoordinatorEntity.__init__(self, coordinator)
+        super().__init__(coordinator)
         ImageEntity.__init__(self, hass)
         self.hass = hass
         self._site_id = site_id
@@ -248,7 +248,7 @@ class UnifiFloorPlanImage(
         plan_id: str,
     ) -> None:
         """Initialize the floor plan image entity."""
-        CoordinatorEntity.__init__(self, coordinator)
+        super().__init__(coordinator)
         ImageEntity.__init__(self, hass)
         self._plan_id = plan_id
         self._attr_unique_id = f"innerspace_floor_plan_{plan_id}"
@@ -319,6 +319,11 @@ class UnifiFloorPlanImage(
             "image_url": strip_url_query(plan.get("image_url")),
         }
         return {k: v for k, v in attrs.items() if v is not None}
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Keep the entity on an entity ID change; nothing here is keyed on it."""
+        async_delegate_entity_id_changed(super(), old_entity_id)
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel a pending background retry when the entity is removed."""
@@ -513,6 +518,11 @@ class UnifiVoucherQrCodeImage(UnifiSiteEntity, ImageEntity):
             self._last_observed_payload = None
             self._attr_image_last_updated = dt_util.utcnow()
         self.async_write_ha_state()
+
+    @callback
+    def async_entity_id_changed(self, old_entity_id: str) -> None:
+        """Keep the entity on an entity ID change; nothing here is keyed on it."""
+        async_delegate_entity_id_changed(super(), old_entity_id)
 
     async def async_added_to_hass(self) -> None:
         """Register lifecycle and timer on add."""

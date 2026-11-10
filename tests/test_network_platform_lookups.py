@@ -9,6 +9,7 @@ snapshot does not hold.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
@@ -19,7 +20,7 @@ from homeassistant.core import ServiceCall
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.unifi_insights import (
     binary_sensor,
@@ -34,6 +35,7 @@ from custom_components.unifi_insights import (
 )
 from custom_components.unifi_insights.client_wake import wake_unique_id
 from custom_components.unifi_insights.const import CONF_CLIENT_CONTROL, DOMAIN
+from tests.fixtures.entities import EntityCollector
 from tests.fixtures.facade_data import (
     facade_data,
     with_client,
@@ -266,7 +268,10 @@ async def _discover(
     entry.async_create_background_task.side_effect = lambda _hass, task, **_kwargs: (
         task.close()
     )
-    with patch.multiple(module, **dict.fromkeys(names, DEFAULT)) as doubles:
+    with ExitStack() as stack:
+        doubles = {
+            name: stack.enter_context(patch.object(module, name)) for name in names
+        }
         await module.async_setup_entry(hass, entry, MagicMock())
     return doubles
 
@@ -744,7 +749,7 @@ async def _restored_wake_button(
     )
     added: list[Any] = []
 
-    await button.async_setup_entry(hass, entry, added.extend)
+    await button.async_setup_entry(hass, entry, EntityCollector(added))
     await hass.async_block_till_done(wait_background_tasks=True)
 
     (wake,) = [e for e in added if isinstance(e, button.UnifiClientWakeButton)]
@@ -952,12 +957,11 @@ TOPOLOGY_RECORDS = {
 
 def _topology_snapshot() -> FacadeData:
     """Return a snapshot with a switch, a wired client and the client's link."""
-    return facade_data(
-        **{
-            section: {SITE: {record_id: record}}
-            for section, (record_id, record) in TOPOLOGY_RECORDS.items()
-        }
-    )
+    sections: dict[str, Any] = {
+        section: {SITE: {record_id: record}}
+        for section, (record_id, record) in TOPOLOGY_RECORDS.items()
+    }
+    return facade_data(**sections)
 
 
 def _topology_shape(data: FacadeData) -> dict[str, Any]:

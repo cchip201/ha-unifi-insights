@@ -17,12 +17,14 @@ from homeassistant.const import (
     UnitOfInformation,
     UnitOfTemperature,
 )
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_registry import (
     RegistryEntryDisabler,
     RegistryEntryHider,
 )
 from homeassistant.helpers.typing import UNDEFINED
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 from unifi_official_api.protect.models.sensor import (
     Sensor as ProtectSensorModel,
 )
@@ -60,6 +62,7 @@ from custom_components.unifi_insights.sensor import (
     _bytes_to_gb,
     _calculate_storage_available,
     _calculate_storage_percent,
+    _collect_device_port_indices,
     _discover_outlet_sensors,
     _discover_protect_sensors,
     _discover_site_internet_activity_sensors,
@@ -76,6 +79,8 @@ from custom_components.unifi_insights.sensor import (
     format_uptime,
     get_network_device_temperature,
 )
+from tests.fixtures.assertions import patch_attribute, require_not_none
+from tests.fixtures.entities import EntityCollector
 from tests.fixtures.facade_data import (
     facade_data,
     set_availability,
@@ -95,9 +100,8 @@ from tests.fixtures.library_responses import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from homeassistant.components.sensor import SensorEntity
     from homeassistant.core import HomeAssistant
-    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers.entity import Entity
 
     from custom_components.unifi_insights.sensor import (
         UnifiInsightsSensorEntityDescription,
@@ -753,6 +757,157 @@ class TestUplinkRateStateLevel:
         assert state.state not in ("unknown", "unavailable")
         assert float(state.state) == 0.0
 
+    async def test_restored_down_port_becomes_available_on_up_update(
+        self,
+        *,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        real_config_entry: MockConfigEntry,
+        mock_network_client: MagicMock,
+        mock_protect_client: MagicMock,
+        mock_local_auth: MagicMock,
+        enable_custom_integrations: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A restored DOWN port starts unavailable and becomes available when UP."""
+        real_config_entry.add_to_hass(hass)
+        area_reg = ar.async_get(hass)
+        area = area_reg.async_create("Server Room")
+
+        mock_network_client.sites.get_all.return_value = [
+            {"id": "default", "name": "Default", "desc": "Default"}
+        ]
+        devices_down = [
+            {
+                "id": "switch_1",
+                "name": "Switch 1",
+                "model": "USW-24",
+                "mac": "AA:BB:CC:DD:EE:01",
+                "macAddress": "AA:BB:CC:DD:EE:01",
+                "state": "ONLINE",
+                "ipAddress": "192.168.1.51",
+                "interfaces": {
+                    "ports": [
+                        {
+                            "idx": 1,
+                            "state": "DOWN",
+                            "speed": 1000,
+                            "name": "Port 1",
+                        }
+                    ]
+                },
+            }
+        ]
+        mock_network_client.devices.get_all.return_value = devices_down
+        mock_network_client.devices.get_statistics = AsyncMock(return_value={})
+
+        speed_row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "switch_1_port_speed_1",
+            config_entry=real_config_entry,
+            suggested_object_id="custom_port_1_speed",
+            disabled_by=None,
+        )
+        speed_row = entity_registry.async_update_entity(
+            speed_row.entity_id,
+            name="Custom Speed",
+            area_id=area.id,
+            hidden_by=RegistryEntryHider.USER,
+        )
+
+        tx_row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "switch_1_port_tx_bytes_1",
+            config_entry=real_config_entry,
+            disabled_by=RegistryEntryDisabler.USER,
+        )
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "switch_1_port_rx_bytes_1",
+            config_entry=real_config_entry,
+        )
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "switch_1_port_tx_rate_1",
+            config_entry=real_config_entry,
+        )
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "switch_1_port_rx_rate_1",
+            config_entry=real_config_entry,
+        )
+
+        await hass.config_entries.async_setup(real_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        state = hass.states.get(speed_row.entity_id)
+        assert state is not None
+        assert state.state == "unavailable"
+
+        entry_rows_before = er.async_entries_for_config_entry(
+            entity_registry, real_config_entry.entry_id
+        )
+        sensor_entities_before = len(hass.states.async_entity_ids("sensor"))
+
+        devices_up = [
+            {
+                "id": "switch_1",
+                "name": "Switch 1",
+                "model": "USW-24",
+                "mac": "AA:BB:CC:DD:EE:01",
+                "macAddress": "AA:BB:CC:DD:EE:01",
+                "state": "ONLINE",
+                "ipAddress": "192.168.1.51",
+                "interfaces": {
+                    "ports": [
+                        {
+                            "idx": 1,
+                            "state": "UP",
+                            "speed": 1000,
+                            "name": "Port 1",
+                        }
+                    ]
+                },
+            }
+        ]
+        mock_network_client.devices.get_all.return_value = devices_up
+
+        coordinator = real_config_entry.runtime_data.coordinator
+        await coordinator.device_coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        state = hass.states.get(speed_row.entity_id)
+        assert state is not None
+        assert state.state not in ("unavailable", "unknown")
+        assert float(state.state) == 1000.0
+
+        speed_after = entity_registry.async_get(speed_row.entity_id)
+        assert speed_after is not None
+        assert speed_after.name == "Custom Speed"
+        assert speed_after.area_id == area.id
+        assert speed_after.hidden_by == RegistryEntryHider.USER
+        assert speed_after.disabled_by is None
+
+        tx_after = entity_registry.async_get(tx_row.entity_id)
+        assert tx_after is not None
+        assert tx_after.disabled_by == RegistryEntryDisabler.USER
+
+        entry_rows_after = er.async_entries_for_config_entry(
+            entity_registry, real_config_entry.entry_id
+        )
+        assert len(entry_rows_after) == len(entry_rows_before)
+        sensor_entities_after = len(hass.states.async_entity_ids("sensor"))
+        assert sensor_entities_after == sensor_entities_before
+        # Home Assistant rejects a second entity with the same unique ID, so the
+        # counts above stay equal even if discovery re-creates the restored port
+        # when it comes UP. Only the rejection log shows that.
+        assert "does not generate unique IDs" not in caplog.text
+
 
 class TestUnifiPortSensor:
     """Tests for UnifiPortSensor."""
@@ -784,7 +939,7 @@ class TestUnifiPortSensor:
         description = next(s for s in PORT_SENSOR_TYPES if s.key == "port_poe_power")
         port = {"poe": {"enabled": True, "power": 0.0, "good": False}}
 
-        value = description.value_fn(port)
+        value = require_not_none(description.value_fn)(port)
 
         assert value == 0.0
         assert value is not None
@@ -1071,8 +1226,7 @@ class TestSFPPortSensors:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1094,8 +1248,7 @@ class TestSFPPortSensors:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
         listener = mock_coordinator.async_add_listener.call_args[0][0]
@@ -1126,8 +1279,7 @@ class TestSFPPortSensors:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1233,8 +1385,7 @@ class TestAsyncSetupEntry:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1249,8 +1400,7 @@ class TestAsyncSetupEntry:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1266,8 +1416,7 @@ class TestAsyncSetupEntry:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1288,8 +1437,7 @@ class TestAsyncSetupEntry:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1317,8 +1465,7 @@ class TestAsyncSetupEntry:
         mock_config_entry.runtime_data.coordinator = mock_coordinator
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -1348,8 +1495,7 @@ class TestAsyncSetupEntry:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -2158,7 +2304,7 @@ class TestUnifiProtectNVRSensor:
 
         # Check native value (500 GB = ~465.66 GB in binary)
         value = sensor.native_value
-        assert value is not None
+        assert isinstance(value, (int, float))
         assert abs(value - 465.66) < 1
 
     async def test_storage_total_sensor(self, hass: HomeAssistant, mock_coordinator):
@@ -2173,7 +2319,7 @@ class TestUnifiProtectNVRSensor:
 
         # Check native value (1 TB = ~931.32 GB in binary)
         value = sensor.native_value
-        assert value is not None
+        assert isinstance(value, (int, float))
         assert abs(value - 931.32) < 1
 
     async def test_storage_available_sensor(
@@ -2190,7 +2336,7 @@ class TestUnifiProtectNVRSensor:
 
         # Check native value (~465.66 GB available)
         value = sensor.native_value
-        assert value is not None
+        assert isinstance(value, (int, float))
         assert abs(value - 465.66) < 1
 
     async def test_storage_percent_sensor(self, hass: HomeAssistant, mock_coordinator):
@@ -2280,8 +2426,7 @@ class TestAsyncSetupEntryWithNVRSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2315,8 +2460,7 @@ class TestAsyncSetupEntryWithNVRSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2353,8 +2497,7 @@ class TestAsyncSetupEntryWithNVRSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2381,8 +2524,7 @@ class TestAsyncSetupEntryWithNVRSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2408,8 +2550,7 @@ class TestAsyncSetupEntryWithNVRSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2441,8 +2582,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2470,8 +2610,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2498,8 +2637,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2552,8 +2690,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2597,8 +2734,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2642,8 +2778,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2684,8 +2819,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2733,8 +2867,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2769,8 +2902,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2800,8 +2932,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
         listener = mock_coordinator.async_add_listener.call_args[0][0]
@@ -2833,8 +2964,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2865,8 +2995,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2887,8 +3016,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2924,8 +3052,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2959,8 +3086,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -2992,8 +3118,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
 
@@ -3042,8 +3167,7 @@ class TestAsyncSetupEntryEdgeCases:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         await async_setup_entry(hass, mock_config_entry, mock_add_entities)
         listener = mock_coordinator.async_add_listener.call_args[0][0]
@@ -3582,7 +3706,7 @@ class TestSiteClientSensorTypes:
         desc = next(
             d for d in SITE_CLIENT_SENSOR_TYPES if d.key == "site_total_clients"
         )
-        assert desc.value_fn(clients) == 3
+        assert require_not_none(desc.value_fn)(clients) == 3
 
     def test_wired_clients_value_fn(self):
         """Test value_fn counts only wired clients."""
@@ -3594,7 +3718,7 @@ class TestSiteClientSensorTypes:
         desc = next(
             d for d in SITE_CLIENT_SENSOR_TYPES if d.key == "site_wired_clients"
         )
-        assert desc.value_fn(clients) == 2
+        assert require_not_none(desc.value_fn)(clients) == 2
 
     def test_wireless_clients_value_fn(self):
         """Test value_fn counts only wireless clients."""
@@ -3606,13 +3730,13 @@ class TestSiteClientSensorTypes:
         desc = next(
             d for d in SITE_CLIENT_SENSOR_TYPES if d.key == "site_wireless_clients"
         )
-        assert desc.value_fn(clients) == 2
+        assert require_not_none(desc.value_fn)(clients) == 2
 
     def test_empty_clients(self):
         """Test value_fn handles empty clients dict."""
         clients: dict = {}
         for desc in SITE_CLIENT_SENSOR_TYPES:
-            assert desc.value_fn(clients) == 0
+            assert require_not_none(desc.value_fn)(clients) == 0
 
 
 class TestUnifiSiteClientSensor:
@@ -3763,7 +3887,7 @@ class TestUnifiSiteClientSensor:
         device_info = sensor.device_info
         assert device_info is not None
         idents = device_info.get("identifiers")
-        assert ("unifi_insights", "site_site1") in idents
+        assert ("unifi_insights", "site_site1") in require_not_none(idents)
 
     async def test_native_value_no_clients_data(
         self, hass: HomeAssistant, mock_coordinator: MagicMock
@@ -3809,8 +3933,7 @@ class TestAsyncSetupEntrySiteClientSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         with (
             patch(
@@ -3851,8 +3974,7 @@ class TestAsyncSetupEntrySiteClientSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         with (
             patch(
@@ -3891,8 +4013,7 @@ class TestAsyncSetupEntrySiteClientSensors:
 
         entities = []
 
-        def mock_add_entities(new_entities):
-            entities.extend(new_entities)
+        mock_add_entities = EntityCollector(entities)
 
         with (
             patch(
@@ -4036,8 +4157,7 @@ class TestProtectSensorCapabilityFiltering:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -4057,8 +4177,7 @@ class TestProtectSensorCapabilityFiltering:
 
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -4152,8 +4271,7 @@ class TestUnifiOutletSensor:
         mock_config_entry.runtime_data.coordinator = mock_coordinator
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -4341,8 +4459,7 @@ class TestUnifiAcPowerSensors:
         mock_config_entry.runtime_data.coordinator = mock_coordinator
         added_entities: list = []
 
-        def add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        add_entities = EntityCollector(added_entities)
 
         await async_setup_entry(hass, mock_config_entry, add_entities)
 
@@ -4986,7 +5103,7 @@ class TestSensorAdditionalCoverageGaps:
         discover_callback()
 
     async def test_voucher_sensor_discovery_and_deduplication(
-        self, hass: HomeAssistant, mock_config_entry: MockConfigEntry
+        self, hass: HomeAssistant, mock_config_entry: MockConfigEntry, monkeypatch
     ) -> None:
         """Test that voucher sensors are discovered and deduplicated."""
         coordinator = MagicMock()
@@ -4999,14 +5116,15 @@ class TestSensorAdditionalCoverageGaps:
         listeners = []
         coordinator.async_add_listener = listeners.append
 
-        mock_config_entry.data = {"console_id": "console"}
+        patch_attribute(
+            monkeypatch, mock_config_entry, "data", {"console_id": "console"}
+        )
         mock_config_entry.runtime_data = MagicMock(
             coordinator=coordinator, mobility_coordinator=None
         )
         added_entities: list = []
 
-        def async_add_entities(new_entities, **kwargs):
-            added_entities.extend(new_entities)
+        async_add_entities = EntityCollector(added_entities)
 
         with (
             patch(
@@ -5168,8 +5286,8 @@ class TestStalePortCleanupNativeRegistry:
             disabled_by=RegistryEntryDisabler.USER,
             hidden_by=RegistryEntryHider.USER,
         )
-        added: list[SensorEntity] = []
-        await async_setup_entry(hass, mock_config_entry, added.extend)
+        added: list[Entity] = []
+        await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
         assert row.unique_id not in {entity.unique_id for entity in added}
         assert entity_registry.async_get(row.entity_id) == row
 
@@ -5193,7 +5311,7 @@ class TestStalePortCleanupNativeRegistry:
         row = entity_registry.async_get_or_create(
             "sensor",
             DOMAIN,
-            port.unique_id,
+            require_not_none(port.unique_id),
             config_entry=mock_config_entry,
             translation_key=port.translation_key,
         )
@@ -5240,7 +5358,7 @@ class TestStalePortCleanupNativeRegistry:
             entity_registry.async_get_or_create(
                 "sensor",
                 DOMAIN,
-                own_port.unique_id,
+                require_not_none(own_port.unique_id),
                 config_entry=mock_config_entry,
             ),
             entity_registry.async_get_or_create(
@@ -5253,7 +5371,7 @@ class TestStalePortCleanupNativeRegistry:
             entity_registry.async_get_or_create(
                 "sensor",
                 DOMAIN,
-                foreign_port.unique_id,
+                require_not_none(foreign_port.unique_id),
                 config_entry=other,
                 translation_key=foreign_port.translation_key,
             ),
@@ -5271,11 +5389,11 @@ class TestStalePortCleanupNativeRegistry:
         cleanup_coordinator.data = with_sections(
             cleanup_coordinator.data, devices=devices
         )
-        added: list[SensorEntity] = []
+        added: list[Entity] = []
         with patch.object(
             entity_registry, "async_remove", wraps=entity_registry.async_remove
         ) as remove:
-            await async_setup_entry(hass, mock_config_entry, added.extend)
+            await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
 
         assert not added
         remove.assert_not_called()
@@ -5310,11 +5428,18 @@ class TestStalePortCleanupNativeRegistry:
         row = entity_registry.async_get_or_create(
             "sensor",
             DOMAIN,
-            port.unique_id,
+            require_not_none(port.unique_id),
             config_entry=mock_config_entry,
             translation_key=translation_key,
         )
-        if not device_present:
+        if device_present:
+            cleanup_coordinator.data = with_device_fields(
+                cleanup_coordinator.data,
+                "site1",
+                "device1",
+                ports=[{"idx": 1, "state": "DOWN"}],
+            )
+        else:
             cleanup_coordinator.data = with_sections(
                 cleanup_coordinator.data, devices={}
             )
@@ -5344,10 +5469,348 @@ class TestStalePortCleanupNativeRegistry:
         row = entity_registry.async_get_or_create(
             "binary_sensor" if ownership == "domain" else "sensor",
             "other_platform" if ownership == "platform" else DOMAIN,
-            port.unique_id,
+            require_not_none(port.unique_id),
             config_entry=other if ownership == "foreign" else mock_config_entry,
             translation_key=port.translation_key,
             disabled_by=RegistryEntryDisabler.USER,
+        )
+        await async_setup_entry(hass, mock_config_entry, MagicMock())
+        assert entity_registry.async_get(row.entity_id) == row
+
+    async def test_down_port_keeps_registry_rows_and_is_restored(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """A DOWN port retains its registry rows and is restored on startup."""
+        area_reg = ar.async_get(hass)
+        area = area_reg.async_create("Server Room")
+        cleanup_coordinator.data = with_device_fields(
+            cleanup_coordinator.data,
+            "site1",
+            "device1",
+            ports=[{"idx": 2, "state": "DOWN"}],
+        )
+        row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_speed_2",
+            config_entry=mock_config_entry,
+            translation_key="port_speed",
+            disabled_by=RegistryEntryDisabler.USER,
+        )
+        row = entity_registry.async_update_entity(
+            row.entity_id,
+            name="Custom Down Port",
+            area_id=area.id,
+            hidden_by=RegistryEntryHider.USER,
+        )
+        added: list[Entity] = []
+        with patch.object(
+            entity_registry, "async_remove", wraps=entity_registry.async_remove
+        ) as spy_remove:
+            await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
+            spy_remove.assert_not_called()
+
+        saved = entity_registry.async_get(row.entity_id)
+        assert saved is not None
+        assert saved.name == "Custom Down Port"
+        assert saved.area_id == area.id
+        assert saved.hidden_by == RegistryEntryHider.USER
+        assert saved.disabled_by == RegistryEntryDisabler.USER
+        assert row.unique_id in {entity.unique_id for entity in added}
+
+    async def test_unregistered_down_port_gains_no_entity_and_no_registry_row(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """An unregistered DOWN port gains neither entities nor registry rows."""
+        cleanup_coordinator.data = with_device_fields(
+            cleanup_coordinator.data,
+            "site1",
+            "device1",
+            ports=[{"idx": 2, "state": "DOWN"}],
+        )
+        added: list[Entity] = []
+        await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
+
+        port_2_added = [e for e in added if getattr(e, "unique_id", "").endswith("_2")]
+        assert not port_2_added
+
+        entries = er.async_entries_for_config_entry(
+            entity_registry, mock_config_entry.entry_id
+        )
+        assert not [e for e in entries if e.unique_id.endswith("_2")]
+
+    async def test_only_seeded_descriptions_restored_for_down_port(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """Only previously seeded descriptions are restored for a DOWN port."""
+        cleanup_coordinator.data = with_device_fields(
+            cleanup_coordinator.data,
+            "site1",
+            "device1",
+            ports=[{"idx": 2, "state": "DOWN"}],
+        )
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_tx_bytes_2",
+            config_entry=mock_config_entry,
+            translation_key="port_tx_bytes",
+        )
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_rx_bytes_2",
+            config_entry=mock_config_entry,
+            translation_key="port_rx_bytes",
+        )
+        entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_sfp_vendor_2",
+            config_entry=mock_config_entry,
+            translation_key="port_sfp_vendor",
+        )
+
+        added: list[Entity] = []
+        await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
+
+        port_2_added = [
+            e
+            for e in added
+            if getattr(e, "unique_id", "").endswith("_2")
+            and isinstance(e, UnifiPortSensor)
+        ]
+        added_keys = {e.entity_description.key for e in port_2_added}
+        assert added_keys == {"port_tx_bytes", "port_rx_bytes", "port_sfp_vendor"}
+
+    async def test_later_discovery_passes_do_not_restore_newly_down_ports(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """Later discovery passes do not restore ports that went DOWN after startup."""
+        captured_listener: Any = None
+
+        def save_listener(listener: Any) -> Any:
+            nonlocal captured_listener
+            captured_listener = listener
+            return lambda: None
+
+        cleanup_coordinator.async_add_listener.side_effect = save_listener
+
+        row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_speed_2",
+            config_entry=mock_config_entry,
+            translation_key="port_speed",
+        )
+
+        added: list[Entity] = []
+        await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
+        assert callable(captured_listener)
+        assert row.unique_id not in {entity.unique_id for entity in added}
+
+        cleanup_coordinator.data = with_device_fields(
+            cleanup_coordinator.data,
+            "site1",
+            "device1",
+            ports=[{"idx": 2, "state": "DOWN"}],
+        )
+        captured_listener()
+
+        port_2_added = [e for e in added if getattr(e, "unique_id", "").endswith("_2")]
+        assert not port_2_added
+        assert entity_registry.async_get(row.entity_id) == row
+
+    @pytest.mark.parametrize(
+        "ports_value",
+        [
+            [],
+            None,
+            [{"idx": "invalid", "state": "DOWN"}, {"idx": None, "state": "DOWN"}],
+        ],
+        ids=["empty_list", "missing_key", "all_invalid_indices"],
+    )
+    async def test_unknown_port_evidence_preserves_port_rows(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+        ports_value: Any,
+    ) -> None:
+        """Retain port rows when port evidence is empty, missing, or invalid."""
+        if ports_value is None:
+            dev = dict(cleanup_coordinator.data["devices"]["site1"]["device1"])
+            dev.pop("ports", None)
+            cleanup_coordinator.data = with_sections(
+                cleanup_coordinator.data,
+                devices={"site1": {"device1": dev}},
+            )
+        else:
+            cleanup_coordinator.data = with_device_fields(
+                cleanup_coordinator.data,
+                "site1",
+                "device1",
+                ports=ports_value,
+            )
+
+        row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_speed_1",
+            config_entry=mock_config_entry,
+            translation_key="port_speed",
+        )
+        with patch.object(
+            entity_registry, "async_remove", wraps=entity_registry.async_remove
+        ) as spy_remove:
+            await async_setup_entry(hass, mock_config_entry, MagicMock())
+            spy_remove.assert_not_called()
+
+        assert entity_registry.async_get(row.entity_id) == row
+
+    async def test_absent_port_index_removed_while_present_down_index_survives(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """Remove absent port indices while preserving present DOWN indices."""
+        cleanup_coordinator.data = with_device_fields(
+            cleanup_coordinator.data,
+            "site1",
+            "device1",
+            ports=[{"idx": 1, "state": "DOWN"}],
+        )
+        row_present = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_speed_1",
+            config_entry=mock_config_entry,
+            translation_key="port_speed",
+        )
+        row_absent = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_speed_2",
+            config_entry=mock_config_entry,
+            translation_key="port_speed",
+        )
+        await async_setup_entry(hass, mock_config_entry, MagicMock())
+        assert entity_registry.async_get(row_present.entity_id) is not None
+        assert entity_registry.async_get(row_absent.entity_id) is None
+
+    async def test_multi_site_device_port_union_preserves_row(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """Survive cleanup when site A has empty ports and site B reports the port."""
+        cleanup_coordinator.data = with_sections(
+            cleanup_coordinator.data,
+            sites={"site1": {"id": "site1"}, "site2": {"id": "site2"}},
+            devices={
+                "site1": {
+                    "device1": {
+                        "name": "Synthetic switch site1",
+                        "state": "ONLINE",
+                        "ports": [],
+                    }
+                },
+                "site2": {
+                    "device1": {
+                        "name": "Synthetic switch site2",
+                        "state": "ONLINE",
+                        "ports": [{"idx": 2, "state": "DOWN"}],
+                    }
+                },
+            },
+        )
+        row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_speed_2",
+            config_entry=mock_config_entry,
+            translation_key="port_speed",
+        )
+        await async_setup_entry(hass, mock_config_entry, MagicMock())
+        assert entity_registry.async_get(row.entity_id) is not None
+
+    def test_port_evidence_is_the_union_across_sites(
+        self, cleanup_coordinator: MagicMock
+    ) -> None:
+        """Merge every site's port indices for a device, not one site's list."""
+        cleanup_coordinator.data = with_sections(
+            cleanup_coordinator.data,
+            sites={"site1": {"id": "site1"}, "site2": {"id": "site2"}},
+            devices={
+                "site1": {
+                    "device1": {
+                        "name": "Synthetic switch site1",
+                        "state": "ONLINE",
+                        "ports": [
+                            {"idx": 1, "state": "DOWN"},
+                            {"idx": 3, "state": "UP"},
+                        ],
+                    },
+                    "device2": {
+                        "name": "Synthetic switch without ports",
+                        "state": "ONLINE",
+                        "ports": [],
+                    },
+                },
+                "site2": {
+                    "device1": {
+                        "name": "Synthetic switch site2",
+                        "state": "ONLINE",
+                        "ports": [{"idx": 2, "state": "DOWN"}],
+                    }
+                },
+            },
+        )
+        assert _collect_device_port_indices(cleanup_coordinator) == {
+            "device1": {1, 2, 3}
+        }
+
+    async def test_present_port_uncreated_description_survives_cleanup(
+        self,
+        hass: HomeAssistant,
+        entity_registry: er.EntityRegistry,
+        mock_config_entry: MockConfigEntry,
+        cleanup_coordinator: MagicMock,
+    ) -> None:
+        """Survive cleanup when port is present but description was not created."""
+        cleanup_coordinator.data = with_device_fields(
+            cleanup_coordinator.data,
+            "site1",
+            "device1",
+            ports=[{"idx": 1, "state": "UP"}],
+        )
+        row = entity_registry.async_get_or_create(
+            "sensor",
+            DOMAIN,
+            "device1_port_poe_power_1",
+            config_entry=mock_config_entry,
+            translation_key="port_poe_power",
         )
         await async_setup_entry(hass, mock_config_entry, MagicMock())
         assert entity_registry.async_get(row.entity_id) == row
@@ -5377,6 +5840,13 @@ class TestStalePortCleanupNativeRegistry:
         removed: bool,
     ) -> None:
         """Require a nonempty device, known key, and canonical integer port tail."""
+        if removed:
+            cleanup_coordinator.data = with_device_fields(
+                cleanup_coordinator.data,
+                "site1",
+                "device1",
+                ports=[{"idx": 1, "state": "DOWN"}],
+            )
         row = entity_registry.async_get_or_create(
             "sensor",
             DOMAIN,
@@ -5407,7 +5877,7 @@ class TestStalePortCleanupNativeRegistry:
         row = entity_registry.async_get_or_create(
             "sensor",
             DOMAIN,
-            port.unique_id,
+            require_not_none(port.unique_id),
             config_entry=mock_config_entry,
             translation_key=port.translation_key,
             disabled_by=RegistryEntryDisabler.USER,
@@ -5415,8 +5885,8 @@ class TestStalePortCleanupNativeRegistry:
         row = entity_registry.async_update_entity(
             row.entity_id, name="Custom active port"
         )
-        added: list[SensorEntity] = []
-        await async_setup_entry(hass, mock_config_entry, added.extend)
+        added: list[Entity] = []
+        await async_setup_entry(hass, mock_config_entry, EntityCollector(added))
         assert row.unique_id in {entity.unique_id for entity in added}
         assert entity_registry.async_get(row.entity_id) == row
 
@@ -5444,7 +5914,7 @@ class TestStalePortCleanupNativeRegistry:
         row = entity_registry.async_get_or_create(
             "sensor",
             DOMAIN,
-            storage.unique_id,
+            require_not_none(storage.unique_id),
             config_entry=mock_config_entry,
             translation_key=storage.translation_key,
             disabled_by=RegistryEntryDisabler.USER,
