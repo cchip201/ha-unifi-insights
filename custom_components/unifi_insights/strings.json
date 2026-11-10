@@ -536,6 +536,21 @@
       "site_wireless_clients": {
         "name": "Wireless clients"
       },
+      "isp_avg_latency": {
+        "name": "ISP latency"
+      },
+      "isp_max_latency": {
+        "name": "ISP maximum latency"
+      },
+      "isp_packet_loss": {
+        "name": "ISP packet loss"
+      },
+      "isp_name": {
+        "name": "ISP name"
+      },
+      "isp_asn": {
+        "name": "ISP AS number"
+      },
       "internet_download_1h": {
         "name": "Internet download (last hour)"
       },

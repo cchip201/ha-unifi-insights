@@ -40,6 +40,7 @@ from custom_components.unifi_insights.sensor import (
     ROUTER_SENSORS,
     SECURITY_SENSOR_TYPES,
     SITE_INTERNET_ACTIVITY_SENSOR_TYPES,
+    SITE_ISP_METRIC_SENSOR_TYPES,
     STORAGE_SENSOR_TYPES,
     WORKSPACE_SENSORS,
 )
@@ -443,6 +444,25 @@ def test_site_internet_activity_sensor_translations_resolve_in_both_files() -> N
         assert key in en_sensor, f"{key} missing from translations/en.json"
         assert en_sensor[key] == strings_sensor[key], (
             f"{key} differs between strings.json and translations/en.json"
+        )
+
+
+def test_site_isp_metric_sensor_translations_and_icons_resolve() -> None:
+    """Every Site Manager ISP metric sensor has a name in both files and an icon."""
+    en_sensor = json.loads(_EN_JSON.read_text())["entity"]["sensor"]
+    strings_sensor = json.loads(_STRINGS_JSON.read_text())["entity"]["sensor"]
+    icons_sensor = json.loads(_ICONS_JSON.read_text())["entity"]["sensor"]
+
+    for desc in SITE_ISP_METRIC_SENSOR_TYPES:
+        key = desc.translation_key
+        assert key is not None
+        assert key in strings_sensor, f"{key} missing from strings.json"
+        assert key in en_sensor, f"{key} missing from translations/en.json"
+        assert en_sensor[key] == strings_sensor[key], (
+            f"{key} differs between strings.json and translations/en.json"
+        )
+        assert icons_sensor[key]["default"].startswith("mdi:"), (
+            f"{key} has no icon in icons.json"
         )
 
 

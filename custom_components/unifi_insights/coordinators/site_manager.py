@@ -20,6 +20,7 @@ from unifi_official_api.site_manager import UniFiSiteManagerClient
 from custom_components.unifi_insights.const import (
     DOMAIN,
     ISP_WAN_NUMBERS,
+    ISP_WAN_TEXT,
     SCAN_INTERVAL_SITE_MANAGER,
     SITE_MANAGER_COLLECTIONS,
 )
@@ -60,8 +61,21 @@ def _by_id(rows: list[dict[str, Any]], field_name: str) -> dict[str, dict[str, A
     }
 
 
+def _isp_text(value: Any) -> str | None:
+    """Return an ISP name or AS number as text, or None when it is not usable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    # Home Assistant limits a state to 255 characters.
+    return text[:255] or None
+
+
 def _latest_isp_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Keep only the newest numeric WAN period for each host and site."""
+    """Keep only the newest WAN period (numbers and ISP text) per host and site."""
     latest: dict[str, dict[str, dict[str, Any]]] = {}
     for row in rows:
         host_id = row.get("hostId")
@@ -88,10 +102,17 @@ def _latest_isp_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             latest[host_id][site_id] = {
                 "metric_time": timestamp.isoformat(),
                 "wan": {
-                    key: value
-                    for key in ISP_WAN_NUMBERS
-                    if isinstance(value := wan.get(key), (int, float))
-                    and not isinstance(value, bool)
+                    **{
+                        key: value
+                        for key in ISP_WAN_NUMBERS
+                        if isinstance(value := wan.get(key), (int, float))
+                        and not isinstance(value, bool)
+                    },
+                    **{
+                        key: text
+                        for key in ISP_WAN_TEXT
+                        if (text := _isp_text(wan.get(key))) is not None
+                    },
                 },
             }
     return latest

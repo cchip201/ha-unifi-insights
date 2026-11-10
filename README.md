@@ -154,6 +154,7 @@ Carrier Fabric entries have their own options. See [Carrier Fabric setup](#carri
 | Total Clients, Wired Clients, Wireless Clients               | Sensor         | Per site                                                                               |
 | Connected clients                                            | Sensor         | Per Wi-Fi network, on its `WiFi: <SSID>` device                                        |
 | Internet Download, Internet Upload                           | Sensor         | Per site, for the last hour, 24 hours, 7 days and 30 days                              |
+| ISP latency, ISP packet loss, ISP name, ISP AS number        | Sensor         | Per site on cloud (remote) entries, from Site Manager ISP metrics, newest five-minute period; maximum latency is disabled by default |
 | Total PoE Power, _port_ PoE Power                            | Sensor         | Per switch and per port (W)                                                            |
 | _Port_ TX, RX, TX Rate, RX Rate, Speed                       | Sensor         | Per port: traffic (bytes), rates (Mbit/s) and link speed (Mbps, disabled by default)   |
 | _Port_ SFP Module, SFP Vendor, SFP Type, SFP Serial          | Sensor         | Per SFP port, disabled by default                                                      |

@@ -30,6 +30,9 @@ def release_zip() -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    if not (REPO_ROOT / ".git").exists():
+        _git(REPO_ROOT, "init", "-q")
+        _git(REPO_ROOT, "add", ".")
     return module
 
 

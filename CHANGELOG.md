@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.11.0-cmcore.1] - 2026-11-10
+
+### Added
+
+- cmcore (backlog 1715.1): a remote (cloud) entry gets five sensors per site for the WAN facts the console cannot tell about itself, read from the Site Manager `isp-metrics` feed its shared Site Manager coordinator already polls every 10 minutes: ISP latency, ISP maximum latency (disabled by default), ISP packet loss, ISP name and ISP AS number (the last two are diagnostic entities). They sit on the site's gateway device and go unavailable while the Site Manager `isp_metrics` collection fails or the last hour has no period. The coordinator now keeps `ispName` and `ispAsn` (as text, trimmed to 255 characters) next to the numbers in the newest period it stores; diagnostics still export the numbers only. A local entry has no Site Manager coordinator and gets none of these.
+
 ## [2026.11.0] - 2026-11-05
 
 ### Added

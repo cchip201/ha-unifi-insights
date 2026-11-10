@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_VERIFY_SSL
 from homeassistant.data_entry_flow import FlowResultType
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.unifi_insights.const import (
     CONF_CONNECTION_TYPE,
