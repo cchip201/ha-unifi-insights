@@ -82,6 +82,7 @@ from .coordinators.site_manager import (
     async_release_site_manager,
 )
 from .data_transforms import normalize_mac as canonical_mac
+from .device_id_migration import async_migrate_mac_device_ids
 from .frontend import async_register_frontend
 from .probe import (
     ProbeResult,
@@ -678,6 +679,14 @@ async def async_setup_entry(
 
     if updates:
         hass.config_entries.async_update_entry(entry, **updates)
+
+    # cmcore (backlog 1795): a device the API once listed without an id was
+    # registered under its MAC. Re-key it before the platforms register the
+    # same hardware under the id the API reports now (device_id_migration.py).
+    if device_coordinator and isinstance(device_coordinator.data, dict):
+        async_migrate_mac_device_ids(
+            hass, entry, device_coordinator.data.get("devices") or {}
+        )
 
     # Start the real-time Protect WebSocket subscription (additive to the
     # 30s poll above, which stays as the fallback - see
