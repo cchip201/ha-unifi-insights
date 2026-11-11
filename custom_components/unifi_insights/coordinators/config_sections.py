@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import itertools
 import logging
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final
@@ -15,7 +16,7 @@ from unifi_official_api.network.models.report import SiteReportBucket
 from custom_components.unifi_insights.topology import normalize_mac
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from unifi_official_api.network import UniFiNetworkClient
 
@@ -602,6 +603,136 @@ async def async_call_site_report(
     return list(result) if isinstance(result, (list, tuple)) else []
 
 
+# cmcore (backlog 1813): the Network application 11.0.99 (UniFi OS 6.0.17, 2026-11-11)
+# keeps its statistics in PostgreSQL and answers the classic
+# ``stat/report/{5minutes,hourly,daily}.site`` calls with an empty list, so the
+# internet activity sensors read unavailable. The same WAN totals are in the
+# dashboard feed the Network web UI uses: ``wan_activity.total_activity.history``
+# holds the average receive and transmit rate in bits per second per bucket (5
+# minutes up to a day, 1 hour for a week, 8 hours for a month).
+DASHBOARD_HISTORY_WINDOWS: dict[str, int] = {
+    "1d": WINDOW_1D_MS,
+    "1w": WINDOW_1W_MS,
+    "1m": WINDOW_1M_MS,
+}
+_DASHBOARD_DEFAULT_STEP_MS = {"1d": 300_000, "1w": 3_600_000, "1m": 28_800_000}
+
+
+async def async_call_dashboard_history(
+    network_client: Any,
+    site_name: str,
+    window_ms: int,
+) -> list[Any]:
+    """Return the dashboard's WAN activity history for the last ``window_ms``."""
+    build_path = getattr(network_client, "build_legacy_api_path", None)
+    get = getattr(network_client, "_get", None)
+    if not callable(build_path) or not callable(get):
+        return []
+    legacy_path = str(build_path(site_name, "/x"))
+    suffix = f"/api/s/{site_name}/x"
+    if not legacy_path.endswith(suffix):
+        return []
+    path = (
+        legacy_path.removesuffix(suffix)
+        + f"/v2/api/site/{site_name}/aggregated-dashboard"
+    )
+    response = await get(
+        path,
+        params={"historySeconds": window_ms // 1000},
+        expected_unsupported=True,
+        log_body=False,
+    )
+    if not isinstance(response, dict):
+        return []
+    wan_activity = response.get("wan_activity")
+    total = (
+        wan_activity.get("total_activity") if isinstance(wan_activity, dict) else None
+    )
+    history = total.get("history") if isinstance(total, dict) else None
+    return list(history) if isinstance(history, list) else []
+
+
+def _sum_dashboard_window(
+    buckets: Sequence[Any],
+    *,
+    cutoff_ms: int,
+    now_ms: int,
+    default_step_ms: int,
+) -> dict[str, int] | None:
+    """Turn average-rate buckets (bits per second) into received and sent bytes."""
+    points: list[tuple[int, float | None, float | None]] = []
+    for item in buckets:
+        if not isinstance(item, dict):
+            continue
+        stamp = item.get("timestamp")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            continue
+        rx_rate = item.get("avg_rx_rate_bps")
+        tx_rate = item.get("avg_tx_rate_bps")
+        points.append(
+            (
+                int(stamp),
+                float(rx_rate) if isinstance(rx_rate, (int, float)) else None,
+                float(tx_rate) if isinstance(tx_rate, (int, float)) else None,
+            )
+        )
+    if not points:
+        return None
+    points.sort()
+    gaps = [b[0] - a[0] for a, b in itertools.pairwise(points) if b[0] > a[0]]
+    step_ms = min(gaps) if gaps else default_step_ms
+
+    rx_total = 0.0
+    tx_total = 0.0
+    rx_seen = tx_seen = False
+    for stamp, rx_rate, tx_rate in points:
+        if stamp < cutoff_ms:
+            continue
+        seconds = min(step_ms, max(0, now_ms - stamp)) / 1000
+        if rx_rate is not None:
+            rx_total += rx_rate * seconds / 8
+            rx_seen = True
+        if tx_rate is not None:
+            tx_total += tx_rate * seconds / 8
+            tx_seen = True
+    totals: dict[str, int] = {}
+    if rx_seen:
+        totals["rx_bytes"] = round(rx_total)
+    if tx_seen:
+        totals["tx_bytes"] = round(tx_total)
+    return totals or None
+
+
+def aggregate_dashboard_activity_windows(
+    history_by_window: Mapping[str, Sequence[Any]],
+    *,
+    now_ms: int,
+) -> dict[str, dict[str, int]]:
+    """
+    Aggregate dashboard history into the ``1h``, ``1d``, ``1w`` and ``1m`` totals.
+
+    ``1h`` and ``1d`` both read the 5-minute buckets of the day-long feed, ``1w``
+    the hourly buckets of the week-long feed and ``1m`` the 8-hour buckets of the
+    month-long feed. A window without usable buckets is omitted, not zero.
+    """
+    windows: dict[str, dict[str, int]] = {}
+    for window_key, source_key, duration_ms in (
+        ("1h", "1d", WINDOW_1H_MS),
+        ("1d", "1d", WINDOW_1D_MS),
+        ("1w", "1w", WINDOW_1W_MS),
+        ("1m", "1m", WINDOW_1M_MS),
+    ):
+        totals = _sum_dashboard_window(
+            history_by_window.get(source_key) or (),
+            cutoff_ms=now_ms - duration_ms,
+            now_ms=now_ms,
+            default_step_ms=_DASHBOARD_DEFAULT_STEP_MS[source_key],
+        )
+        if totals is not None:
+            windows[window_key] = totals
+    return windows
+
+
 async def async_fetch_site_internet_activity(
     fetch_optional_section: Callable[
         [str, str, Callable[[], Awaitable[list[Any]]]],
@@ -611,8 +742,15 @@ async def async_fetch_site_internet_activity(
     site_id: str,
     site_name: str,
     now_ms: int,
+    *,
+    call_dashboard_history: Callable[..., Awaitable[list[Any]]] | None = None,
 ) -> dict[str, dict[str, int]] | None:
-    """Fetch ``5minutes``, ``hourly``, and ``daily`` site reports and aggregate."""
+    """
+    Fetch ``5minutes``, ``hourly``, and ``daily`` site reports and aggregate.
+
+    When the classic reports answer with no buckets at all (Network 11.0.99), the
+    totals come from the dashboard feed through ``call_dashboard_history``.
+    """
     five_min_buckets = await fetch_optional_section(
         "internet_activity",
         site_id,
@@ -655,12 +793,26 @@ async def async_fetch_site_internet_activity(
     if daily_buckets is None:
         return None
 
-    return aggregate_internet_activity_windows(
+    windows = aggregate_internet_activity_windows(
         five_min_buckets,
         hourly_buckets,
         daily_buckets,
         now_ms=now_ms,
     )
+    if windows or call_dashboard_history is None:
+        return windows
+
+    history_by_window: dict[str, list[Any]] = {}
+    for window_key, window_ms in DASHBOARD_HISTORY_WINDOWS.items():
+        history = await fetch_optional_section(
+            "internet_activity",
+            site_id,
+            partial(call_dashboard_history, site_name, window_ms),
+        )
+        if history is None:
+            return windows
+        history_by_window[window_key] = history
+    return aggregate_dashboard_activity_windows(history_by_window, now_ms=now_ms)
 
 
 def resolve_report_site_name(

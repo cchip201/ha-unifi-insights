@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.11.0-cmcore.4] - 2026-11-11
+
+### Fixed
+
+- cmcore (backlog 1813): the eight internet activity sensors per console (download and upload for the last hour, 24 hours, 7 days and 30 days) read unavailable on every console since the 2026-11-11 UniFi OS update. Network 11.0.99 keeps its statistics in PostgreSQL and the classic `stat/report/{5minutes,hourly,daily}.site` calls answer `200` with no buckets. When those reports come back empty, the totals now come from the Network web UI's dashboard feed (`/v2/api/site/<site>/aggregated-dashboard`, `wan_activity.total_activity.history`), which carries the average receive and transmit rate per 5-minute, hourly and 8-hour bucket. Bytes are rate x bucket seconds / 8, so a window is only as full as the console's new statistics: the 24 hour, 7 day and 30 day totals read low until the new buckets fill, because the old history was not carried over.
+
 ## [2026.11.0-cmcore.3] - 2026-11-11
 
 ### Fixed

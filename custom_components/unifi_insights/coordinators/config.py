@@ -46,6 +46,7 @@ from .config_sections import (
     WINDOW_1M_MS,
     WINDOW_1W_MS,
     aggregate_internet_activity_windows,
+    async_call_dashboard_history,
     async_call_site_report,
     async_fetch_site_firewall,
     async_fetch_site_internet_activity,
@@ -311,6 +312,14 @@ class UnifiInsightsConfigCoordinator(UnifiInsightsBaseCoordinator):
             self.network_client, site_name, interval, start_ms=start_ms, end_ms=end_ms
         )
 
+    async def _call_dashboard_history(
+        self, site_name: str, window_ms: int
+    ) -> list[Any]:
+        """Read the dashboard's WAN activity history for the last ``window_ms``."""
+        return await async_call_dashboard_history(
+            self.network_client, site_name, window_ms
+        )
+
     async def _fetch_site_internet_activity(
         self,
         *,
@@ -325,6 +334,7 @@ class UnifiInsightsConfigCoordinator(UnifiInsightsBaseCoordinator):
             site_id=site_id,
             site_name=site_name,
             now_ms=now_ms,
+            call_dashboard_history=self._call_dashboard_history,
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
