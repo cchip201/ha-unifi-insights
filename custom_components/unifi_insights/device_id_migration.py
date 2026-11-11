@@ -39,6 +39,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
+from .console_identity import build_site_unique_id, resolve_console_namespace
 from .const import DOMAIN
 
 if TYPE_CHECKING:
@@ -85,14 +86,23 @@ def _rewrite_unique_id(
     The platforms build two shapes from the device id: ``<site>_<id>_<suffix>``
     (most entities) and ``<id>_<suffix>`` (port sensors). The suffix is kept
     verbatim, so the result is what the platform builds for the new id.
+
+    A third shape starts with the same MAC but is not keyed on the device:
+    ``<console>_<site>_<suffix>`` names a site entity (vouchers, client totals)
+    by the console's MAC, which the platform keeps building whatever id the API
+    gives the gateway device. It is left alone (v2026.11.0-cmcore.2 rewrote it
+    and orphaned 22 entities; ``_revert_console_namespaced`` undoes that).
     """
     lowered = unique_id.lower()
-    for old_prefix, new_prefix in (
-        (f"{site_id}_{old_token}_", f"{site_id}_{new_device_id}_"),
-        (f"{old_token}_", f"{new_device_id}_"),
-    ):
-        if lowered.startswith(old_prefix.lower()):
-            return new_prefix + unique_id[len(old_prefix) :]
+    keyed_on_site = f"{site_id}_{old_token}_"
+    if lowered.startswith(keyed_on_site.lower()):
+        return f"{site_id}_{new_device_id}_{unique_id[len(keyed_on_site) :]}"
+    keyed_on_device = f"{old_token}_"
+    if lowered.startswith(keyed_on_device.lower()):
+        rest = unique_id[len(keyed_on_device) :]
+        if rest.startswith(f"{site_id}_"):
+            return None
+        return f"{new_device_id}_{rest}"
     return None
 
 
@@ -173,12 +183,24 @@ def async_migrate_mac_device_ids(
             if key is None:
                 continue
 
+            new_identifier = f"{prefix}{device_id}"
             found = _find_mac_device(device_registry, entry.entry_id, prefix, key)
             if found is None:
+                moved_device = device_registry.async_get_device_by_identifier(
+                    (DOMAIN, new_identifier), entry.entry_id
+                )
+                if moved_device is not None:
+                    _revert_console_namespaced(
+                        entity_registry,
+                        entry,
+                        moved_device.id,
+                        site_id=site_id,
+                        device_id=device_id,
+                        key=key,
+                    )
                 continue
             old, old_identifier = found
 
-            new_identifier = f"{prefix}{device_id}"
             holder = device_registry.async_get_device_by_identifier(
                 (DOMAIN, new_identifier), entry.entry_id
             )
@@ -228,6 +250,76 @@ def async_migrate_mac_device_ids(
                 moved,
             )
     return migrated
+
+
+def _revert_console_namespaced(
+    entity_registry: er.EntityRegistry,
+    entry: ConfigEntry,
+    registry_device_id: str,
+    *,
+    site_id: str,
+    device_id: str,
+    key: str,
+) -> int:
+    """
+    Undo the cmcore.2 rewrite of site entities named by the console's MAC.
+
+    v2026.11.0-cmcore.2 turned ``<console MAC>_<site>_<suffix>`` into
+    ``<device id>_<site>_<suffix>``, which no platform builds, so those entities
+    went unavailable and the platforms added copies with a ``_2`` entity id.
+    For the console's own device, put each unique id back to the namespaced
+    form and drop the copy that holds it, so the original keeps its entity id.
+    Return how many unique ids were put back.
+    """
+    namespace = resolve_console_namespace(entry)
+    if namespace is None or mac_key(namespace) != key:
+        return 0
+    wrong = f"{device_id}_{site_id}_"
+    reverted = 0
+    for reg_entry in er.async_entries_for_device(
+        entity_registry, registry_device_id, include_disabled_entities=True
+    ):
+        if (
+            reg_entry.platform != DOMAIN
+            or reg_entry.config_entry_id != entry.entry_id
+            or not reg_entry.unique_id.startswith(wrong)
+        ):
+            continue
+        target = build_site_unique_id(
+            namespace, site_id, reg_entry.unique_id[len(wrong) :]
+        )
+        copy_id = entity_registry.async_get_entity_id(reg_entry.domain, DOMAIN, target)
+        if copy_id is not None:
+            copy = entity_registry.async_get(copy_id)
+            if copy is None or copy.config_entry_id != entry.entry_id:
+                _LOGGER.warning(
+                    "Device id migration: %s holds %s; leaving %s as it is",
+                    copy_id,
+                    target,
+                    reg_entry.entity_id,
+                )
+                continue
+            entity_registry.async_remove(copy_id)
+        try:
+            entity_registry.async_update_entity(
+                reg_entry.entity_id, new_unique_id=target
+            )
+        except (HomeAssistantError, ValueError) as err:
+            _LOGGER.warning(
+                "Device id migration: cannot put back %s (%s): %s",
+                reg_entry.entity_id,
+                reg_entry.unique_id,
+                err,
+            )
+            continue
+        reverted += 1
+    if reverted:
+        _LOGGER.info(
+            "Device id migration: put %d console-namespaced unique ids back on %s",
+            reverted,
+            registry_device_id,
+        )
+    return reverted
 
 
 def _find_mac_device(

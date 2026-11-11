@@ -14,7 +14,7 @@ from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant.common import MockConfigEntry
 from unifi_official_api.network.models import Device
 
-from custom_components.unifi_insights.const import DOMAIN
+from custom_components.unifi_insights.const import CONF_CONSOLE_ID, DOMAIN
 from custom_components.unifi_insights.device_id_migration import (
     _is_api_device_id,
     _rewrite_unique_id,
@@ -128,6 +128,8 @@ def test_is_api_device_id(value: object, expected: bool) -> None:  # noqa: FBT00
             f"{SITE}_{MAC}_port1_poe_power_cycle",
             f"{SITE}_{API_ID}_port1_poe_power_cycle",
         ),
+        (f"{MAC}_{SITE}_voucher_duration", None),
+        (f"{MAC.upper()}_{SITE}_site_total_clients", None),
         (f"{SITE}_rule-1_firewall_rule", None),
         (f"{SITE}_{MAC}", None),
         ("other", None),
@@ -158,6 +160,9 @@ async def test_migrates_device_and_entities_in_place(hass: HomeAssistant) -> Non
     )
     rule = _entity(
         hass, entry, device, "switch", f"{SITE}_rule-1_firewall_rule", "rule"
+    )
+    site_total = _entity(
+        hass, entry, device, "sensor", f"{MAC}_{SITE}_site_total_clients", "total"
     )
     ent_reg.async_update_entity(cpu.entity_id, name="CPU", labels={"keep"})
 
@@ -196,6 +201,9 @@ async def test_migrates_device_and_entities_in_place(hass: HomeAssistant) -> Non
     assert after_rule is not None
     assert after_rule.unique_id == f"{SITE}_rule-1_firewall_rule"
     assert after_rule.device_id == device.id
+    after_total = ent_reg.async_get(site_total.entity_id)
+    assert after_total is not None
+    assert after_total.unique_id == f"{MAC}_{SITE}_site_total_clients"
 
     # A second run finds nothing left to do.
     assert async_migrate_mac_device_ids(hass, entry, _site_api()) == 0
@@ -483,6 +491,162 @@ async def test_other_platform_entities_are_not_rewritten(hass: HomeAssistant) ->
     kept = er.async_get(hass).async_get(foreign.entity_id)
     assert kept is not None
     assert kept.unique_id == f"{SITE}_{MAC}_cpu_usage"
+
+
+def _console_entry(
+    hass: HomeAssistant,
+    console_id: str | None = CONSOLE_MAC,
+    entry_id: str = "mig_entry",
+) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id=entry_id,
+        title="UniFi Local",
+        data={CONF_CONSOLE_ID: console_id} if console_id else {},
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+def _migrated_console(hass: HomeAssistant, entry: MockConfigEntry) -> dr.DeviceEntry:
+    """The console as v2026.11.0-cmcore.2 left it: UUID identifier, MAC connection."""
+    return dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, f"{SITE}_{CONSOLE_API_ID}")},
+        connections={(dr.CONNECTION_NETWORK_MAC, CONSOLE_MAC)},
+        manufacturer="Ubiquiti Inc.",
+        model="UDM Pro",
+        name="CMCoreUDMP (50.35.176.45)",
+    )
+
+
+def _console_api() -> dict[str, dict[str, dict[str, Any]]]:
+    return {SITE: {CONSOLE_API_ID: {"macAddress": CONSOLE_MAC}}}
+
+
+async def test_puts_back_console_namespaced_ids_the_old_release_rewrote(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cmcore.2 damage is undone: original keeps its entity id, the copy goes."""
+    entry = _console_entry(hass)
+    ent_reg = er.async_get(hass)
+    device = _migrated_console(hass, entry)
+    wrong = f"{CONSOLE_API_ID}_{SITE}_voucher_duration"
+    original = _entity(hass, entry, device, "number", wrong, "voucher_duration")
+    ent_reg.async_update_entity(original.entity_id, name="Voucher length")
+    copy = _entity(
+        hass,
+        entry,
+        device,
+        "number",
+        f"{CONSOLE_MAC}_{SITE}_voucher_duration",
+        "voucher_duration_2",
+    )
+    alone = _entity(
+        hass,
+        entry,
+        device,
+        "sensor",
+        f"{CONSOLE_API_ID}_{SITE}_internet_upload_1h",
+        "up",
+    )
+    keyed = _entity(
+        hass, entry, device, "sensor", f"{SITE}_{CONSOLE_API_ID}_cpu_usage", "cpu"
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert async_migrate_mac_device_ids(hass, entry, _console_api()) == 0
+
+    fixed = ent_reg.async_get(original.entity_id)
+    assert fixed is not None
+    assert fixed.unique_id == f"{CONSOLE_MAC}_{SITE}_voucher_duration"
+    assert fixed.name == "Voucher length"
+    assert ent_reg.async_get(copy.entity_id) is None
+    fixed_alone = ent_reg.async_get(alone.entity_id)
+    assert fixed_alone is not None
+    assert fixed_alone.unique_id == f"{CONSOLE_MAC}_{SITE}_internet_upload_1h"
+    untouched = ent_reg.async_get(keyed.entity_id)
+    assert untouched is not None
+    assert untouched.unique_id == f"{SITE}_{CONSOLE_API_ID}_cpu_usage"
+    assert "put 2 console-namespaced unique ids back" in caplog.text
+
+    # Run again: nothing left to put back.
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert async_migrate_mac_device_ids(hass, entry, _console_api()) == 0
+    assert "put" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "console_id",
+    [None, "aa:bb:cc:dd:ee:ff"],
+    ids=["no-console-id", "namespace-of-another-console"],
+)
+async def test_does_not_put_back_without_the_console_namespace(
+    hass: HomeAssistant, console_id: str | None
+) -> None:
+    """Only the console whose MAC is the entry's namespace gets ids put back."""
+    entry = _console_entry(hass, console_id)
+    device = _migrated_console(hass, entry)
+    wrong = f"{CONSOLE_API_ID}_{SITE}_voucher_duration"
+    entity = _entity(hass, entry, device, "number", wrong, "voucher_duration")
+
+    assert async_migrate_mac_device_ids(hass, entry, _console_api()) == 0
+
+    kept = er.async_get(hass).async_get(entity.entity_id)
+    assert kept is not None
+    assert kept.unique_id == wrong
+
+
+async def test_put_back_leaves_a_copy_of_another_entry(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An entity of another entry that holds the namespaced id is never removed."""
+    entry = _console_entry(hass)
+    other = _console_entry(hass, entry_id="other_entry")
+    ent_reg = er.async_get(hass)
+    device = _migrated_console(hass, entry)
+    wrong = f"{CONSOLE_API_ID}_{SITE}_voucher_duration"
+    original = _entity(hass, entry, device, "number", wrong, "voucher_duration")
+    foreign = ent_reg.async_get_or_create(
+        "number",
+        DOMAIN,
+        f"{CONSOLE_MAC}_{SITE}_voucher_duration",
+        config_entry=other,
+        suggested_object_id="foreign",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert async_migrate_mac_device_ids(hass, entry, _console_api()) == 0
+
+    assert "leaving" in caplog.text
+    assert ent_reg.async_get(foreign.entity_id) is not None
+    kept = ent_reg.async_get(original.entity_id)
+    assert kept is not None
+    assert kept.unique_id == wrong
+
+
+async def test_put_back_failure_is_logged_not_raised(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refused unique id change skips that entity and the setup goes on."""
+    entry = _console_entry(hass)
+    device = _migrated_console(hass, entry)
+    wrong = f"{CONSOLE_API_ID}_{SITE}_voucher_duration"
+    entity = _entity(hass, entry, device, "number", wrong, "voucher_duration")
+
+    with (
+        caplog.at_level(logging.WARNING),
+        patch.object(
+            er.EntityRegistry, "async_update_entity", side_effect=ValueError("busy")
+        ),
+    ):
+        assert async_migrate_mac_device_ids(hass, entry, _console_api()) == 0
+
+    assert "cannot put back" in caplog.text
+    kept = er.async_get(hass).async_get(entity.entity_id)
+    assert kept is not None
+    assert kept.unique_id == wrong
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

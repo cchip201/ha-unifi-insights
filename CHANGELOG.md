@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.11.0-cmcore.3] - 2026-11-11
+
+### Fixed
+
+- cmcore (backlog 1795): v2026.11.0-cmcore.2 also rewrote the 22 site entities whose unique id is `<console MAC>_<site>_<suffix>` (vouchers, client totals, internet usage), which no platform builds, so they went unavailable and the platforms added `_2` copies. The re-key now leaves that shape alone, and setup puts the 22 back on the console's own device and removes the copy that holds each id, so the original keeps its entity id.
+
 ## [2026.11.0-cmcore.2] - 2026-11-11
 
 ### Fixed
