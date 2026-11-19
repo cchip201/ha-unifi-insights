@@ -22,6 +22,7 @@ env:
 
 jobs:
   test:
+    timeout-minutes: 30
     name: Test
     runs-on: ubuntu-latest
     permissions:
@@ -90,10 +91,11 @@ jobs:
         with:
           slug: ${{ github.repository }}
           files: ./coverage.xml
-          use_oidc: ${{ env.CODECOV_OIDC == 'true' }}
-          fail_ci_if_error: ${{ env.CODECOV_OIDC == 'true' }}
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          fail_ci_if_error: false
 
   frontend:
+    timeout-minutes: 30
     name: Frontend
     runs-on: ubuntu-latest
     defaults:
@@ -154,3 +156,29 @@ jobs:
 
       - name: Committed bundle matches source
         run: git diff --exit-code -- ../custom_components/unifi_insights/frontend/
+
+  ci-gate:
+    name: CI Gate
+    if: ${{ always() }}
+    needs: ["test", "frontend"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require successful validation
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          ALLOWED_SKIPS: ${{ '[]' }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, sys
+          results = json.loads(os.environ['RESULTS'])
+          allowed_skips = set(json.loads(os.environ['ALLOWED_SKIPS']))
+          failures = {name: job['result'] for name, job in results.items()
+                      if job['result'] != 'success'
+                      and not (job['result'] == 'skipped' and name in allowed_skips)}
+          if not results or failures:
+              print(f'::error::Required CI did not pass: {failures or "no results"}')
+              sys.exit(1)
+          print('All required CI jobs passed (only documented event skips allowed).')
+          PYTHON

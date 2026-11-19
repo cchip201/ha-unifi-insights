@@ -133,10 +133,16 @@ SCAN_INTERVAL_DEVICE = timedelta(seconds=30)
 # attempt waits the same interval before it retries, so rate limiting or an
 # offline console is not hammered once per statistics poll (#454).
 SCAN_INTERVAL_DEVICE_DETAILS = timedelta(minutes=5)
+DEVICE_DETAILS_CONCURRENCY: Final = 4
 # Config coordinator - slow updates for sites, WiFi config (5 minutes)
 SCAN_INTERVAL_CONFIG = timedelta(minutes=5)
 SCAN_INTERVAL_INNERSPACE = timedelta(minutes=5)
 SCAN_INTERVAL_SITE_MANAGER = timedelta(minutes=10)
+SITE_MANAGER_ISP_DEVICE_PREFIX: Final = "unifi_insights_site_manager:"
+SITE_MANAGER_ISP_SAMPLE_PERIOD: Final = "5m"
+SITE_MANAGER_ISP_LOOKBACK: Final = timedelta(hours=1)
+SITE_MANAGER_ISP_STALE_AFTER: Final = SITE_MANAGER_ISP_LOOKBACK
+SITE_MANAGER_ISP_FUTURE_TOLERANCE: Final = timedelta(minutes=5)
 CARRIER_FABRIC_SCAN_INTERVAL = timedelta(minutes=5)
 CARRIER_FABRIC_REQUEST_TIMEOUT: Final = 30  # seconds
 # Mobility routers report usage and location slowly; keys without Mobility
@@ -183,12 +189,14 @@ ISP_WAN_NUMBERS: Final = (
     "uptime",
 )
 # cmcore (backlog 1715.1): the two text fields of an ISP period (the ISP's name and
-# its AS number as text, e.g. "Ziply Fiber" / "20055"); kept beside the numbers so a
-# sensor can show who the WAN is with. Diagnostics still export ISP_WAN_NUMBERS only.
-ISP_WAN_TEXT: Final = (
-    "ispAsn",
-    "ispName",
-)
+# its AS number as text, e.g. "Ziply Fiber" / "20055"), so a sensor can show who the
+# WAN is with. Since upstream 2026.11.3 the coordinator keeps them in the sample's
+# "isp" mapping (keys name and asn), apart from the numbers in "wan"; this maps the
+# Site Manager field a sensor names to that key. Diagnostics export numbers only.
+ISP_WAN_TEXT: Final = {
+    "ispAsn": "asn",
+    "ispName": "name",
+}
 # cmcore (backlog 663): the device and Protect coordinators' poll, per config entry,
 # in seconds (options flow). A cloud entry is polled through UniFi's remote connector,
 # which answered HTTP 408 (connector timeout) about 35 times an hour on the offsite

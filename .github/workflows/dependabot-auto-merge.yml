@@ -5,6 +5,7 @@ name: Dependabot Auto-merge
 # tinkerologie/.github.
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -19,9 +20,33 @@ jobs:
         github.event.pull_request.user.login == 'dependabot[bot]' &&
         github.actor == 'dependabot[bot]'
       }}
-    uses: tinkerologie/.github/.github/workflows/dependabot-auto-merge.yml@8b5a48edcfc57a283ca85244a572e16ebd539571 # v1.6.0
+    uses: tinkerologie/.github/.github/workflows/dependabot-auto-merge.yml@235f37f63360eaf10573b0bf1216767b712c1b96 # shared governance
+    with:
+      native-auto-merge: true
     permissions:
       contents: write # merge the pull request
       pull-requests: write # merge the pull request
       checks: read # wait for check runs
       statuses: read # wait for commit statuses
+
+  dependency-policy:
+    name: Dependency Policy
+    needs: auto-merge
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require current-head eligibility verification
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          RESULT: ${{ needs.auto-merge.result }}
+        run: |
+          if [ "$AUTHOR" = 'dependabot[bot]' ]; then
+            test "$RESULT" = success
+          else
+            case "$RESULT" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          fi

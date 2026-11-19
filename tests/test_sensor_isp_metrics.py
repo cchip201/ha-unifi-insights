@@ -387,9 +387,14 @@ def test_isp_sample_reader_tolerates_malformed_snapshots() -> None:
 
 
 def test_isp_field_checks_the_type_of_each_value() -> None:
-    sample = {"wan": {"avgLatency": 3, "ispName": "Ziply Fiber", "flag": True}}
+    sample = {
+        "wan": {"avgLatency": 3, "flag": True},
+        "isp": {"name": "Ziply Fiber", "asn": "20055"},
+    }
     assert _isp_field(sample, "avgLatency", text=False) == 3
+    # the ISP text comes from the sample's isp mapping (upstream 2026.11.3 shape)
     assert _isp_field(sample, "ispName", text=True) == "Ziply Fiber"
+    assert _isp_field(sample, "ispAsn", text=True) == "20055"
     # a number read as text, text read as a number, a boolean, a missing key
     assert _isp_field(sample, "avgLatency", text=True) is None
     assert _isp_field(sample, "ispName", text=False) is None
@@ -397,4 +402,6 @@ def test_isp_field_checks_the_type_of_each_value() -> None:
     assert _isp_field(sample, "missing", text=False) is None
     assert _isp_field({"wan": "bad"}, "avgLatency", text=False) is None
     assert _isp_field(None, "avgLatency", text=False) is None
-    assert _isp_field({"wan": {"ispName": ""}}, "ispName", text=True) is None
+    assert _isp_field({"isp": {"name": ""}}, "ispName", text=True) is None
+    assert _isp_field({"isp": "bad"}, "ispName", text=True) is None
+    assert _isp_field({"wan": {"ispName": "Ziply Fiber"}}, "ispName", text=True) is None

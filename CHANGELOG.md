@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2026.11.3-cmcore.1] - 2026-11-19
+
+### Changed
+
+- cmcore: merged upstream v2026.11.3 into the fork. The fork's own changes stand on top of it (backlogs 663, 1795, 1715.1, 529, 976, 1374), and every entity the fork already had keeps its unique id.
+- cmcore (backlog 1715.1, 2005): the fork's five ISP metric sensors (`isp_avg_latency`, `isp_max_latency`, `isp_packet_loss`, `isp_name`, `isp_asn`, on the site's gateway device) now read the ISP's name and AS number from the sample's `isp` mapping that upstream's Site Manager coordinator keeps since 2026.11.3, instead of from `wan`. Their unique ids, names and device are unchanged. Upstream's own Site Manager WAN sensors (#499, a separate "UniFi Site Manager" service device) come with the merge and sit beside them.
+
+## [2026.11.3] - 2026-11-18
+
+### Added
+
+- Show read-only Network port inventory on switching nodes in the topology card. The topology snapshot schema is now v3 and uses the updated bundled card. [#498](https://github.com/tinkerologie/ha-unifi-insights/issues/498)
+
+- Add Site Manager WAN diagnostics for Remote entries, with source timestamp expiry and per-site isolation. A live cloud capture confirmed the units: WAN uptime is a percentage, and download and upload are the reported connection capacity, not live traffic. Downtime has no confirmed unit and stays in diagnostics. Periods from hosts without WAN data are ignored. [#499](https://github.com/tinkerologie/ha-unifi-insights/issues/499)
+
+### Fixed
+
+- Pin patched minimatch tooling for frontend checks and enforce aggregate CI validation.
+
 ## [2026.11.2-cmcore.1] - 2026-11-12
 
 ### Changed

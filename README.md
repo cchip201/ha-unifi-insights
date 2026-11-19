@@ -862,6 +862,15 @@ Each active Mobility workspace is a service device with **Routers** and **Online
 
 A router that Mobility stops reporting becomes unavailable. You can then delete its device from the device page.
 
+## Switch ports in the topology card
+
+Select a switching device or gateway and open **Ports** in the detail
+panel. The card groups official Network port records by connector and shows
+their reported indices, link state, negotiated and maximum speed, and PoE
+settings. The panel reports when ports are unknown or unavailable, and labels
+retained port data when a refresh fails. The list refreshes through the
+integration's five-minute device details poll.
+
 ## UniFi Site Manager
 
 Remote entries use the same cloud API key to read account-wide data from UniFi Site Manager every 10 minutes:
@@ -873,6 +882,28 @@ Remote entries use the same cloud API key to read account-wide data from UniFi S
 Site Manager data appears in diagnostics. Entries with the same API key
 share one account refresh. A Site Manager failure does not stop the console
 connection. The diagnostics report shows the collection status.
+
+Each Remote entry adds a Site Manager service device for each cloud site
+with WAN samples for that console. Average and maximum latency (ms), packet
+loss (%), and download and upload capacity (kbit/s, displayed in Mbit/s by
+default) are enabled when reported. WAN uptime (% of the sample), sample time
+and ISP name with ASN are disabled by default.
+
+The units come from a live capture of six cloud sites over 24 hours and
+7 days. Latency ranged from 0 to 70 ms, and packet loss from 0 to 15%. Uptime
+was always 0 or 100, so it is a percentage. Download and upload capacity did
+not change from sample to sample. It is the speed that the console reports
+for its internet connection, not live traffic. The API also reports a
+downtime value. Its unit is not confirmed, so it is not a sensor and appears
+only in diagnostics. A period from a host without WAN data reports every
+field as zero. The integration ignores such periods.
+
+The timestamp comes from the latest five-minute sample. Sensors become
+unavailable when the metrics collection fails or the source sample reaches
+one hour of age, including during a request cooldown. Cloud sites have
+their own identifiers and are independent of Network sites. The sample
+covers the cloud site as a whole. Per-uplink quality, active WAN and
+failover are outside the scope of these metrics.
 
 ## UniFi Carrier Fabric (ISP)
 
