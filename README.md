@@ -13,6 +13,26 @@ entities, actions, and six dashboard cards.
 
 <!-- BADGES:END -->
 
+## This fork
+
+This repository is a maintained fork of [tinkerologie/ha-unifi-insights](https://github.com/tinkerologie/ha-unifi-insights). The code, the Apache-2.0 licence and the credit stay with the upstream authors; this fork merges each upstream release and keeps the same integration domain (`unifi_insights`), so existing entries, entities and settings carry over. The badges, Marketplace and HACS links and the rest of this page are upstream's. This fork's default branch is `cmcore`; `main` is an old copy of upstream's branch and is not kept up to date.
+
+What it adds over upstream:
+
+- **Poll interval**: an option for each entry (30 to 900 seconds). Local entries keep 30 seconds; remote (cloud) entries default to 120 seconds.
+- **Firewall policies**: no switch for the "Return" policy that the console generates itself.
+- **Clients**: no per-client entities for a client with a randomized MAC address and no name; a client device that holds no entity can be deleted; an offline client's device tracker stays on the access point or switch it was last connected to.
+- **InnerSpace**: an InnerSpace device of an entry that has no InnerSpace can be deleted.
+- **Internet provider sensors** on the site's gateway device: average and maximum latency, packet loss, provider name and AS number, read from Site Manager.
+- **Device identity**: a network device registered under its MAC address is re-keyed to the id the API reports now; entity unique ids are kept.
+
+Add it as a custom repository:
+
+- **Home Assistant 2026.11 and newer** (Marketplace): open **Settings** > **Marketplace** > **Add from link**, enter `https://github.com/cchip201/ha-unifi-insights`, select **Add** (pick the type **Integration** if it asks), then install **UniFi Insights** and restart Home Assistant.
+- **Home Assistant 2026.10 and older** (HACS): open HACS, then the three-dot menu > **Custom repositories**, enter `https://github.com/cchip201/ha-unifi-insights`, type **Integration**, select **Add**, then download **UniFi Insights** and restart Home Assistant.
+
+This fork and upstream install into the same folder (`custom_components/unifi_insights`), so use one of them, not both. Report problems with this fork in its [issues](https://github.com/cchip201/ha-unifi-insights/issues).
+
 ## Contents
 
 - **Setup** · [Requirements](#requirements) · [Installation](#installation) · [Configuration](#configuration)
