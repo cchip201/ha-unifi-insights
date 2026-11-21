@@ -5,7 +5,7 @@ Move network devices registered under their MAC to the id the API reports now.
 cmcore patch (backlog 1795). A network device is registered as
 ``(DOMAIN, "<site>_<device id>")`` and its entities carry the same id in their
 unique ids. Until the 2026-11-11 UniFi OS update (UDM-Pro 5.1.34 to 6.0.17) the
-Network application listed the console and one switch of the CMCoreUDMP site
+Network application listed the console and one switch of a site
 without a usable ``id``: ``Device.populate_id_fallback`` keyed them on the MAC
 (``device_id_is_mac``), while the clients endpoint already named them by their
 UUID. Since the update the devices list carries the UUID, the platforms build

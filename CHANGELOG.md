@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - cmcore: merged upstream v2026.11.2 into the fork. The fork's own changes stand on top of it: the optional poll interval (backlog 663), the MAC to UUID device re-key (backlog 1795), the ISP metrics sensors (backlog 1715.1) and the ephemeral-client and device-removal change (backlog 529), the derived firewall policy switches (backlog 976) and the InnerSpace device clean-up (backlog 1374).
-- cmcore (backlog 1813): the dashboard-feed fallback of 2026.11.0-cmcore.4 is retired. Upstream v2026.11.2 (#503) reads the internet activity of a Network 11 console from its new statistics engine (`GET /v2/api/stats/source`, then `/v2/api/stats/recent/series`), and all three of the fork's consoles answer `MODERN` with usable receive and transmit bytes (Network 11.0.99 on CMCoreUDMP and chipCityUDMP, 11.1.47 on CMCoreUDM, read 2026-11-12), so the eight sensors per console come from upstream's code and the fork carries nothing for them.
+- cmcore (backlog 1813): the dashboard-feed fallback of 2026.11.0-cmcore.4 is retired. Upstream v2026.11.2 (#503) reads the internet activity of a Network 11 console from its new statistics engine (`GET /v2/api/stats/source`, then `/v2/api/stats/recent/series`), and all three of the fork's consoles answer `MODERN` with usable receive and transmit bytes (Network 11.0.99 on two of them, 11.1.47 on the third, read 2026-11-12), so the eight sensors per console come from upstream's code and the fork carries nothing for them.
 
 ## [2026.11.2] - 2026-11-12
 
@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- cmcore (backlog 1795): after the 2026-11-11 UniFi OS update (UDM-Pro 5.1.34 to 6.0.17) the Network application lists the console and one switch of the CMCoreUDMP site with a UUID `id`; until then they had none and the library keyed them on their MAC (`Device.populate_id_fallback`). Home Assistant refused the UUID-keyed device because the same MAC was registered to the MAC-keyed one, so every entity of both devices went unavailable. Setup now re-keys such a device in place (`device_id_migration.py`): the device row, entity ids, names, areas and labels stay; the device identifier and the entities' unique ids move from the MAC to the UUID. A client's uplink stub device that already holds the UUID identifier gives its entities to the real device and is removed.
+- cmcore (backlog 1795): after the 2026-11-11 UniFi OS update (UDM-Pro 5.1.34 to 6.0.17) the Network application lists the console and one switch of a site with a UUID `id`; until then they had none and the library keyed them on their MAC (`Device.populate_id_fallback`). Home Assistant refused the UUID-keyed device because the same MAC was registered to the MAC-keyed one, so every entity of both devices went unavailable. Setup now re-keys such a device in place (`device_id_migration.py`): the device row, entity ids, names, areas and labels stay; the device identifier and the entities' unique ids move from the MAC to the UUID. A client's uplink stub device that already holds the UUID identifier gives its entities to the real device and is removed.
 
 ## [2026.11.0-cmcore.1] - 2026-11-10
 

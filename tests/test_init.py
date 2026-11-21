@@ -748,16 +748,16 @@ def _client_device(
     ("mac", "name", "name_by_user", "expected"),
     [
         # randomized (locally administered) and unnamed: removable
-        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c0", None, True),
-        ("1e:fc:1f:19:57:7e", "", None, True),
-        ("be:cf:ed:fa:7a:1e", None, None, True),
+        ("a6:00:00:00:00:01", "a6:00:00:00:00:01", None, True),
+        ("1e:00:00:00:00:03", "", None, True),
+        ("be:00:00:00:00:04", None, None, True),
         # randomized but named, in UniFi or in Home Assistant: refused
-        ("a6:32:49:91:9b:c0", "Colin's Pixel", None, False),
-        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c0", "Kitchen tablet", False),
+        ("a6:00:00:00:00:01", "A Pixel phone", None, False),
+        ("a6:00:00:00:00:01", "a6:00:00:00:00:01", "Kitchen tablet", False),
         # a global (burned-in) MAC is never ephemeral, named or not
-        ("98:e2:55:40:0c:ad", "98:e2:55:40:0c:ad", None, False),
+        ("98:00:00:00:00:05", "98:00:00:00:00:05", None, False),
         # a name that is another MAC is a name
-        ("a6:32:49:91:9b:c0", "a6:32:49:91:9b:c1", None, False),
+        ("a6:00:00:00:00:01", "a6:00:00:00:00:02", None, False),
         # an identifier that is no MAC at all is never ephemeral
         ("not-a-mac", None, None, False),
     ],
@@ -781,7 +781,7 @@ async def test_remove_config_entry_device_for_empty_client_device(
 ) -> None:
     """A client device that holds no entity can be deleted (cmcore, backlog 643)."""
     entry = _entry_with_sites({"default": "Default"}, ["default"])
-    named = _client_device("98:e2:55:40:0c:ad", "Kitchen tablet")
+    named = _client_device("98:00:00:00:00:05", "Kitchen tablet")
     named.id = "device-empty"
 
     # the placeholder left behind once the client's tracker moved back to its uplink
@@ -795,7 +795,7 @@ async def test_remove_config_entry_device_for_empty_client_device(
         is False
     )
     disabled = _hold_an_entity(
-        hass, _client_device("98:e2:55:40:0c:ae", "Hall tablet"), disabled=True
+        hass, _client_device("98:00:00:00:00:06", "Hall tablet"), disabled=True
     )
     assert await async_remove_config_entry_device(hass, entry, disabled) is False
 
@@ -808,8 +808,8 @@ async def test_remove_config_entry_device_for_empty_client_device(
 @pytest.mark.parametrize(
     "identifier",
     [
-        "innerspace_dcba8527-f206-450a-87da-5691f873f9d9",
-        "innerspace_floor_plan_1cf17015-9d46-41f0-af10-e20646881ffc",
+        "innerspace_00000000-0000-4000-8000-000000000001",
+        "innerspace_floor_plan_00000000-0000-4000-8000-000000000002",
     ],
 )
 async def test_remove_config_entry_device_for_innerspace_without_innerspace(
@@ -836,7 +836,7 @@ async def test_remove_config_entry_device_ephemeral_without_runtime_data(
 ) -> None:
     """An entry that is not loaded still lets an ephemeral client device go (529)."""
     entry = MagicMock(spec=["entry_id"])
-    device = _client_device("a6:32:49:91:9b:c0", None)
+    device = _client_device("a6:00:00:00:00:01", None)
 
     assert await async_remove_config_entry_device(hass, entry, device) is True
 

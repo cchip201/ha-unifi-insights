@@ -26,10 +26,10 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 SITE = "88f7af54-98f8-306a-a1c7-c9349722b1f6"
-MAC = "f0:9f:c2:17:4a:71"
-API_ID = "a68579c2-e861-3ff3-ad1a-024270fd6d28"
-CONSOLE_MAC = "e0:63:da:88:c0:bb"
-CONSOLE_API_ID = "2e756474-1ce8-3eea-ac6c-e75f6848db8a"
+MAC = "aa:bb:cc:11:22:01"
+API_ID = "11111111-1111-3111-a111-111111111111"
+CONSOLE_MAC = "aa:bb:cc:11:22:02"
+CONSOLE_API_ID = "22222222-2222-3222-a222-222222222222"
 
 
 def _entry(hass: HomeAssistant, entry_id: str = "mig_entry") -> MockConfigEntry:
@@ -52,7 +52,7 @@ def _mac_device(
         connections={(dr.CONNECTION_NETWORK_MAC, mac)},
         manufacturer="Ubiquiti Inc.",
         model="US 8 60W",
-        name="US860WLibreMon (10.0.1.31)",
+        name="Switch (192.0.2.31)",
     )
 
 
@@ -85,10 +85,10 @@ def _site_api(
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        ("f0:9f:c2:17:4a:71", "f09fc2174a71"),
-        ("F0-9F-C2-17-4A-71", "f09fc2174a71"),
-        ("f09f.c217.4a71", "f09fc2174a71"),
-        ("  F0:9F:C2:17:4A:71  ", "f09fc2174a71"),
+        ("aa:bb:cc:11:22:01", "aabbcc112201"),
+        ("AA-BB-CC-11-22-01", "aabbcc112201"),
+        ("aabb.cc11.2201", "aabbcc112201"),
+        ("  AA:BB:CC:11:22:01  ", "aabbcc112201"),
         (API_ID, None),
         ("5f1c2e8a9b3d4c6e7f8a9b0c", None),
         ("not a mac", None),
@@ -176,7 +176,7 @@ async def test_migrates_device_and_entities_in_place(hass: HomeAssistant) -> Non
     assert moved.identifiers == {(DOMAIN, f"{SITE}_{API_ID}")}
     assert moved.connections == {(dr.CONNECTION_NETWORK_MAC, MAC)}
     assert moved.labels == {"network"}
-    assert moved.name == "US860WLibreMon (10.0.1.31)"
+    assert moved.name == "Switch (192.0.2.31)"
     assert (
         dev_reg.async_get_device_by_identifier(
             (DOMAIN, f"{SITE}_{MAC}"), entry.entry_id
@@ -217,7 +217,7 @@ async def test_matches_mac_in_any_case_or_format(hass: HomeAssistant) -> None:
         hass, entry, device, "sensor", f"{SITE}_{MAC.upper()}_cpu_usage", "cpu"
     )
 
-    api = _site_api(mac="F0-9F-C2-17-4A-71")
+    api = _site_api(mac="AA-BB-CC-11-22-01")
     assert async_migrate_mac_device_ids(hass, entry, api) == 1
 
     dev_reg = dr.async_get(hass)
@@ -516,7 +516,7 @@ def _migrated_console(hass: HomeAssistant, entry: MockConfigEntry) -> dr.DeviceE
         connections={(dr.CONNECTION_NETWORK_MAC, CONSOLE_MAC)},
         manufacturer="Ubiquiti Inc.",
         model="UDM Pro",
-        name="CMCoreUDMP (50.35.176.45)",
+        name="Console (203.0.113.45)",
     )
 
 
@@ -663,11 +663,11 @@ async def test_setup_entry_moves_the_registered_device(
     mock_network_client.devices.get_all.return_value = [
         Device(
             id=API_ID,
-            name="US860WLibreMon",
+            name="Switch",
             model="US 8 60W",
             macAddress=MAC.upper(),
             state="ONLINE",
-            ipAddress="10.0.1.31",
+            ipAddress="192.0.2.31",
         )
     ]
     dev_reg = dr.async_get(hass)
@@ -679,7 +679,7 @@ async def test_setup_entry_moves_the_registered_device(
         device,
         "sensor",
         f"{SITE}_{MAC}_cpu_usage",
-        "us860wlibremon_cpu_usage",
+        "switch_cpu_usage",
     )
 
     await hass.config_entries.async_setup(mock_config_entry.entry_id)

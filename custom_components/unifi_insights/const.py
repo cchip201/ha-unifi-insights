@@ -189,7 +189,7 @@ ISP_WAN_NUMBERS: Final = (
     "uptime",
 )
 # cmcore (backlog 1715.1): the two text fields of an ISP period (the ISP's name and
-# its AS number as text, e.g. "Ziply Fiber" / "20055"), so a sensor can show who the
+# its AS number as text, e.g. "Example ISP" / "64500"), so a sensor can show who the
 # WAN is with. Since upstream 2026.11.3 the coordinator keeps them in the sample's
 # "isp" mapping (keys name and asn), apart from the numbers in "wan"; this maps the
 # Site Manager field a sensor names to that key. Diagnostics export numbers only.
